@@ -1,58 +1,130 @@
 <script lang="ts">
   import "../lib/i18n";
   import { _ } from "svelte-i18n";
-
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Input from "./Input.svelte";
-  let msg_items = $state([""]);
+  import Messagelist from "./Messagelist.svelte";
+  import Contactlist from "./Contactlist.svelte";
 
-  function add(input: string) {
-    if (input.trim()) {
-      msg_items = [...msg_items, input.trim()];
-      input = "";
-    }
-  }
-  function remove(index: number) {
-    msg_items = msg_items.filter((_, i) => i !== index);
-  }
+  // === 组件引用 ===
+  let msgListRef = $state<ReturnType<typeof Messagelist> | undefined>(
+    undefined,
+  );
+  let contactListRef: ReturnType<typeof Contactlist>;
 
+  // === 状态 ===
+  let selectedContactId = $state<string | null>(null);
+  let contacts = $state([
+    {
+      id: "1",
+      name: "Alice",
+      lastMessage: "好的，明天见",
+      lastTime: Date.now(),
+      unread: 2,
+      isOnline: true,
+    },
+    {
+      id: "2",
+      name: "Bob",
+      lastMessage: "收到",
+      lastTime: Date.now() - 86400000,
+      unread: 0,
+      isOnline: false,
+    },
+    {
+      id: "3",
+      name: "Charlie",
+      lastMessage: "在吗？",
+      lastTime: Date.now() - 172800000,
+      unread: 5,
+      isOnline: true,
+    },
+  ]);
+
+  // === 监听远程消息 ===
   onMount(() => {
     let unlisten: (() => void) | undefined;
-
     (async () => {
-      unlisten = await listen("chat-message", (event) => {
-        console.log("收到消息:", event.payload);
-        console.log("payload:", event.payload);
-        console.log("type:", typeof event.payload);
-        if (typeof event.payload === "string") {
-          msg_items = [...msg_items, event.payload];
-        }
+      unlisten = await listen<string>("chat-message", (e) => {
+        // TODO: 根据 sender_id 路由到对应会话
+        msgListRef?.add(e.payload, false);
+
+        // 更新联系人列表的最后消息
+        contacts = contacts.map((c) =>
+          c.id === selectedContactId
+            ? { ...c, lastMessage: e.payload, lastTime: Date.now() }
+            : c,
+        );
       });
     })();
-
-    return () => {
-      if (unlisten) unlisten();
-    };
+    return () => unlisten?.();
   });
+
+  // === 选择联系人 ===
+  function handleSelectContact(id: string) {
+    selectedContactId = id;
+    // TODO: 加载该联系人的消息历史
+    // msgListRef?.loadHistory(id);
+  }
+
+  // === 发送消息 ===
+  function handleSend(text: string) {
+    if (!selectedContactId) return;
+    msgListRef?.add(text, true);
+
+    // 更新联系人列表
+    contacts = contacts.map((c) =>
+      c.id === selectedContactId
+        ? { ...c, lastMessage: text, lastTime: Date.now() }
+        : c,
+    );
+  }
 </script>
 
 <main class="container">
-  <div class="top-right">
-    <ul>
-      {#each msg_items as item, i}
-        <li>
-          <span>{item}</span>
-          <button class="del" onclick={() => remove(i)}>×</button>
-        </li>
-      {/each}
-    </ul>
+  <!-- 左侧：联系人列表 -->
+  <aside class="sidebar">
+    <Contactlist
+      {contacts}
+      selectedId={selectedContactId}
+      onselect={handleSelectContact}
+    ></Contactlist>
+  </aside>
+
+  <!-- 右侧：聊天区域 -->
+  <div class="main-content">
+    <!-- 顶部：关于链接 -->
+    <a class="about-link" href="./about" title={$_("about")}>{$_("about")}</a>
+
+    <!-- 中部：消息列表 -->
+    <div class="chat-area">
+      {#if selectedContactId}
+        <Messagelist bind:this={msgListRef}></Messagelist>
+      {:else}
+        <div class="empty-state">
+          <svg
+            width="64"
+            height="64"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="#525252"
+            stroke-width="1"
+          >
+            <path
+              d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+            />
+          </svg>
+          <p>选择联系人开始聊天</p>
+        </div>
+      {/if}
+    </div>
+
+    <!-- 底部：输入框 -->
+    <div class="input-area">
+      <Input onsend={handleSend} disabled={!selectedContactId}></Input>
+    </div>
   </div>
-  <div class="top-left"></div>
-  <div class="bottom-right">
-    <Input />
-  </div>
-  <a href="./about" title={$_("about")}>{$_("about")}</a>
 </main>
 
 <style>
@@ -61,87 +133,89 @@
     font-size: 16px;
     line-height: 24px;
     font-weight: 400;
-
-    color: #0f0f0f;
-    background-color: #f6f6f6;
-
-    font-synthesis: none;
-    text-rendering: optimizeLegibility;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    -webkit-text-size-adjust: 100%;
-    appearance: none;
-    -webkit-appearance: none;
+    color: #f6f6f6;
+    background-color: #0f0f0f;
   }
 
   .container {
     margin: 0;
-    padding-top: 10vh;
+    display: flex;
+    height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+  }
+
+  /* 左侧边栏：联系人列表 */
+  .sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    border-right: 1px solid #2a2a2a;
+    background: #0a0a0a;
+  }
+
+  /* 右侧主内容区 */
+  .main-content {
+    flex: 1;
     display: grid;
-    grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
-    justify-items: center;
+    grid-template-areas:
+      "."
+      "chat"
+      "input";
+    grid-template-rows: auto 1fr auto;
+    position: relative;
+  }
+
+  /* 关于链接 */
+  .about-link {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    color: #737373;
+    text-decoration: none;
+    font-size: 14px;
+    z-index: 10;
+  }
+  .about-link:hover {
+    color: #3b82f6;
+  }
+
+  /* 消息列表区域 */
+  .chat-area {
+    grid-area: chat;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* 空状态 */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
     align-items: center;
-    text-align: center;
+    justify-content: center;
+    height: 100%;
+    color: #525252;
+    gap: 16px;
+  }
+  .empty-state p {
+    font-size: 14px;
   }
 
-  .top-right {
-    position: absolute;
-    top: 10px;
-    right: 10px;
-    max-width: 300px;
-    overflow-y: auto;
-  }
-  .bottom-right {
-    position: absolute;
-    bottom: 0;
-    right: 0;
-    width: 60%;
-    box-sizing: border-box;
-    padding: 10px;
+  /* 输入框区域 */
+  .input-area {
+    grid-area: input;
+    padding: 16px;
+    border-top: 1px solid #2a2a2a;
+    background: #1a1a1a;
   }
 
-  button {
-    border-radius: 8px;
-    border: 1px solid transparent;
-    padding: 0.6em 1.2em;
-    font-size: 1em;
-    font-weight: 500;
-    font-family: inherit;
-    color: #0f0f0f;
-    background-color: #ffffff;
-    transition: border-color 0.25s;
-    box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-  }
-
-  button {
-    cursor: pointer;
-  }
-
-  button:hover {
-    border-color: #396cd8;
-  }
-  button:active {
-    border-color: #396cd8;
-    background-color: #e8e8e8;
-  }
-
-  button {
-    outline: none;
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root {
-      color: #f6f6f6;
-      background-color: #2f2f2f;
-    }
-
-    button {
-      color: #ffffff;
-      background-color: #0f0f0f98;
-    }
-    button:active {
-      background-color: #0f0f0f69;
+  /* 响应式：小屏幕隐藏侧边栏 */
+  @media (max-width: 768px) {
+    .sidebar {
+      position: absolute;
+      z-index: 100;
+      height: 100%;
+      transform: translateX(-100%);
+      transition: transform 0.3s;
     }
   }
 </style>

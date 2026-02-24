@@ -13,8 +13,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
-
-pub mod storage;
+use tokio::try_join;
+mod log;
+mod storage;
+use log::init_logger;
 pub struct CoreConfig {
     /// example: "/path/to/database.db"
     database_path: PathBuf,
@@ -60,8 +62,7 @@ pub struct ChatMeassage {
     pub event: MessageEvent,
     pub data: String,
 }
-mod log;
-use log::init_logger;
+
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
     gossipsub: gossipsub::Behaviour,
@@ -83,7 +84,7 @@ impl ChatCore {
         // subscribes to our topic
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
         let (tx, rx) = mpsc::channel(32);
-        tokio::try_join!(init_logger(&cfg), storage::init(&cfg))?;
+        try_join!(init_logger(&cfg), storage::init(&cfg))?;
 
         Ok(ChatCore {
             swarm,

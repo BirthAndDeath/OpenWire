@@ -15,7 +15,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "svelte-i18n": "^4.0.1"
+    "svelte-i18n": "^4.0.1",
+    "virtua": "^0.48.6"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
