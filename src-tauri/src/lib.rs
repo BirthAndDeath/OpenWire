@@ -1,12 +1,8 @@
-use std::f32::consts::LOG2_10;
 
-use chat_core::ChatMeassage;
-use libp2p::futures::StreamExt;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{Emitter, Manager};
 use chat_core::ChatCommand;
 use libp2p::{
-    Swarm,
-    futures::io,
+
     gossipsub};
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -45,7 +41,7 @@ pub fn run() {
                     let local = tokio::task::LocalSet::new();
                     let _result_local = local.run_until(async {
                         // 创建通道用于这里 -> core 通信
-                        let (cmd_tx,mut  cmd_rx) = mpsc::channel::<ChatCommand>(64);
+                        let (cmd_tx,cmd_rx) = mpsc::channel::<ChatCommand>(64);
 
                        
                         // ❗ Swarm 必须在 spawn_local 中（!Send）

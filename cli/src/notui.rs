@@ -1,29 +1,72 @@
 use crate::App;
-use std::net::SocketAddr;
-pub async fn no_tui_run(_app: &mut App) -> std::io::Result<()> {
-    let mut targets: Vec<SocketAddr> = vec![];
+use chat_core::ChatCommand;
+use tokio::io::{self, AsyncBufReadExt, BufReader};
 
-    //不想写注释了，自己读吧好累（我的命名应该已经很贴切了,大概？）
+pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
+    // 获取对 core 的引用并启动它
+    let mut core = app.core.take().unwrap();
+    let mut rx = core
+        .rx_message
+        .take()
+        .ok_or(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "消息通道问题",
+        ))
+        .expect("消息通道问题");
 
-    println!("输入目标 IPv6 地址（如 [::1]:8000):");
-    let mut target_str = String::new();
-    std::io::stdin().read_line(&mut target_str).unwrap();
-    targets.push(target_str.trim().parse().expect("无效地址"));
-    // 接收任务
-    todo!();
+    // 启动核心服务
+    let core_joinhandle = core.run();
 
-    // 发送循环
-    let mut stdin = String::new();
-    println!("输入消息回车发送/Ctrl+C 退出）：");
-    loop {
-        stdin.clear();
-        std::io::stdin().read_line(&mut stdin).unwrap();
-        let line = stdin.trim();
-        if line.is_empty() {
-            continue;
+    // 创建一个任务来处理传入的消息
+    let message_handler = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            println!("[网络] {}", msg.data);
         }
-        for target in &targets {
-            //&app.socket.send_to(line.as_bytes(), target).await?;
+    });
+
+    // 创建一个任务来处理用户输入
+    let cmd_tx = app.app_data.cmd_tx.clone();
+    let input_handler = tokio::spawn(async move {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut buffer = String::new();
+
+        println!("输入消息回车发送，Ctrl+C 退出：");
+
+        loop {
+            buffer.clear();
+            if let Err(_) = reader.read_line(&mut buffer).await {
+                break;
+            }
+
+            let line = buffer.trim();
+            if !line.is_empty() {
+                // 发送消息
+                if let Err(_) = cmd_tx
+                    .send(ChatCommand::SendMessage {
+                        message: line.to_string(),
+                    })
+                    .await
+                {
+                    eprintln!("无法发送消息");
+                    break;
+                }
+
+                // 显示自己发送的消息
+                println!("[我] {}", line);
+            }
         }
-    }
+    });
+
+    // 等待输入处理任务完成（实际上不会完成，直到用户中断）
+    let _ = tokio::join!(message_handler, input_handler);
+
+    // 发送关闭命令
+    let _ = app.app_data.cmd_tx.try_send(ChatCommand::Shutdown);
+
+    // 等待核心服务结束
+    let result = core_joinhandle.join();
+
+    println!("exit {:?}", result);
+    Ok(())
 }

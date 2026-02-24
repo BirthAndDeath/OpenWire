@@ -14,7 +14,15 @@
       {
         "title": "chat",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "visible": true,
+        "center": true,
+        "focus": true
       }
     ],
     "security": {
@@ -26,10 +34,34 @@
       },
       "csp": {
         "default-src": "'self'",
+        "script-src": "'self' 'unsafe-eval' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob:",
+        "font-src": "'self'",
         "connect-src": "'self'",
-        "script-src": "'self'",
-        "style-src": "'self' 'unsafe-inline'"
-      }
+        "media-src": "'self'",
+        "object-src": "'none'",
+        "frame-ancestors": "'none'",
+        "base-uri": "'self'",
+        "form-action": "'self'",
+        "upgrade-insecure-requests": "true"
+      },
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "windows": [
+            "main"
+          ],
+          "permissions": [
+            "core:default",
+            "core:window:default",
+            "core:window:allow-close",
+            "core:window:allow-minimize",
+            "core:window:allow-maximize",
+            "core:window:allow-start-dragging"
+          ]
+        }
+      ]
     }
   },
   "bundle": {

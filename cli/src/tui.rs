@@ -288,8 +288,10 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
         }
         terminal.draw(|frame| tui_render(frame, &app))?;
     }
-    app.app_data.cmd_tx.try_send(ChatCommand::Shutdown);
-    core_joinhandle.join();
+    let result_cmd = app.app_data.cmd_tx.try_send(ChatCommand::Shutdown);
+    print!("结束通道命令结果{:?}", result_cmd);
+    let result_thread = core_joinhandle.join();
+    print!("结束后台线程 结果{:?}", result_thread);
     disable_raw_mode()?;
     terminal.clear()?;
     terminal.show_cursor()?;

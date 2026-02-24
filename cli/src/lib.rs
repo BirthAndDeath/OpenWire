@@ -38,7 +38,7 @@ impl App {
     pub async fn try_init() -> anyhow::Result<App> {
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // 默认选中第一条消息
-        let (mut cmd_tx, mut cmd_rx) = mpsc::channel::<ChatCommand>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ChatCommand>(64);
         let app_data = AppData { cmd_tx };
         let home_dir = std::env::home_dir().expect("failedto get home dir");
         let database_path = home_dir.join(".chat/database.sqlite");
@@ -50,7 +50,7 @@ impl App {
 
         let cfg =
             chat_core::CoreConfig::new(database_path, cmd_rx, Some(log_path), Some(log_level));
-        let mut core = chat_core::ChatCore::try_init(cfg).await?;
+        let core = chat_core::ChatCore::try_init(cfg).await?;
 
         Ok(App {
             current_focus: Focus::Input,
