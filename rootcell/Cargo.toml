@@ -24,8 +24,8 @@ jni = "0.21"
 android-activity = { version = "0.6", features = ["native-activity"] }
 
 [target.'cfg(any(target_os = "ios"))'.dependencies]
-security-framework = "3.6.0"
-security-framework-sys = "2.16"
+security-framework = "3.7.0"
+security-framework-sys = "2.17"
 keyring = { version = "3", features = ["apple-native"] }
 
 # Windows / Linux / macOS 通用
