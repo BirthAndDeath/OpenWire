@@ -5,7 +5,12 @@
     // === Props ===
     let {
         onsend,
-        disabled = false, // 新增：外部禁用控制
+        disabled = false,
+        fill = false, // 新增：填充父容器
+    }: {
+        onsend?: (text: string) => void;
+        disabled?: boolean;
+        fill?: boolean;
     } = $props();
 
     // === 状态 ===
@@ -58,7 +63,7 @@
     }
 </script>
 
-<div class="input-wrapper" class:disabled>
+<div class="input-wrapper" class:disabled class:fill>
     {#if disabled}
         <div class="overlay">选择联系人以开始聊天</div>
     {/if}
@@ -153,6 +158,33 @@
         border-radius: 12px;
         padding: 12px 16px;
         transition: opacity 0.2s;
+    }
+
+    /* 新增：填充模式 */
+    .input-wrapper.fill {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        box-sizing: border-box;
+    }
+
+    .input-wrapper.fill .input-row {
+        flex: 1;
+        align-items: stretch;
+        min-height: 0;
+    }
+
+    .input-wrapper.fill .input-box {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+    }
+
+    .input-wrapper.fill textarea {
+        flex: 1;
+        min-height: 0;
+        max-height: none;
     }
 
     .input-wrapper.disabled {

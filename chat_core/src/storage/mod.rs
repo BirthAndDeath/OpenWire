@@ -58,6 +58,31 @@ pub fn get_pool() -> Option<&'static Pool<Sqlite>> {
 async fn create_table_once(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     // 程序启动时执行一次建表语句
     // 创建 users 表
+    // 用户表 代表用户自己管理的身份/账号
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users(
+            accountid SERIAL PRIMARY KEY,
+            metadata TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    //设备表
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS devices(
+            accountid SERIAL PRIMARY KEY,
+            peerid SERIAL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    //联系人表
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS contacts(
