@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = ["isolation"] }
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { workspace = true }
 chat_core = { workspace = true }
 tauri = { version = "2", features = ["isolation"] }
 tauri-plugin-opener = "2"

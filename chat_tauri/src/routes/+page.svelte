@@ -46,6 +46,9 @@
   let sidebarWidth = $state(300);
   let inputHeight = $state(150);
 
+  // === 新增：添加好友状态 ===
+  let friendInputValue = $state("");
+
   // === 监听远程消息 ===
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -107,16 +110,76 @@
         : c,
     );
   }
+
+  // === 新增：添加好友 ===
+  function handleAddFriend() {
+    const pubkey = friendInputValue.trim();
+    if (!pubkey) return;
+
+    // TODO: 调用 Rust 验证公钥并创建会话
+    console.log("Adding friend:", pubkey);
+
+    // 临时模拟添加成功
+    const newContact = {
+      id: crypto.randomUUID(),
+      name: `User ${pubkey.slice(0, 8)}...`,
+      lastMessage: "新朋友",
+      lastTime: Date.now(),
+      unread: 0,
+      isOnline: false,
+    };
+
+    contacts = [...contacts, newContact];
+    friendInputValue = ""; // 清空输入
+  }
+
+  function handleFriendKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      handleAddFriend();
+    }
+  }
 </script>
 
 <main class="container">
   <!-- 左侧：联系人列表 -->
   <aside class="sidebar" style={`width: ${sidebarWidth}px`}>
-    <Contactlist
-      {contacts}
-      selectedId={selectedContactId}
-      onselect={handleSelectContact}
-    ></Contactlist>
+    <div class="sidebar-content">
+      <Contactlist
+        {contacts}
+        selectedId={selectedContactId}
+        onselect={handleSelectContact}
+      ></Contactlist>
+    </div>
+
+    <!-- 底部：添加好友输入框 -->
+    <div class="add-friend-box">
+      <input
+        type="text"
+        class="friend-input"
+        placeholder={$_("add_friend_placeholder") || "输入公钥添加好友..."}
+        bind:value={friendInputValue}
+        onkeydown={handleFriendKeydown}
+      />
+      <button
+        class="add-btn"
+        onclick={handleAddFriend}
+        disabled={!friendInputValue.trim()}
+        aria-label={$_("add_friend") || "添加好友"}
+      >
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+        >
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+      </button>
+    </div>
   </aside>
 
   <!-- 左侧分隔条：使用 slider 角色（交互式） -->
@@ -223,6 +286,70 @@
     border-right: 1px solid #2a2a2a;
     background: #0a0a0a;
     position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 添加好友区域 */
+  .add-friend-box {
+    padding: 12px;
+    border-top: 1px solid #2a2a2a;
+    background: #141414;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .friend-input {
+    flex: 1;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #f6f6f6;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .friend-input:focus {
+    border-color: #3b82f6;
+  }
+
+  .friend-input::placeholder {
+    color: #525252;
+  }
+
+  .add-btn {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #3b82f6;
+    border: none;
+    border-radius: 6px;
+    color: white;
+    cursor: pointer;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+
+  .add-btn:hover:not(:disabled) {
+    background: #2563eb;
+  }
+
+  .add-btn:disabled {
+    background: #2a2a2a;
+    color: #525252;
+    cursor: not-allowed;
   }
 
   .resize-handle {

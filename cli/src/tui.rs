@@ -1,4 +1,4 @@
-use chat_core::ChatCommand;
+use chat_core::{ChatCommand, ChatMessage};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
@@ -206,8 +206,13 @@ fn handle_input_focus(app: &mut App, key_code: KeyCode) {
             // 发送消息
             if !app.input.trim().is_empty() {
                 app.messages.push(app.input.clone());
+
                 app.app_data.cmd_tx.try_send(ChatCommand::SendMessage {
-                    message: app.input.clone(),
+                    message: {
+                        ChatMessage {
+                            data: app.input.clone(),
+                        }
+                    },
                 });
                 //send
                 app.input.clear();

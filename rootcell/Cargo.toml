@@ -1,52 +1,49 @@
 [package]
 name = "rootcell"
-version = "0.0.1"
-edition = "2024"
-description = "Securitycore of mychat"
-authors = ["Wang yuxuan ", "3589206993@qq.com"]
-license = "AGPL-3.0-only"
+version = "0.1.0"
+edition = "2021"
 
-[lib]
-crate-type = ["lib"]
+[features]
+default = []
+# 启用 WebAuthn 硬件支持（包含软件令牌）
+hardware-auth = ["dep:webauthn-authenticator-rs", "dep:webauthn-rs-proto"]
+# 启用 USB HID 硬件密钥支持（YubiKey 等）
+usb-hid = ["hardware-auth", "webauthn-authenticator-rs/u2fhid"]
+# 强制生产环境使用硬件（禁用软件回退）
+force-hardware = []
+tokio = ["dep:tokio"]
+
+
 [dependencies]
-ring = { version = "0.17", default-features = false, features = ["std"] }
-zeroize = { version = "1.8", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-ed25519-dalek = { version = "2", features = ["pkcs8", "zeroize", "rand_core"] }
-thiserror = "2.0.18"
-subtle = "2.6.1"
-getrandom = { version = "0.3.4", features = ["std"] }
+# 加密
+aes-gcm = "0.10"
+x25519-dalek = { version = "2.0", features = ["reusable_secrets", "getrandom"] }
+getrandom = "0.2"
+rand = "0.8"
+hkdf = "0.12"
+sha2 = "0.10"
 
+# 序列化
+postcard = { version = "1.0", features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
 
-# 硬件密钥访问（平台特定）
-[target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
-android-activity = { version = "0.6", features = ["native-activity"] }
+# 安全内存
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
 
-[target.'cfg(any(target_os = "ios"))'.dependencies]
-security-framework = "3.7.0"
-security-framework-sys = "2.17"
-keyring = { version = "3", features = ["apple-native"] }
+# 错误处理
+thiserror = "1.0"
 
-# Windows / Linux / macOS 通用
-[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-keyring = { version = "3", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native-sync-persistent",
-] }
-tss-esapi = { version = "7.6", optional = true }
+# WebAuthn（可选）
+webauthn-authenticator-rs = { version = "0.5", optional = true }
+webauthn-rs-proto = { version = "0.5", optional = true }
+async-trait = { version = "0.1" }
 
-[package.metadata.cargo-deny]
-# 禁止不安全代码的依赖
-multiple-versions = "warn"
-wildcards = "allow"
-highlight = "all"
+# 异步运行时（测试用）
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros"], optional = true }
 
-skip = []
-skip-tree = []
-[lints.rust]
-unsafe_code = "forbid"
-[package.metadata.docs.rs]
-# docs.rs 构建时使用
-no-deps = true
+[dev-dependencies]
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "integration"
+required-features = ["hardware-auth"]

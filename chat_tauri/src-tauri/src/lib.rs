@@ -4,13 +4,19 @@ use chat_core::ChatCommand;
 use libp2p::{
 
     gossipsub};
+    use chat_core::{ChatMessage, MessageEvent};
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-async fn send(state: tauri::State<'_, AppData>, message: &str) -> Result<bool, String> {
+async fn send(state: tauri::State<'_, AppData>, message: &str,receiver:Vec<u8>) -> Result<bool, String> {
     let result = state
         .cmd_tx
         .send(ChatCommand::SendMessage {
-            message: message.to_string(),
+            message:{ChatMessage{
+                receiver,
+                data: message.to_string(),
+            }
+            
+        }
         })
         .await;
 

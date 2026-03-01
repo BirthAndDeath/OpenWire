@@ -48,6 +48,7 @@ declare module '$env/static/private' {
 	export const TERM_PROGRAM_VERSION: string;
 	export const npm_package_json: string;
 	export const PANEL_GDK_CORE_DEVICE_EVENTS: string;
+	export const GK_GL_PATH: string;
 	export const GTK_MODULES: string;
 	export const SDL_IM_MODULE: string;
 	export const VSCODE_GIT_ASKPASS_MAIN: string;
@@ -101,6 +102,7 @@ declare module '$env/static/private' {
 	export const npm_lifecycle_event: string;
 	export const npm_package_version: string;
 	export const NO_AT_BRIDGE: string;
+	export const GK_GL_ADDR: string;
 	export const QT_IM_MODULE: string;
 	export const TAURI_ENV_FAMILY: string;
 	export const VSCODE_GIT_ASKPASS_EXTRA_ARGS: string;
@@ -170,6 +172,7 @@ declare module '$env/dynamic/private' {
 		TERM_PROGRAM_VERSION: string;
 		npm_package_json: string;
 		PANEL_GDK_CORE_DEVICE_EVENTS: string;
+		GK_GL_PATH: string;
 		GTK_MODULES: string;
 		SDL_IM_MODULE: string;
 		VSCODE_GIT_ASKPASS_MAIN: string;
@@ -223,6 +226,7 @@ declare module '$env/dynamic/private' {
 		npm_lifecycle_event: string;
 		npm_package_version: string;
 		NO_AT_BRIDGE: string;
+		GK_GL_ADDR: string;
 		QT_IM_MODULE: string;
 		TAURI_ENV_FAMILY: string;
 		VSCODE_GIT_ASKPASS_EXTRA_ARGS: string;

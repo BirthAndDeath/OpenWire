@@ -25,6 +25,7 @@ pub struct App {
     should_quit: bool,
     core: Option<ChatCore>,
     app_data: AppData,
+    credential_id: Vec<u8>,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 // 定义焦点枚举
