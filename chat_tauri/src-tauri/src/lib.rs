@@ -1,6 +1,6 @@
 
 use tauri::{Emitter, Manager};
-use chat_core::ChatCommand;
+use chat_core::{ChatCommand, ChatMessageType};
 use libp2p::{
 
     gossipsub};
@@ -12,8 +12,9 @@ async fn send(state: tauri::State<'_, AppData>, message: &str,receiver:Vec<u8>) 
         .cmd_tx
         .send(ChatCommand::SendMessage {
             message:{ChatMessage{
-                receiver,
-                data: message.to_string(),
+                msgtype:ChatMessageType::Text,
+                
+                data: message.to_string().into_bytes(),
             }
             
         }

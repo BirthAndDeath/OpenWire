@@ -3,7 +3,8 @@
 
     // === 类型定义 ===
     interface Contact {
-        id: string;
+        order: number;
+        peerid: string;
         name: string;
         avatar?: string;
         lastMessage?: string;
@@ -31,13 +32,15 @@
 
     // === 派生状态：过滤后的联系人 ===
     let filteredContacts = $derived(
-        contacts.filter(
-            (c) =>
-                c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                c.lastMessage
-                    ?.toLowerCase()
-                    .includes(searchQuery.toLowerCase()),
-        ),
+        contacts
+            .filter(
+                (c) =>
+                    c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                    c.lastMessage
+                        ?.toLowerCase()
+                        .includes(searchQuery.toLowerCase()),
+            )
+            .sort((a, b) => a.order - b.order),
     );
 
     // === 操作 ===
@@ -111,25 +114,25 @@
             <VList
                 bind:this={vlistRef}
                 data={filteredContacts}
-                getKey={(c: Contact) => c.id}
+                getKey={(c: Contact) => c.peerid}
             >
                 {#snippet children(contact)}
                     <div
                         class="contact-item"
-                        class:selected={selectedId === contact.id}
+                        class:selected={selectedId === contact.peerid}
                         class:online={contact.isOnline}
                         role="button"
                         tabindex="0"
-                        onclick={() => select(contact.id)}
+                        onclick={() => select(contact.peerid)}
                         onkeydown={(e) => {
                             if (e.key === "Enter" || e.key === " ") {
                                 e.preventDefault();
-                                select(contact.id);
+                                select(contact.peerid);
                             }
                         }}
                         oncontextmenu={(e) => {
                             e.preventDefault();
-                            oncontextmenu?.(e, contact.id);
+                            oncontextmenu?.(e, contact.peerid);
                         }}
                     >
                         <!-- 头像 -->

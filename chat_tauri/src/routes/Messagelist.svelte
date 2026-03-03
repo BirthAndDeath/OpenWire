@@ -51,17 +51,6 @@
         // await invoke("load_history", { before: oldestTs, limit: 30 });
         isLoadingHistory = false;
     }
-
-    // === 事件监听 ===
-    onMount(() => {
-        let unlisten: (() => void) | undefined;
-        (async () => {
-            unlisten = await listen<string>("chat-message", (e) =>
-                add(e.payload, false),
-            );
-        })();
-        return () => unlisten?.();
-    });
 </script>
 
 <div class="chat">

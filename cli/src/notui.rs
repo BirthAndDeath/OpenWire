@@ -1,6 +1,7 @@
 use crate::App;
 use chat_core::ChatCommand;
 use chat_core::ChatMessage;
+use chat_core::ChatMessageType;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
     // 获取对 core 的引用并启动它
@@ -46,8 +47,8 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
                     .send(ChatCommand::SendMessage {
                         message: {
                             ChatMessage {
-                                data: line.to_string(),
-                                receiver: app.app_data.credential_id.clone(),
+                                msgtype: ChatMessageType::Text,
+                                data: line.to_string().into_bytes(),
                             }
                         },
                     })

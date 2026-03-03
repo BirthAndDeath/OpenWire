@@ -911,6 +911,7 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "postcard",
  "quinn",
  "rootcell",
  "serde",

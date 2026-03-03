@@ -17,7 +17,17 @@
   let selectedContactId = $state<string | null>(null);
   let contacts = $state([
     {
-      id: "1",
+      order: 0,
+      peerid: "0",
+      name: "topic",
+      lastMessage: "欢迎来到聊天室（测试）使用主题订阅",
+      lastTime: Date.now(),
+      unread: 0,
+      isOnline: true,
+    },
+    {
+      order: 1,
+      peerid: "1",
       name: "Alice",
       lastMessage: "好的，明天见",
       lastTime: Date.now(),
@@ -25,7 +35,8 @@
       isOnline: true,
     },
     {
-      id: "2",
+      order: 2,
+      peerid: "2",
       name: "Bob",
       lastMessage: "收到",
       lastTime: Date.now() - 86400000,
@@ -33,7 +44,8 @@
       isOnline: false,
     },
     {
-      id: "3",
+      order: 3,
+      peerid: "3",
       name: "Charlie",
       lastMessage: "在吗？",
       lastTime: Date.now() - 172800000,
@@ -42,11 +54,11 @@
     },
   ]);
 
-  // === 新增状态：分隔条位置 ===
+  // === 分隔条位置 ===
   let sidebarWidth = $state(300);
   let inputHeight = $state(150);
 
-  // === 新增：添加好友状态 ===
+  // === 添加好友状态 ===
   let friendInputValue = $state("");
 
   // === 监听远程消息 ===
@@ -56,10 +68,11 @@
       unlisten = await listen<string>("chat-message", (e) => {
         // TODO: 根据 sender_id 路由到对应会话
         msgListRef?.add(e.payload, false);
+        console.log("Received message:", e.payload);
 
         // 更新联系人列表的最后消息
         contacts = contacts.map((c) =>
-          c.id === selectedContactId
+          c.peerid === selectedContactId
             ? { ...c, lastMessage: e.payload, lastTime: Date.now() }
             : c,
         );
@@ -105,7 +118,7 @@
 
     // 更新联系人列表
     contacts = contacts.map((c) =>
-      c.id === selectedContactId
+      c.peerid === selectedContactId
         ? { ...c, lastMessage: text, lastTime: Date.now() }
         : c,
     );
@@ -121,7 +134,8 @@
 
     // 临时模拟添加成功
     const newContact = {
-      id: crypto.randomUUID(),
+      order: contacts.length,
+      peerid: crypto.randomUUID(),
       name: `User ${pubkey.slice(0, 8)}...`,
       lastMessage: "新朋友",
       lastTime: Date.now(),
