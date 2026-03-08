@@ -2,19 +2,19 @@
 members = [
     "chat_core",
     "rootcell",
-    "cli",
+    "chat_cli",
     "chat_tauri/src-tauri",
-    "chat_dixious/packages/*",
+    "chat_dioxus/packages/*",
 ]
 resolver = "3"
 [workspace.dependencies]
 dioxus = { version = "0.7.3" }
 
 # workspace
-ui = { path = "chat_dixious/packages/ui" }
+ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
 chat_core = { path = "chat_core" }
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.50.0", features = ["full"] }
 [profile.dev]
 incremental = true # 以较小的步骤编译您的二进制文件。
 lto = false

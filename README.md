@@ -29,9 +29,10 @@ version:0.0.1
 
 ## 项目结构
 
-- /chat_cli 存放cli项目（rust命令行，基于ratatui）
-- /chat_tauri 存放tauri项目
-- /chat_dioxus 存放dioxus项目
+- /chat_cli 存放cli项目（rust命令行，基于ratatui，维护中）
+- /chat_tauri 存放tauri项目（维护中）
+- /chat_dioxus 存放dioxus项目（新建）
+- /chat_core 存放核心项目逻辑（演进中）
 
 ### chat app
 
