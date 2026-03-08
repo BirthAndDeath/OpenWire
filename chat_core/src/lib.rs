@@ -1,11 +1,7 @@
 use futures::StreamExt;
 use libp2p::kad::{Config as KadConfig, QueryResult};
 use libp2p::{PeerId, StreamProtocol};
-use libp2p::{
-    Swarm, dcutr, gossipsub, identify, mdns, noise, ping, relay,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
-};
+use libp2p::{Swarm, gossipsub};
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -64,8 +60,6 @@ pub struct ChatcoreEvent {
 pub struct Userinfo {
     /// X25519 公钥（32 字节）
     pub x25519_public: [u8; 32],
-    /// WebAuthn credential ID
-    pub credential_id: Vec<u8>,
 }
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 pub struct ChatCore {
@@ -90,6 +84,9 @@ impl ChatCore {
     /// 3. 初始化日志系统和存储层（并发执行）
     /// 4. 创建消息通道
     pub async fn try_init(cfg: CoreConfig) -> anyhow::Result<Self> {
+        if let Err(e) = init_logger(&cfg) {
+            return Err(anyhow::anyhow!("Failed to init logger:{}", e));
+        };
         let mut swarm = p2p::swarm_init()?;
 
         // 创建并订阅 Gossipsub 话题
@@ -101,7 +98,7 @@ impl ChatCore {
         let (tx, rx) = mpsc::channel(32);
 
         // 并发初始化日志和存储，任一失败则整体失败
-        let (_, _) = try_join!(init_logger(&cfg), storage::init(&cfg))?;
+        let _ = try_join!(storage::init(&cfg))?;
 
         Ok(ChatCore {
             swarm,

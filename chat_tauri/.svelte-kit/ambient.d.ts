@@ -51,7 +51,6 @@ declare module '$env/static/private' {
 	export const SSH_AGENT_PID: string;
 	export const XDG_SESSION_TYPE: string;
 	export const npm_node_execpath: string;
-	export const QT_WAYLAND_RECONNECT: string;
 	export const SHLVL: string;
 	export const npm_config_noproxy: string;
 	export const CHROME_DESKTOP: string;
@@ -242,7 +241,6 @@ declare module '$env/dynamic/private' {
 		SSH_AGENT_PID: string;
 		XDG_SESSION_TYPE: string;
 		npm_node_execpath: string;
-		QT_WAYLAND_RECONNECT: string;
 		SHLVL: string;
 		npm_config_noproxy: string;
 		CHROME_DESKTOP: string;

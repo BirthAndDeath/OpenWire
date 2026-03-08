@@ -26,7 +26,6 @@ impl CoreConfig {
         path_to_log: Option<impl Into<PathBuf>>,
         log_level: Option<impl Into<String>>,
     ) -> Self {
-        // 简化匹配：如果 path_to_log 为 None，直接返回无日志配置
         if path_to_log.is_none() {
             return Self {
                 database_path: database_path.into(),

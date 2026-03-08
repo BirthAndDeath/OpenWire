@@ -1,114 +1,64 @@
 <script lang="ts">
     import { VList } from "virtua/svelte";
-    import { listen } from "@tauri-apps/api/event";
-    import { onMount, tick } from "svelte";
+    import { tick } from "svelte";
 
-    // === 类型定义 ===
-    interface Message {
+    interface Msg {
         id: string;
         content: string;
-        timestamp: number;
-        isLocal: boolean;
+        ts: number;
+        me: boolean;
     }
 
-    // === 状态管理 ===
-    let messages = $state<Message[]>([]);
-    let vlistRef: any = $state(undefined);
-    let isLoadingHistory = $state(false);
-    let hasMoreHistory = $state(true);
-    let oldestTs = $state<number | null>(null);
+    let msgs = $state<Msg[]>([]);
+    let vlist: any;
 
-    // === 消息操作 ===
-    export function add(content: string, isLocal = false) {
-        if (!content.trim()) return;
-        messages = [
-            ...messages,
+    export function add(text: string, me = false) {
+        if (!text.trim()) return;
+        msgs = [
+            ...msgs,
             {
-                id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-                content: content.trim(),
-                timestamp: Date.now(),
-                isLocal,
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                content: text.trim(),
+                ts: Date.now(),
+                me,
             },
         ];
-        tick().then(() => scrollToBottom());
+        tick().then(() =>
+            vlist?.scrollToIndex(msgs.length - 1, { smooth: true }),
+        );
     }
+
     add("欢迎来到聊天室", true);
-    export function remove(id: string) {
-        messages = messages.filter((m) => m.id !== id);
-    }
 
-    function scrollToBottom() {
-        vlistRef?.scrollToIndex(messages.length - 1, {
-            smooth: true,
-            align: "end",
-        });
-    }
-
-    // === 历史加载 ===
-    async function loadHistory() {
-        if (isLoadingHistory || !hasMoreHistory) return;
-        isLoadingHistory = true;
-        // await invoke("load_history", { before: oldestTs, limit: 30 });
-        isLoadingHistory = false;
+    export function del(id: string) {
+        msgs = msgs.filter((m) => m.id !== id);
     }
 </script>
 
-<div class="chat">
-    {#if isLoadingHistory}
-        <div class="loading">加载中...</div>
-    {/if}
-
-    <VList
-        bind:this={vlistRef}
-        data={messages}
-        getKey={(m: Message) => m.id}
-        class="list"
-    >
-        {#snippet children(msg)}
-            <div class="msg" class:me={msg.isLocal}>
-                <div class="bubble">
-                    <p>{msg.content}</p>
-                    <time>{new Date(msg.timestamp).toLocaleTimeString()}</time>
-                </div>
-                <button class="del" onclick={() => remove(msg.id)}>×</button>
+<VList bind:this={vlist} data={msgs} getKey={(m) => m.id} class="list">
+    {#snippet children(m)}
+        <div class="msg" class:me={m.me}>
+            <div class="bubble">
+                <p>{m.content}</p>
+                <time>{new Date(m.ts).toLocaleTimeString()}</time>
             </div>
-        {/snippet}
-    </VList>
-</div>
+            <button class="x" onclick={() => del(m.id)}>×</button>
+        </div>
+    {/snippet}
+</VList>
 
 <style>
-    :global(.chat) {
-        display: flex;
-        flex-direction: column;
-        width: 100%;
-        height: 100%;
-        background: #0f0f0f;
-        position: relative;
-    }
-
     :global(.virtua-scroll-view) {
-        flex: 1;
         padding: 16px;
-    }
-
-    .loading {
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        text-align: center;
-        padding: 8px;
-        background: rgba(0, 0, 0, 0.8);
-        color: #666;
-        font-size: 12px;
-        z-index: 10;
+        background: #0f0f0f;
+        height: 100%;
     }
 
     .msg {
         display: flex;
+        gap: 8px;
         margin-bottom: 12px;
         align-items: flex-start;
-        gap: 8px;
     }
     .msg.me {
         flex-direction: row-reverse;
@@ -121,10 +71,9 @@
         background: #1a1a1a;
         color: #fafafa;
     }
-    .msg.me .bubble {
+    .me .bubble {
         background: #3b82f6;
     }
-
     .bubble p {
         margin: 0;
         font-size: 14px;
@@ -138,7 +87,7 @@
         margin-top: 4px;
     }
 
-    .del {
+    .x {
         width: 20px;
         height: 20px;
         border-radius: 50%;
@@ -147,15 +96,11 @@
         color: #666;
         cursor: pointer;
         opacity: 0;
-        transition: all 0.2s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
     }
-    .msg:hover .del {
+    .msg:hover .x {
         opacity: 1;
     }
-    .del:hover {
+    .x:hover {
         background: rgba(239, 68, 68, 0.2);
         color: #ef4444;
     }

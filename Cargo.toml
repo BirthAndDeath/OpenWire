@@ -7,28 +7,30 @@ members = [
     "chat_dioxus/packages/*",
 ]
 resolver = "3"
+
 [workspace.dependencies]
 dioxus = { version = "0.7.3" }
-
-# workspace
+# workspace dependencies
 ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
 chat_core = { path = "chat_core" }
-tokio = { version = "1.50.0", features = ["full"] }
+tokio = { version = "1.40.0", features = ["full"] }  
+
 [profile.dev]
-incremental = true # 以较小的步骤编译您的二进制文件。
+incremental = true  # Compile your binary in smaller steps.
 lto = false
 
 [profile.release]
-codegen-units = 1        # 允许 LLVM 执行更好的优化。
-lto = true               # 启用链接时优化。
-opt-level = 's'          # 's'优先考虑小的二进制文件大小。如果您更喜欢速度，请使用 `3`。
-panic = "abort"          # 通过禁用 panic 处理程序来提高性能。
-strip = true             # 确保移除调试符号。
-debug = false            # 无调试符号（或 limited）
+codegen-units = 1        # Allow LLVM to perform better optimizations.
+lto = true               # Enable Link Time Optimization.
+opt-level = 's'          # 's' prioritizes small binary size. Use `3` if you prefer speed.
+panic = "abort"          # Improve performance by disabling panic handlers.
+strip = true             # Ensure debug symbols are removed.
+debug = false            # No debug symbols (or limited)
 debug-assertions = false
-overflow-checks = true   # 保持溢出检查（安全关键）
+overflow-checks = true   # Keep overflow checks (security critical)
 rpath = false
+
 [profile.hot]
 inherits = "release"
 

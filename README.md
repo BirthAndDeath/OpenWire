@@ -1,8 +1,8 @@
 # Chat
 
-Chat是一个基于 Tauri 框架构建的跨平台应用程序，目前处于非常早期的开发阶段。本项目旨在提供一个高性能、低资源占用的通用通信工具。
+Chat是一个跨平台应用程序，目前处于非常早期的开发阶段。本项目旨在提供一个高性能、低资源占用的通用通信工具。
 
-仅演示，生产自负
+***仅演示，生产自负***
 
 ## 目标
 
@@ -17,7 +17,7 @@ Chat是一个基于 Tauri 框架构建的跨平台应用程序，目前处于非
 
 ## License
 
-This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
+This project is licensed under the [**GNU Affero General Public License v3.0**](LICENSE).
 出于对通信软件安全性的考虑，暂定为AGPLv3.0
 
 ## 项目状态
@@ -29,7 +29,7 @@ version:0.0.1
 
 ## 项目结构
 
-- /chat_cli 存放cli项目（rust命令行，基于ratatui，维护中）
+- /chat_cli 存放cli项目（基于ratatui，维护中）
 - /chat_tauri 存放tauri项目（维护中）
 - /chat_dioxus 存放dioxus项目（新建）
 - /chat_core 存放核心项目逻辑（演进中）
@@ -54,16 +54,21 @@ version:0.0.1
 ### 开发环境搭建
 
 如果使用Tauri，请确保已安装Tauri CLI。
-如果cargo网络超时，可以使用镜像源
+[安装tauri cli](https://tauri.app/zh-cn/start/prerequisites/)
+
+如果cargo网络超时，可以尝试使用镜像源
 
 ```bash
 # 克隆项目后进入目录
 cd myapp
 
+# 进入tauri项目
+cd chat_tauri
+
 # 安装依赖
 npm install
 
-# 启动开发服务器
+# 开发调试
 npm tauri dev
 ```
 
@@ -73,7 +78,9 @@ npm tauri dev
 cargo run
 ```
 
-单独运行cli事例
+运行cli事例
+
+todo:考虑是否迁移到dioxus
 
 ### 开发构建
 
@@ -84,6 +91,7 @@ npm tauri build
 
 ---
 开发群 QQ:1083388325
+[bilibili account](<https://space.bilibili.com/3494362084280927/>)
 
 ## HISTORY
 

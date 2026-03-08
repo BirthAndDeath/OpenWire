@@ -2,73 +2,58 @@
     import { invoke } from "@tauri-apps/api/core";
     import { slide } from "svelte/transition";
 
-    // === Props ===
     let {
         onsend,
         disabled = false,
-        fill = false, // 新增：填充父容器
-    }: {
-        onsend?: (text: string) => void;
+        fill = false,
+    } = $props<{
+        onsend?: (t: string) => void;
         disabled?: boolean;
         fill?: boolean;
-    } = $props();
+    }>();
 
-    // === 状态 ===
-    let content = $state("");
-    let isSending = $state(false);
-    let error = $state("");
-    let success = $state(false);
-    let inputRef: HTMLTextAreaElement;
+    let text = $state("");
+    let sending = $state(false);
+    let err = $state("");
+    let ok = $state(false);
+    let area: HTMLTextAreaElement;
 
-    // === 发送逻辑 ===
     async function submit() {
-        if (!content.trim() || isSending || disabled) return;
-
-        isSending = true;
-        error = "";
-        success = false;
-
+        if (!text.trim() || sending || disabled) return;
+        sending = true;
+        err = "";
         try {
-            await invoke("send", { message: content.trim() });
-            onsend?.(content.trim());
-            content = "";
-            success = true;
-            resetHeight();
-            setTimeout(() => (success = false), 3000);
-        } catch (err) {
-            error = (err as Error).message;
+            await invoke("send", { message: text.trim() });
+            onsend?.(text.trim());
+            text = "";
+            ok = true;
+            setTimeout(() => (ok = false), 2000);
+        } catch (e) {
+            err = String(e);
         } finally {
-            isSending = false;
+            sending = false;
+            area.style.height = "auto";
         }
     }
 
-    function resetHeight() {
-        if (inputRef) inputRef.style.height = "auto";
+    function resize(node: HTMLTextAreaElement) {
+        const fn = () =>
+            (node.style.height = Math.min(node.scrollHeight, 300) + "px");
+        node.addEventListener("input", fn);
+        return { destroy: () => node.removeEventListener("input", fn) };
     }
 
-    function onKeydown(e: KeyboardEvent) {
-        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-            e.preventDefault();
-            submit();
-        }
-    }
-
-    function autoResize(node: HTMLTextAreaElement) {
-        const resize = () => {
-            node.style.height = "auto";
-            node.style.height = Math.min(node.scrollHeight, 300) + "px";
-        };
-        node.addEventListener("input", resize);
-        return { destroy: () => node.removeEventListener("input", resize) };
-    }
+    const onKey = (e: KeyboardEvent) => {
+        if (e.ctrlKey && e.key === "Enter") e.preventDefault(), submit();
+    };
 </script>
 
-<div class="input-wrapper" class:disabled class:fill>
+<div class="wrap" class:disabled class:fill>
     {#if disabled}
-        <div class="overlay">选择联系人以开始聊天</div>
+        <div class="mask">选择联系人以开始聊天</div>
     {/if}
 
-    <div class="security-badge">
+    <div class="badge">
         <svg
             width="12"
             height="12"
@@ -83,39 +68,31 @@
         <span>E2EE</span>
     </div>
 
-    <form
-        onsubmit={(e) => {
-            e.preventDefault();
-            submit();
-        }}
-        class="input-row"
-    >
-        <div class="input-box">
+    <form onsubmit={(e) => (e.preventDefault(), submit())} class="row">
+        <div class="box">
             <textarea
-                bind:this={inputRef}
-                bind:value={content}
-                use:autoResize
+                bind:this={area}
+                bind:value={text}
+                use:resize
                 placeholder={disabled ? "请先选择联系人..." : "输入消息..."}
                 maxlength="4096"
                 rows="1"
-                disabled={isSending || disabled}
-                onkeydown={onKeydown}
+                disabled={sending || disabled}
+                onkeydown={onKey}
             ></textarea>
-            <div class="input-hints" class:disabled>
-                <span>Ctrl + Enter</span>
-                <span class:limit={content.length > 3500}>
-                    {content.length}/4096
-                </span>
+            <div class="hints" class:disabled>
+                <span>Ctrl+Enter</span>
+                <span class:warn={text.length > 3500}>{text.length}/4096</span>
             </div>
         </div>
 
         <button
             type="submit"
-            class="send-btn"
-            class:loading={isSending}
-            disabled={!content.trim() || isSending || disabled}
+            class="btn"
+            class:loading={sending}
+            disabled={!text.trim() || sending || disabled}
         >
-            {#if isSending}
+            {#if sending}
                 <svg class="spin" width="20" height="20" viewBox="0 0 24 24">
                     <circle
                         cx="12"
@@ -136,67 +113,56 @@
                     stroke="currentColor"
                     stroke-width="2"
                 >
-                    <line x1="22" y1="2" x2="11" y2="13" />
-                    <polygon points="22,2 15,22 11,13 2,9" />
+                    <line x1="22" y1="2" x2="11" y2="13" /><polygon
+                        points="22,2 15,22 11,13 2,9"
+                    />
                 </svg>
             {/if}
         </button>
     </form>
 
-    {#if error}
-        <div class="toast error" transition:slide>{error}</div>
-    {:else if success}
-        <div class="toast success" transition:slide>已发送</div>
+    {#if err}
+        <div class="toast err" transition:slide>{err}</div>
+    {:else if ok}
+        <div class="toast ok" transition:slide>已发送</div>
     {/if}
 </div>
 
 <style>
-    .input-wrapper {
+    .wrap {
         position: relative;
         background: #1a1a1a;
         border: 1px solid #2a2a2a;
         border-radius: 12px;
         padding: 12px 16px;
-        transition: opacity 0.2s;
     }
-
-    /* 新增：填充模式 */
-    .input-wrapper.fill {
+    .wrap.fill {
         width: 100%;
         height: 100%;
         display: flex;
         flex-direction: column;
-        box-sizing: border-box;
     }
-
-    .input-wrapper.fill .input-row {
+    .wrap.fill .row {
         flex: 1;
         align-items: stretch;
-        min-height: 0;
     }
-
-    .input-wrapper.fill .input-box {
+    .wrap.fill .box {
         display: flex;
         flex-direction: column;
-        min-height: 0;
     }
-
-    .input-wrapper.fill textarea {
+    .wrap.fill textarea {
         flex: 1;
-        min-height: 0;
         max-height: none;
     }
-
-    .input-wrapper.disabled {
+    .wrap.disabled {
         opacity: 0.6;
     }
 
-    .overlay {
+    .mask {
         position: absolute;
         inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        display: grid;
+        place-items: center;
         background: rgba(15, 15, 15, 0.8);
         border-radius: 12px;
         color: #525252;
@@ -204,7 +170,7 @@
         z-index: 10;
     }
 
-    .security-badge {
+    .badge {
         display: inline-flex;
         align-items: center;
         gap: 4px;
@@ -217,22 +183,19 @@
         font-weight: 600;
     }
 
-    .input-row {
+    .row {
         display: flex;
         gap: 12px;
         align-items: flex-end;
     }
-
-    .input-box {
+    .box {
         flex: 1;
         background: #0f0f0f;
         border: 1px solid #333;
         border-radius: 8px;
         padding: 10px 12px;
-        transition: border-color 0.2s;
     }
-
-    .input-box:focus-within {
+    .box:focus-within {
         border-color: #3b82f6;
     }
 
@@ -247,16 +210,14 @@
         resize: none;
         outline: none;
     }
-
     textarea::placeholder {
         color: #525252;
     }
-
     textarea:disabled {
         cursor: not-allowed;
     }
 
-    .input-hints {
+    .hints {
         display: flex;
         justify-content: space-between;
         margin-top: 6px;
@@ -264,22 +225,19 @@
         color: #525252;
         font-family: monospace;
     }
-
-    .input-hints.disabled {
+    .hints.disabled {
         opacity: 0.5;
     }
-
-    .input-hints .limit {
+    .hints .warn {
         color: #ef4444;
         font-weight: 600;
     }
 
-    .send-btn {
+    .btn {
         width: 40px;
         height: 40px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+        display: grid;
+        place-items: center;
         background: #3b82f6;
         border: none;
         border-radius: 8px;
@@ -288,26 +246,21 @@
         transition: all 0.2s;
         flex-shrink: 0;
     }
-
-    .send-btn:hover:not(:disabled) {
+    .btn:hover:not(:disabled) {
         background: #2563eb;
         transform: translateY(-1px);
     }
-
-    .send-btn:disabled {
+    .btn:disabled {
         opacity: 0.4;
         cursor: not-allowed;
-        transform: none;
     }
-
-    .send-btn.loading {
+    .btn.loading {
         background: #404040;
     }
 
     .spin {
         animation: spin 1s linear infinite;
     }
-
     @keyframes spin {
         to {
             transform: rotate(360deg);
@@ -320,13 +273,11 @@
         border-radius: 6px;
         font-size: 13px;
     }
-
-    .toast.error {
+    .toast.err {
         background: rgba(239, 68, 68, 0.1);
         color: #ef4444;
     }
-
-    .toast.success {
+    .toast.ok {
         background: rgba(34, 197, 94, 0.1);
         color: #22c55e;
     }
