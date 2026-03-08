@@ -909,7 +909,6 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "futures",
- "hex",
  "keyring",
  "libp2p",
  "postcard",
@@ -922,7 +921,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -1478,7 +1476,6 @@ dependencies = [
  "digest",
  "fiat-crypto",
  "rustc_version",
- "serde",
  "subtle",
  "zeroize",
 ]
