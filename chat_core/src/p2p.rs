@@ -1,20 +1,16 @@
-use futures::StreamExt;
 use libp2p::kad::{self, Mode, store::MemoryStore};
-use libp2p::kad::{Config as KadConfig, QueryResult};
+use libp2p::kad::Config as KadConfig;
+//use libp2p::request_response::{self};
+
 use libp2p::{PeerId, StreamProtocol};
+
 use libp2p::{
     Swarm, dcutr, gossipsub, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
-use serde::{Deserialize, Serialize};
 use std::num::NonZero;
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    time::Duration,
-};
-use tokio::time::error::Elapsed;
+use std::time::Duration;
 
 use crate::{ChatCore, ChatMessage, ChatMessageType};
 /// libp2p 网络行为组合：Gossipsub（消息广播）+ mDNS（局域网发现）
@@ -64,25 +60,25 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
             let peer_id = key.public().to_peer_id();
             // --- Gossipsub 配置 ---
 
-            // 消息 ID 生成：基于内容哈希，相同内容不重复传播
+            
+
             let message_id_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
+                let hash = blake3::hash(&message.data);
+                gossipsub::MessageId::from(hash.to_hex().as_str())
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                // 心跳间隔：10 秒，调试友好（生产可缩短至 1 秒）
-                .heartbeat_interval(Duration::from_secs(10))
-                // 严格验证：强制消息签名，防伪造
+                .heartbeat_interval(Duration::from_secs(1)) // 生产用 1s
                 .validation_mode(gossipsub::ValidationMode::Strict)
-                // 内容寻址：相同数据不产生重复传播
                 .message_id_fn(message_id_fn)
-                .max_transmit_size(64 * 1024) // 64KB 上限
+                .max_transmit_size(64 * 1024)
+                // 可选：限制 mesh 规模防资源耗尽
+                .mesh_outbound_min(2)
+                .mesh_n_low(2)
+                .mesh_n_high(6)
                 .build()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-            // 创建 Gossipsub：使用 Ed25519 签名消息
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
@@ -223,7 +219,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
             info,
-            connection_id,
+            connection_id: _,
         })) => {
             tracing::info!(
                 "Identified {} with {} protocols",

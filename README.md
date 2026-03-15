@@ -34,12 +34,12 @@ version:0.0.1
 - /chat_dioxus 存放dioxus项目（新建）
 - /chat_core 存放核心项目逻辑（演进中）
 
-### chat app
+### chat_tauri
 
 - **框架**: Tauri 2
 - **后端**: Rust
 
-### chat cli
+### chat_cli
 
 - **界面**: ratatui
 
@@ -89,9 +89,12 @@ todo:考虑是否迁移到dioxus
 npm tauri build
 ```
 
----
-开发群 QQ:1083388325
-[bilibili account](<https://space.bilibili.com/3494362084280927/>)
+## 联系
+
+- 开发群 QQ:1083388325
+- [bilibili account](<https://space.bilibili.com/3494362084280927/>)
+
+欢迎贡献！在未明确申明的情况下，默认您的贡献遵守本项目的license
 
 ## HISTORY
 
@@ -100,12 +103,9 @@ npm tauri build
 
 ## PLAN
 
-先搭建基础框架
+搭建基础框架ing
 未来展望：
-点对点加密
-身份密钥认证
-算力共享(？)
-以及各种可能的设想
+算力共享？
 
 ### 吐槽
 

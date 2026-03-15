@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = ["isolation"] }
 [dependencies]
 tokio = { workspace = true }
 chat_core = { workspace = true }
+tracing = { workspace = true }
 tauri = { version = "2", features = ["isolation"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }

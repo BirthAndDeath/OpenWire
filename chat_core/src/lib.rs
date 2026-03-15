@@ -1,13 +1,7 @@
 use futures::StreamExt;
-use libp2p::kad::{Config as KadConfig, QueryResult};
-use libp2p::{PeerId, StreamProtocol};
 use libp2p::{Swarm, gossipsub};
 
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    time::Duration,
-};
+use std::hash::Hasher;
 use tokio::sync::mpsc;
 use tokio::try_join;
 mod coreconfig;
@@ -56,11 +50,8 @@ pub struct ChatcoreEvent {
     pub event: MessageEvent,
     pub data: String,
 }
-#[derive(Debug)]
-pub struct Userinfo {
-    /// X25519 公钥（32 字节）
-    pub x25519_public: [u8; 32],
-}
+/// 初始化：首次运行时执行
+fn first_run() {}
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议

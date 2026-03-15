@@ -1,3 +1,14 @@
 {
-  "svelte.enable-ts-plugin": true
+  "svelte.enable-ts-plugin": true,
+  "editor.formatOnSave": true,
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true,
+  },
+  // 检查配置
+  "rust-analyzer.checkOnSave": true,
+  "rust-analyzer.check.command": "clippy",
+  // 补全与辅助
+  "rust-analyzer.completion.autoimport.enable": true,
+  "rust-analyzer.assist.emitMustUse": true
 }
