@@ -3,28 +3,41 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt};
-
+//✅稳定中
+// 标记是否已初始化
+static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+// 文件日志 guard（仅在文件日志模式下持有）
 static LOGGER_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEBUG_LOG_LEVEL: &str = "debug";
 
 /// 初始化日志系统
 ///
-/// 根据配置决定是否记录文件日志或控制台日志
+/// 根据配置决定是否记录文件日志或控制台日志。
+/// 可安全多次调用，后续调用会被忽略。
 ///
 /// # 参数
 /// * `cfg` - 核心配置，包含日志级别和日志路径信息
 ///
 /// # 返回值
-/// * `Ok(())` - 初始化成功
-/// * `Err(anyhow::Error)` - 初始化失败
+/// * `Ok(())` - 初始化成功或已经初始化
+/// * `Err(anyhow::Error)` - 初始化失败（仅在第一次调用时可能失败）
 pub fn init_logger(cfg: &CoreConfig) -> anyhow::Result<()> {
+    // 防止重复初始化
+    if LOGGER_INIT.set(()).is_err() {
+        tracing::debug!("Logger already initialized, skipping");
+        return Ok(());
+    }
+
     let env_filter = build_filter(cfg.log_level.as_deref())?;
 
-    if let Some(path) = &cfg.path_to_log {
-        let guard = LOGGER_GUARD.get_or_init(|| init_file_logger(path, &env_filter));
-        // 确保 guard 被引用，避免 Drop
-        let _ = guard;
-    } else {
-        init_console_logger(&env_filter)?;
+    match &cfg.path_to_log {
+        Some(path) => {
+            let guard = init_file_logger(path, &env_filter)?;
+            LOGGER_GUARD.set(guard).ok();
+        }
+        None => init_console_logger(&env_filter)?,
     }
 
     Ok(())
@@ -45,9 +58,9 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
         .or_else(|_| {
             let default = level.unwrap_or_else(|| {
                 if cfg!(debug_assertions) {
-                    "debug"
+                    DEBUG_LOG_LEVEL
                 } else {
-                    "info"
+                    DEFAULT_LOG_LEVEL
                 }
             });
             EnvFilter::try_new(default)
@@ -60,38 +73,39 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
 /// 创建日志目录并设置非阻塞文件写入器
 ///
 /// # 参数
-/// * `path` - 日志文件存储路径
+/// * `path` - 日志文件存储路径（将被规范化）
 /// * `filter` - 环境过滤器
 ///
 /// # 返回值
-/// * `WorkerGuard` - 工作线程守卫，确保日志写入完成
-fn init_file_logger(path: &Path, filter: &EnvFilter) -> WorkerGuard {
-    validate_log_path(path).expect("Invalid log path");
+/// * `Ok(WorkerGuard)` - 工作线程守卫，确保日志写入完成
+/// * `Err(anyhow::Error)` - 初始化失败
+fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGuard> {
+    std::fs::create_dir_all(&path)?;
+    let safe_path = validate_log_path(path)?; // 规范化后的安全路径
+    std::fs::create_dir_all(&safe_path).expect("Failed to create log directory");
 
-    std::fs::create_dir_all(path).expect("Failed to create log directory");
-
-    let log_file = path.join("app.log");
+    let log_file = safe_path.join("app.log");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_file)
-        .expect("Failed to open log file");
+        .open(&log_file)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
 
     fmt()
+        .with_ansi(false)
         .with_writer(non_blocking)
         .with_env_filter(filter.clone())
         .try_init()
-        .expect("logger init error");
+        .expect("Failed to init File logger");
 
     tracing::info!(
         filter = %filter,
-        path = %path.display(),
+        path = %safe_path.display(),
         "File logger initialized"
     );
 
-    guard
+    Ok(guard)
 }
 
 /// 初始化控制台日志记录器
@@ -105,7 +119,6 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> WorkerGuard {
 /// * `Ok(())` - 初始化成功
 /// * `Err(anyhow::Error)` - 初始化失败
 fn init_console_logger(filter: &EnvFilter) -> anyhow::Result<()> {
-    // try_init 避免重复初始化 panic
     fmt()
         .with_env_filter(filter.clone())
         .try_init()
@@ -117,7 +130,7 @@ fn init_console_logger(filter: &EnvFilter) -> anyhow::Result<()> {
 
 /// 验证日志路径的安全性
 ///
-/// 检查路径中是否包含父目录遍历组件，防止路径穿越攻击
+/// 检查路径中是否包含父目录遍历组件，并将路径规范化为绝对路径。
 ///
 /// # 参数
 /// * `path` - 待验证的路径
@@ -133,11 +146,14 @@ fn validate_log_path(path: &Path) -> anyhow::Result<PathBuf> {
         anyhow::bail!("Path traversal detected in log path");
     }
 
-    // 验证父目录
-    let canonical_base = path
-        .parent()
-        .and_then(|p| p.canonicalize().ok())
-        .unwrap_or_else(|| path.to_path_buf());
+    // 尝试规范化为绝对路径
+    // 如果路径本身不存在，则尝试规范化其父目录
+    let canonical = path.canonicalize().or_else(|_| {
+        path.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p.join(path.file_name().unwrap_or_default()))
+            .ok_or_else(|| anyhow::anyhow!("Invalid log path: cannot resolve"))
+    })?;
 
-    Ok(canonical_base)
+    Ok(canonical)
 }
