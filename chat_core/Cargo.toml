@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libp2p = { version = "0.56.0", features = [
+    "dns",
     "tokio",
     "cbor",
     "request-response",
@@ -19,6 +20,9 @@ libp2p = { version = "0.56.0", features = [
     "yamux",
     "quic",
     "kad",
+    "rsa",
+    "secp256k1",
+    "ed25519",
 ] }
 anyhow = "1.0.102"
 futures = "0.3.32"
@@ -37,6 +41,7 @@ aes-gcm = "0.10.3"
 keyring = "3.6.3"
 snap = "1.1.1"
 blake3 = "1.8.3"
+rand = "0.10.0"
 
 [package.metadata.docs.rs]
 no-deps = true
