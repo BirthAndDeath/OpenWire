@@ -1,7 +1,5 @@
 {
 	"compilerOptions": {
-		"forceConsistentCasingInFileNames": true,
-		"strict": true,
 		"paths": {
 			"$lib": [
 				"../src/lib"

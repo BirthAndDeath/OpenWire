@@ -1,1 +1,17 @@
+[source.crates-io]
+replace-with = "ustc"
 
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+[source.sjtu]
+registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
+
+[net]
+git-fetch-with-cli = true
+
+[build]
+jobs = 4
