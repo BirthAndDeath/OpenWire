@@ -8,7 +8,6 @@ libp2p = { version = "0.56.0", features = [
     "tokio",
     "cbor",
     "request-response",
-    "gossipsub",
     "mdns",
     "relay",
     "identify",

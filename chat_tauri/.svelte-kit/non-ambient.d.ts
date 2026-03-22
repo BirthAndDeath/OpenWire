@@ -26,6 +26,8 @@ export {};
 
 
 declare module "$app/types" {
+	type MatcherParam<M> = M extends (param : string) => param is (infer U extends string) ? U : string;
+
 	export interface AppTypes {
 		RouteId(): "/" | "/about";
 		RouteParams(): {
