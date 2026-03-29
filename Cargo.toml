@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
-dioxus = { version = "0.7.3" }
+dioxus = { version = "0.7.4" }
 # workspace dependencies
 ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
@@ -36,3 +36,4 @@ inherits = "release"
 
 [profile.pgo]
 inherits = "release"
+
