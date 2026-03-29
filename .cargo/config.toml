@@ -15,5 +15,7 @@ registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
 
 [build]
 #jobs = 4
+[unstable]
+gc = true
 [cache]
 auto-clean-frequency = "1 day"

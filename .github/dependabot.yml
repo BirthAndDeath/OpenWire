@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+    # 分组更新，将多个依赖合并到一个 PR
+    groups:
+      tokio:
+        patterns:
+          - "tokio*"
+        update-types:
+          - "minor"
+          - "patch"
+      tauri:
+        patterns: ["tauri*", "serde*", "specta*"]
+
+    versioning-strategy: "auto"
+
+  - package-ecosystem: "npm"
+    directory: "/chat-tauri"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    labels:
+      - "dependencies"
+      - "javascript"
+    open-pull-requests-limit: 10
+    groups:
+      tauri-frontend:
+        patterns: ["@tauri-apps/*", "svelte*", "vite*"]
+        update-types: [minor, patch]
+      types:
+        patterns: ["@types/*", "typescript*"]
+      lint:
+        patterns: ["eslint*", "prettier*"]
+  # 检查 GitHub Actions 工作流
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

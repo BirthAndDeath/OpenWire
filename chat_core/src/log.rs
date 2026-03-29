@@ -56,7 +56,7 @@ pub fn init_logger(cfg: &CoreConfig) -> anyhow::Result<()> {
 fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
     EnvFilter::try_from_default_env()
         .or_else(|_| {
-            let default = level.unwrap_or_else(|| {
+            let default = level.unwrap_or({
                 if cfg!(debug_assertions) {
                     DEBUG_LOG_LEVEL
                 } else {
@@ -80,11 +80,10 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
 /// * `Ok(WorkerGuard)` - 工作线程守卫，确保日志写入完成
 /// * `Err(anyhow::Error)` - 初始化失败
 fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGuard> {
-    std::fs::create_dir_all(&path)?;
+    std::fs::create_dir_all(path).expect("Failed to create log directory");
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
-    std::fs::create_dir_all(&safe_path).expect("Failed to create log directory");
 
-    let log_file = safe_path.join("app.log");
+    let log_file = safe_path.join("chat.log");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

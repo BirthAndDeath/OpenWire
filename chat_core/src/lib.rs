@@ -1,7 +1,8 @@
-use futures::StreamExt;
-use libp2p::{Swarm, gossipsub};
+use std::{num::NonZeroUsize, time::Instant};
 
-use std::hash::Hasher;
+use futures::StreamExt;
+use keyring::{Entry, Result};
+use libp2p::{PeerId, Swarm, mdns};
 use tokio::sync::mpsc;
 use tokio::try_join;
 mod coreconfig;
@@ -10,7 +11,7 @@ mod p2p;
 use log::init_logger;
 mod storage;
 pub use coreconfig::CoreConfig;
-
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[repr(u8)]
@@ -27,7 +28,10 @@ pub struct ChatMessage {
     /// 消息内容
     pub data: Vec<u8>,
 }
-
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatResponse {
+    timestamp: u64,
+}
 /// 控制命令：外部向核心发送的指令
 #[derive(Debug)]
 pub enum ChatCommand {
@@ -44,6 +48,8 @@ pub enum MessageEvent {
     Error,
     /// 日志信息（连接状态等）
     Log,
+    /// 警告信息
+    Warning,
 }
 /// 通道消息结构：核心向外部（UI）发送的事件包装
 pub struct ChatcoreEvent {
@@ -56,47 +62,43 @@ fn first_run() {}
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
     pub swarm: Swarm<p2p::MyBehaviour>,
-    /// 当前订阅的话题（聊天室标识）
-    pub topic: gossipsub::IdentTopic,
+    /*/// 当前订阅的话题（聊天室标识）
+    pub topic: gossipsub::IdentTopic,*/
     /// 消息发送通道：向外部（UI）发送事件
     pub tx_message: mpsc::Sender<ChatcoreEvent>,
     /// 消息接收通道：外部可取走事件（Option 用于 run() 时 take）
     pub rx_message: Option<mpsc::Receiver<ChatcoreEvent>>,
     /// 命令接收通道：接收外部控制指令
     pub rx_cmd: mpsc::Receiver<ChatCommand>,
+    pub mdns_cache: LruCache<PeerId, Instant>,
 }
 
 impl ChatCore {
     /// 异步初始化核心
-    ///
-    /// # 流程
-    /// 1. 初始化 libp2p swarm（网络层）
-    /// 2. 订阅默认话题 "test-net"
-    /// 3. 初始化日志系统和存储层（并发执行）
-    /// 4. 创建消息通道
+    const MDNS_CACHE_SIZE: usize =2000;//mdns缓存大小
     pub async fn try_init(cfg: CoreConfig) -> anyhow::Result<Self> {
         if let Err(e) = init_logger(&cfg) {
             return Err(anyhow::anyhow!("Failed to init logger:{}", e));
         };
-        let mut swarm = p2p::swarm_init()?;
+        let swarm = p2p::swarm_init()?;
 
-        // 创建并订阅 Gossipsub 话题
-        // 注意：所有节点需使用相同话题名才能互通
+        /*// 创建并订阅 Gossipsub 话题
+        // 注意：需使用相同话题名才能互通
         let topic = gossipsub::IdentTopic::new("test-net");
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;*/
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(32);
-
-        // 并发初始化日志和存储，任一失败则整体失败
         let _ = try_join!(storage::init(&cfg))?;
+        let mdns_cache = LruCache::new(NonZeroUsize::new(Self::MDNS_CACHE_SIZE).unwrap());
 
         Ok(ChatCore {
             swarm,
             tx_message: tx,
             rx_message: Some(rx),
-            topic,
+            //topic,
             rx_cmd: cfg.rx_cmd,
+            mdns_cache,
         })
     }
 
@@ -117,6 +119,7 @@ impl ChatCore {
                 .expect("Failed to build tokio runtime");
 
             rt.block_on(async move {
+                
                 // 主事件循环：三路 select
                 loop {
                     tokio::select! {
@@ -127,6 +130,7 @@ impl ChatCore {
 
                         // 2. 控制命令：外部发送（UI/CLI）
                         Some(cmd) = self.rx_cmd.recv() => {
+                            
                             match cmd {
                                 ChatCommand::SendMessage { message} => {
                                     self.send_message(ChatMessage{msgtype:ChatMessageType::Text,data: message.data});
@@ -151,14 +155,14 @@ impl ChatCore {
     pub fn send_message(&mut self, data: ChatMessage) -> anyhow::Result<()> {
         let bytes =
             postcard::to_allocvec(&data).map_err(|e| anyhow::anyhow!("Postcard failed: {}", e))?;
-        if let Err(e) = self
+        /*if let Err(e) = self
             .swarm
             .behaviour_mut()
             .gossipsub
             .publish(self.topic.clone(), bytes)
         {
             tracing::error!("Publish error: {e:?}");
-        }
+        }*/
         Ok(())
     }
     pub fn send_to() {}

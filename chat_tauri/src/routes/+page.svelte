@@ -6,6 +6,26 @@
   import Input from "./Input.svelte";
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
+  import { fly } from "svelte/transition";
+  let warning = $state<string | null>(null);
+  let timeout: ReturnType<typeof setTimeout>;
+
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+
+    (async () => {
+      unlisten = await listen<string>("warning", (e) => {
+        warning = e.payload;
+        clearTimeout(timeout);
+        timeout = setTimeout(() => (warning = null), 5000);
+      });
+    })();
+
+    return () => {
+      unlisten?.();
+      clearTimeout(timeout);
+    };
+  });
 
   // === 状态 ===
   let msgListRef = $state<ReturnType<typeof Messagelist>>();
@@ -162,7 +182,18 @@
         <div class="empty">选择联系人开始聊天</div>
       {/if}
     </div>
-
+    {#if warning}
+      <div
+        class="toast"
+        transition:fly={{
+          y: -20,
+          duration: 300,
+          easing: (t) => Math.sin((t * Math.PI) / 2),
+        }}
+      >
+        {warning}
+      </div>
+    {/if}
     <div
       class="resizer-h"
       style="top: calc(100% - {inputH}px)"
@@ -222,7 +253,45 @@
     background: #2a2a2a;
     cursor: not-allowed;
   }
+  .toast {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(255, 68, 68, 0.95);
+    color: white;
+    padding: 12px 20px;
+    border-radius: 40px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    z-index: 1000;
+    font-weight: 500;
+    font-size: 14px;
+    text-align: center;
+    max-width: 80vw;
+    word-break: break-word;
+    backdrop-filter: blur(4px);
+    animation: fadeOut 4s ease forwards;
+  }
 
+  @keyframes fadeOut {
+    0% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.9);
+    }
+    15% {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    85% {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    100% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.9);
+      visibility: hidden;
+    }
+  }
   .resizer-v,
   .resizer-h {
     position: absolute;

@@ -43,9 +43,9 @@ pub async fn init_path(path: &Path) -> anyhow::Result<()> {
     }
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(7)
         .min_connections(1)
-        .acquire_timeout(Duration::from_secs(10))
+        .acquire_timeout(Duration::from_secs(7))
         .connect_with(
             SqliteConnectOptions::new()
                 .filename(path)
@@ -54,6 +54,10 @@ pub async fn init_path(path: &Path) -> anyhow::Result<()> {
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
                 .pragma("cache_size", "-64000")
+                .pragma("mmap_size", "268435456") // 内存映射，提升大查询性能
+                .pragma("journal_size_limit", "67108864") // 限制 WAL 文件大小，避免无限膨胀
+                .pragma("temp_store", "memory")
+                .optimize_on_close(true, None)
                 .busy_timeout(Duration::from_secs(5)),
         )
         .await?;

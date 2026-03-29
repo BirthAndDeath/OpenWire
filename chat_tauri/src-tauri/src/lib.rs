@@ -1,16 +1,10 @@
-
-use std::thread::spawn;
-
-use tauri::async_runtime::spawn_blocking;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use chat_core::{ChatCommand, ChatMessageType};
-use libp2p::{
 
-    gossipsub};
     use chat_core::{ChatMessage, MessageEvent};
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-async fn send(state: tauri::State<'_, AppData>, message: &str,receiver:Vec<u8>) -> Result<bool, String> {
+async fn send(state: tauri::State<'_, AppData>, message: &str) -> Result<bool, String> {
     let result = state
         .cmd_tx
         .send(ChatCommand::SendMessage {
@@ -35,7 +29,6 @@ use tokio::sync::mpsc;
 
 pub struct AppData {
     pub cmd_tx: mpsc::Sender<ChatCommand>,
-    pub topic:gossipsub::IdentTopic,
 }
     #[cfg_attr(mobile, tauri::mobile_entry_point)]
     pub fn run() {
@@ -55,7 +48,7 @@ pub struct AppData {
                             let (cmd_tx,cmd_rx) = mpsc::channel::<ChatCommand>(64);
     
                            
-                            // ❗ Swarm 必须在 spawn_local 中（!Send）
+                        
     
                             let db_path = apphandle
                                 .path()
@@ -66,7 +59,7 @@ pub struct AppData {
                                 .path()
                                 .app_log_dir()
                                 .expect("获取log目录失败")
-                                .join("log.txt");
+                                ;
     
                             // 确保目录存在
                             if let Some(parent) = db_path.parent() {
@@ -96,7 +89,7 @@ pub struct AppData {
                             };
                             apphandle.manage(AppData {
                                 cmd_tx: cmd_tx.clone(),//you can use this to send commands to here
-                                topic: core.topic.clone(),
+
                             });
     
     
@@ -112,7 +105,22 @@ pub struct AppData {
                         tokio::select! {
                                
                                 Some(msg) = rx.recv()=> {
-                                    app_handle_for_events.emit("chat-message", msg.data).ok();
+                                    match msg.event {
+                                        MessageEvent::Log => {
+                                          
+                                        }
+                                        MessageEvent::NewMessage => {
+                                            app_handle_for_events.emit("chat-message", msg.data).ok();
+                                        }
+                                        MessageEvent::Warning => {
+                                            app_handle_for_events.emit("warning", msg.data).ok();
+                                        }
+                                        MessageEvent::Error => {
+                                            app_handle_for_events.emit("error", msg.data).ok();
+                                        }
+                                        
+                                    }
+                                    
                                 }
                                 // 心跳
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
@@ -131,17 +139,24 @@ pub struct AppData {
             .build(tauri::generate_context!())
       .expect("error while running tauri application")
             .run(|apphandle, event| match event {
-    RunEvent::Exit => cleanup(&apphandle),
-    _ => {}
+    RunEvent::Exit => cleanup(apphandle),
+    RunEvent::Ready=> {},
+    _=>{}
 })
             
     }
-    
+const FORCE_EXIT_TIMEOUT :std::time::Duration= std::time::Duration::from_secs(30) ;
   fn cleanup(app: &AppHandle) {
-  
-        app.state::<AppData>().cmd_tx.try_send(chat_core::ChatCommand::Shutdown);
-   
-        
-        // 关闭数据库连接、保存状态等
+    let start_time = std::time::Instant::now();
+    while let Err(e) = app.state::<AppData>().cmd_tx.try_send(chat_core::ChatCommand::Shutdown) {
+        if start_time.elapsed() >= FORCE_EXIT_TIMEOUT{
+            tracing::error!("Shutdown command timeout after 30 seconds, forcing exit");
+            app.emit("warning","Shutdown command timeout after 30 seconds, forcing exit" ).ok();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            break;
+        }
+        app.emit("warning",format!("Error sending shutdown command: {e}")).ok();
+        tracing::error!("Error sending shutdown command: {}", e);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-
+}

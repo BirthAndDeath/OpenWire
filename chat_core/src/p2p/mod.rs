@@ -1,18 +1,21 @@
-use libp2p::kad::{self, Mode, store::MemoryStore};
-use libp2p::kad::Config as KadConfig;
-//use libp2p::request_response::{self};
-
-use libp2p::{PeerId, StreamProtocol};
-
+use libp2p::kad::{self, Config as KadConfig, Mode, store::MemoryStore};
+use libp2p::request_response::{
+    Config as rrconfig, Event as RequestResponseEvent, Message as RequestResponseMessage,
+    ProtocolSupport, cbor, cbor::codec::Codec,
+};
 use libp2p::{
-    Swarm, dcutr, gossipsub, identify, mdns, noise, ping, relay,
+    PeerId, StreamProtocol, Swarm, dcutr, dns, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
-use std::num::NonZero;
-use std::time::Duration;
 
-use crate::{ChatCore, ChatMessage, ChatMessageType};
+use std::num::NonZero;
+use std::ops::Deref;
+use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
+mod bootstrap;
+use crate::{ChatCore, ChatMessage, ChatMessageType, ChatResponse};
 /// libp2p 网络行为组合：Gossipsub（消息广播）+ mDNS（局域网发现）
 ///
 /// 设计选择：
@@ -20,8 +23,10 @@ use crate::{ChatCore, ChatMessage, ChatMessageType};
 /// - mDNS: 零配置局域网发现，无需中心服务器
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
-    /// Gossipsub 协议：发布/订阅消息广播
-    pub gossipsub: gossipsub::Behaviour,
+    rr: cbor::Behaviour<ChatMessage, ChatResponse>,
+    /*Gossipsub 协议：发布/订阅消息广播
+    状态：正在弃用迁移
+    pub gossipsub: gossipsub::Behaviour,*/
     /// mDNS 协议：局域网内自动发现对等节点
     mdns: mdns::tokio::Behaviour,
     /// Kademlia 协议：分布式哈希表，用于节点定位和路由
@@ -30,10 +35,8 @@ pub struct MyBehaviour {
     ping: ping::Behaviour,
     // Identify 协议（地址/协议交换）
     identify: identify::Behaviour,
-
     // Relay 协议（NAT 穿透，可选）
     relay: relay::Behaviour,
-
     // DCUtR 协议（直连升级，配合 Relay）
     dcutr: dcutr::Behaviour,
 }
@@ -45,6 +48,12 @@ pub struct MyBehaviour {
 /// - 补充：QUIC（原生 TLS 1.3，性能更优）
 /// - 发现：mDNS 局域网自动发现
 /// - 消息：Gossipsub 广播
+use std::sync::LazyLock;
+
+static PROTOCOL_KAD: LazyLock<StreamProtocol> =
+    LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1"));
+static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
+    LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1/request-response/0.0.1"));
 pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -52,15 +61,15 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
         .with_tcp(
             tcp::Config::default(),
             noise::Config::new,     // XX 握手模式
-            yamux::Config::default, // 可靠流复用
+            yamux::Config::default, // 流复用
         )?
         // QUIC 传输层：内置 TLS 1.3，0-RTT，更好 NAT 穿透
         .with_quic()
+        // DNS 解析（支持 /dns4, /dns6, /dnsaddr）
+        .with_dns()?
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
-            // --- Gossipsub 配置 ---
-
-            
+            /*// --- Gossipsub 配置 ---
 
             let message_id_fn = |message: &gossipsub::Message| {
                 let hash = blake3::hash(&message.data);
@@ -68,11 +77,10 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
             };
 
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(1)) // 生产用 1s
+                .heartbeat_interval(Duration::from_secs(1))
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .message_id_fn(message_id_fn)
                 .max_transmit_size(64 * 1024)
-                // 可选：限制 mesh 规模防资源耗尽
                 .mesh_outbound_min(2)
                 .mesh_n_low(2)
                 .mesh_n_high(6)
@@ -82,7 +90,16 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
-            )?;
+            )?;*/
+            let codec = Codec::<ChatMessage, ChatResponse>::default()
+                .set_request_size_maximum(10 * 1024 * 1024) // 10MB
+                .set_response_size_maximum(100 * 1024 * 1024); // 100MB
+
+            let rr = cbor::Behaviour::with_codec(
+                codec,
+                [(PROTOCOL_MSGRR.deref().to_owned(), ProtocolSupport::Full)],
+                rrconfig::default(),
+            );
 
             // --- mDNS 配置 ---
             let mdns =
@@ -100,7 +117,8 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
             Ok(MyBehaviour {
-                gossipsub,
+                rr,
+                //gossipsub,
                 mdns,
                 kademlia,
                 ping,
@@ -127,7 +145,7 @@ fn create_kademlia(peer_id: PeerId) -> kad::Behaviour<MemoryStore> {
     let store = MemoryStore::new(peer_id);
 
     // 配置Kademlia网络参数
-    let mut config = KadConfig::new(StreamProtocol::new("/rootcell/kad/0.0.1"));
+    let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let _ = &mut config
         .set_query_timeout(Duration::from_secs(60))
         .set_replication_factor(NonZero::new(20).unwrap())
@@ -138,8 +156,18 @@ fn create_kademlia(peer_id: PeerId) -> kad::Behaviour<MemoryStore> {
 
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, config);
     kademlia.set_mode(Some(Mode::Server));
+    for (peerid, addr) in bootstrap::BOOTSTRAP {
+        kademlia.add_address(
+            &PeerId::from_str(peerid).unwrap(),
+            bootstrap::resolve_dnsaddr(addr),
+        );
+    }
+    if let Err(e) = kademlia.bootstrap() {
+        tracing::trace!("Bootstrap error: {}", e);
+    }
     kademlia
 }
+const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// 处理 Swarm 网络事件
 ///
 /// # 事件分类处理
@@ -148,11 +176,96 @@ fn create_kademlia(peer_id: PeerId) -> kad::Behaviour<MemoryStore> {
 /// - 连接管理：建立、关闭、错误
 pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCore) {
     match event {
+        //request-response
+        // 收到请求
+        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::Message {
+            peer,
+            connection_id,
+            message:
+                RequestResponseMessage::Request {
+                    channel,
+                    request,
+                    request_id,
+                },
+        })) => {
+            println!("收到: {:?} from {}", request, peer);
+
+            let response = ChatResponse {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            };
+
+            // 发送响应
+            if let Err(e) = core
+                .swarm
+                .behaviour_mut()
+                .rr
+                .send_response(channel, response)
+            {
+                eprintln!("发送响应失败: {:?}", e);
+            }
+        }
+
+        // 收到响应
+        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::Message {
+            message: RequestResponseMessage::Response { response, .. },
+            ..
+        })) => {
+            println!("响应: {:?}", response);
+        }
+
+        // 请求发送失败
+        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::OutboundFailure {
+            peer,
+            error,
+            ..
+        })) => {
+            eprintln!("向 {} 发送失败: {:?}", peer, error);
+        }
+
+        // 入站失败
+        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::InboundFailure {
+            peer,
+            error,
+            ..
+        })) => {
+            eprintln!("来自 {} 的入站失败: {:?}", peer, error);
+        }
+
+        // 响应已发送
+        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::ResponseSent {
+            ..
+        })) => {
+            println!("响应已发送");
+        }
+
         // --- mDNS 发现 ---
         SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            let now = Instant::now();
             for (peer_id, multiaddr) in list {
-                if &peer_id == core.swarm.local_peer_id() {
-                    continue; // 过滤自己
+                match core.mdns_cache.get(&peer_id) {
+                    Some(last_seen) => {
+                        if now.duration_since(*last_seen) >= MDNS_REFRESH_INTERVAL {
+                            // 间隔足够，更新并处理
+                            core.mdns_cache.put(peer_id, now);
+                            core.swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .add_address(&peer_id, multiaddr);
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => {
+                        // 首次发现，加入缓存
+                        core.mdns_cache.put(peer_id, now);
+                        core.swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, multiaddr);
+                    }
                 }
                 tracing::info!("mDNS discovered: {peer_id}");
 
@@ -162,10 +275,6 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                     .gossipsub
                     .add_explicit_peer(&peer_id);*/
                 // 添加到 Kademlia
-                core.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .add_address(&peer_id, multiaddr);
             }
         }
 
@@ -173,14 +282,12 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer_id, _multiaddr) in list {
                 tracing::info!("mDNS expired: {peer_id}");
-                core.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .remove_explicit_peer(&peer_id);
+                // 从去重缓存中移除，以便下次发现时重新处理
+                core.mdns_cache.pop(&peer_id);
             }
         }
 
-        // --- Gossipsub 消息 ---
+        /*// --- Gossipsub 消息 ---
         SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source: peer_id,
             message_id: id,
@@ -213,7 +320,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                 ))
                 .await;
             }
-        }
+        }*/
 
         // --- Identify 事件（获取 peer 信息）---
         SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
@@ -221,6 +328,12 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
             info,
             connection_id: _,
         })) => {
+            for multiaddr in info.listen_addrs {
+                core.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, multiaddr);
+            }
             tracing::info!(
                 "Identified {} with {} protocols",
                 peer_id,
