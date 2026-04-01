@@ -18,7 +18,7 @@ tokio = ["dep:tokio"]
 # 加密
 aes-gcm = "0.10"
 x25519-dalek = { version = "2.0", features = ["reusable_secrets", "getrandom"] }
-getrandom = "0.2"
+getrandom = "0.4"
 rand = "0.10"
 hkdf = "0.12"
 sha2 = "0.11"
