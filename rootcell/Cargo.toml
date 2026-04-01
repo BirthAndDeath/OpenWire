@@ -31,7 +31,7 @@ serde = { version = "1.0", features = ["derive"] }
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 # 错误处理
-thiserror = "1.0"
+thiserror = "2.0"
 
 # WebAuthn（可选）
 webauthn-authenticator-rs = { version = "0.5", optional = true }
