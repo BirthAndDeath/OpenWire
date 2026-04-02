@@ -1,7 +1,7 @@
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use chat_core::{ChatCommand, ChatMessageType};
-
-    use chat_core::{ChatMessage, MessageEvent};
+use chat_core::{ChatMessage, MessageEvent};
+mod p2p_protocol;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 async fn send(state: tauri::State<'_, AppData>, message: &str) -> Result<bool, String> {
@@ -36,8 +36,40 @@ pub struct AppData {
     
         let handle = rt.handle().clone();
         tauri::Builder::default()
-            .plugin(tauri_plugin_opener::init())
-            .setup(|app| {
+        /* .register_uri_scheme_protocol("p2p", |app, request| {
+            let uri = request.uri().to_string();
+            
+            let parts: Vec<&str> = uri.strip_prefix("p2p://")
+                .unwrap_or("")
+                .splitn(2, '/')
+                .collect();
+            
+            if parts.len() != 2 {
+                return tauri::http::Response::builder()
+                    .status(400)
+                    .body(Vec::new())
+                    .unwrap();
+            }
+            
+            let peer_id = parts[0];
+            let resource = format!("/{}", parts[1]);
+            
+            // 获取状态
+            let p2p = app.state::<P2PState>();
+            
+            let result = tauri::async_runtime::block_on(async {
+                // ... P2P 请求逻辑
+                vec![]
+            });
+            
+            tauri::http::Response::builder()
+                .status(200)
+                .header("Content-Type", "application/octet-stream")
+                .body(result)
+                .unwrap()
+        })*/
+            .plugin(tauri_plugin_opener::init())          
+            .setup(|app| {              
                 let apphandle = app.handle().clone();
                 
                 std::thread::spawn(move || {

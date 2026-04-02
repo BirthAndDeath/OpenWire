@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 use std::time::Instant;
 mod bootstrap;
+mod dht;
 use crate::{ChatCore, ChatMessage, ChatMessageType, ChatResponse};
 /// libp2p 网络行为组合：Gossipsub（消息广播）+ mDNS（局域网发现）
 ///
@@ -39,6 +40,7 @@ pub struct MyBehaviour {
     relay: relay::Behaviour,
     // DCUtR 协议（直连升级，配合 Relay）
     dcutr: dcutr::Behaviour,
+    //rendezvous: rendezvous::client::Behaviour,考虑添加服务申明
 }
 
 /// 初始化 libp2p Swarm
