@@ -978,6 +978,7 @@ dependencies = [
  "postcard",
  "quinn",
  "rand 0.10.0",
+ "redb",
  "rootcell",
  "serde",
  "sled",
@@ -6988,6 +6989,15 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "redb"
+version = "3.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b440f171acaaddcd7e65eefc2ce4f4d4e05c1dffe2afe23f81af2a87cbfc4e0d"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
