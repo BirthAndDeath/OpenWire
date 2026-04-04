@@ -24,7 +24,7 @@ pub struct App {
 
     should_quit: bool,
     core: Option<ChatCore>,
-    app_data: AppData,
+    core_handle: chat_core::CoreHandle,
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 // 定义焦点枚举
@@ -38,8 +38,7 @@ impl App {
     pub async fn try_init() -> anyhow::Result<App> {
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // 默认选中第一条消息
-        let (cmd_tx, cmd_rx) = mpsc::channel::<ChatCommand>(64);
-        let app_data = AppData { cmd_tx };
+
         let home_dir = std::env::home_dir().expect("failedto get home dir");
         let database_path = home_dir.join(".chat/database.sqlite");
         let log_path = home_dir.join(".chat/log");
@@ -48,9 +47,9 @@ impl App {
         #[cfg(not(debug_assertions))]
         let log_level = "info";
 
-        let cfg =
-            chat_core::CoreConfig::new(database_path, cmd_rx, Some(log_path), Some(log_level));
+        let cfg = chat_core::CoreConfig::new(database_path, Some(log_path), Some(log_level));
         let core = chat_core::ChatCore::try_init(cfg).await?;
+        let core_handle = core.core_handle.clone();
 
         Ok(App {
             current_focus: Focus::Input,
@@ -64,7 +63,7 @@ impl App {
             input: String::new(),
             should_quit: false,
             core: Some(core),
-            app_data,
+            core_handle,
         })
     }
 }

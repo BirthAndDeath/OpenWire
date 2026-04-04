@@ -76,8 +76,7 @@ pub struct AppData {
                     handle.block_on(async {
                         let local = tokio::task::LocalSet::new();
                         let _result_local = local.run_until(async {
-                            // 创建通道用于这里 -> core 通信
-                            let (cmd_tx,cmd_rx) = mpsc::channel::<ChatCommand>(64);
+                            
     
                            
                         
@@ -101,13 +100,13 @@ pub struct AppData {
                                 std::fs::create_dir_all(parent).ok();
                             }
                             #[cfg(debug_assertions)]
-            let log_level = "debug";
-            #[cfg(not(debug_assertions))]
-            let log_level = "info";
+                            let log_level = "debug";
+                            #[cfg(not(debug_assertions))]
+                            let log_level = "info";
     
                             let cfg = chat_core::CoreConfig::new(
                                 db_path,
-                                cmd_rx,
+                                
                                 Some(log_path),
                                 Some(log_level)
                             );
@@ -120,7 +119,7 @@ pub struct AppData {
                                 }
                             };
                             apphandle.manage(AppData {
-                                cmd_tx: cmd_tx.clone(),//you can use this to send commands to here
+                                cmd_tx: core.core_handle.cmd_tx.clone(),
 
                             });
     

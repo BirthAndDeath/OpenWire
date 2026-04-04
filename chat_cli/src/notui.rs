@@ -26,7 +26,7 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
     });
 
     // 创建一个任务来处理用户输入
-    let cmd_tx = app.app_data.cmd_tx.clone();
+    let cmd_tx = app.core_handle.cmd_tx.clone();
     let input_handler = tokio::spawn(async move {
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin);
@@ -68,7 +68,7 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
     let _ = tokio::join!(message_handler, input_handler);
 
     // 发送关闭命令
-    let _ = app.app_data.cmd_tx.try_send(ChatCommand::Shutdown);
+    let _ = app.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
 
     // 等待核心服务结束
     let result = core_joinhandle.join();

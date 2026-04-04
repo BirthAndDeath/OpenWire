@@ -207,7 +207,7 @@ fn handle_input_focus(app: &mut App, key_code: KeyCode) {
             if !app.input.trim().is_empty() {
                 app.messages.push(app.input.clone());
 
-                app.app_data.cmd_tx.try_send(ChatCommand::SendMessage {
+                app.core_handle.cmd_tx.try_send(ChatCommand::SendMessage {
                     message: {
                         ChatMessage {
                             msgtype: ChatMessageType::Text,
@@ -294,7 +294,7 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
         }
         terminal.draw(|frame| tui_render(frame, &app))?;
     }
-    let result_cmd = app.app_data.cmd_tx.try_send(ChatCommand::Shutdown);
+    let result_cmd = app.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
     print!("结束通道命令结果{:?}", result_cmd);
     let result_thread = core_joinhandle.join();
     print!("结束后台线程 结果{:?}", result_thread);

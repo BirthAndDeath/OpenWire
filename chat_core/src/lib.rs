@@ -58,6 +58,10 @@ pub struct ChatcoreEvent {
 }
 /// 初始化：首次运行时执行
 fn first_run() {}
+#[derive(Debug, Clone)]
+pub struct CoreHandle{
+pub cmd_tx: mpsc::Sender<ChatCommand>,
+}
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
@@ -71,6 +75,8 @@ pub struct ChatCore {
     /// 命令接收通道：接收外部控制指令
     pub rx_cmd: mpsc::Receiver<ChatCommand>,
     pub mdns_cache: LruCache<PeerId, Instant>,
+    /// 核心句柄：用于外部控制核心
+    pub core_handle: CoreHandle,
 }
 
 impl ChatCore {
@@ -88,17 +94,18 @@ impl ChatCore {
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;*/
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(64);
         let _ = try_join!(storage::init(&cfg))?;
         let mdns_cache = LruCache::new(NonZeroUsize::new(Self::MDNS_CACHE_SIZE).unwrap());
 
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ChatCommand>(64);
         Ok(ChatCore {
             swarm,
             tx_message: tx,
-            rx_message: Some(rx),
-            //topic,
-            rx_cmd: cfg.rx_cmd,
+            rx_message: Some(rx),    
+            rx_cmd: cmd_rx,
             mdns_cache,
+            core_handle: CoreHandle { cmd_tx },
         })
     }
 
