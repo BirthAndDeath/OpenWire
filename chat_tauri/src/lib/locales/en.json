@@ -1,5 +1,10 @@
 {
     "about": "About",
     "details": "Details:",
-    "home": "Home"
+    "home": "Home",
+    "add_friend": "Add friend",
+    "language": "Language",
+    "secure_chat": "Secure Chat",
+    "tagline1": "End-to-end encryption · Decentralized · Privacy-first",
+    "tagline2": "Simple, Safe, Secure"
 }

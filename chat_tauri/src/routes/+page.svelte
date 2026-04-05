@@ -1,6 +1,6 @@
 <script lang="ts">
   import "../lib/i18n";
-  import { _ } from "svelte-i18n";
+  import { _, locale } from "svelte-i18n";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Input from "./Input.svelte";
@@ -9,6 +9,21 @@
   import { fly } from "svelte/transition";
   let warning = $state<string | null>(null);
   let timeout: ReturnType<typeof setTimeout>;
+
+  // 语言选项
+  const languages = [
+    { code: "en", name: "English" },
+    { code: "zh", name: "中文" },
+    { code: "fr", name: "Français" },
+    { code: "es", name: "Español" },
+    { code: "de", name: "Deutsch" },
+    { code: "ja", name: "日本語" },
+  ];
+
+  // 切换语言
+  function changeLanguage(lang: string) {
+    locale.set(lang);
+  }
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -151,6 +166,20 @@
 
 <main class="container">
   <aside class="sidebar" style="width: {sidebarW}px">
+    <!-- 语言选择器 -->
+    <div class="language-selector">
+      <label for="lang-select">{$_("language")}:</label>
+      <select
+        id="lang-select"
+        bind:value={$locale}
+        onchange={(e) => changeLanguage(e.target.value)}
+      >
+        {#each languages as lang}
+          <option value={lang.code}>{lang.name}</option>
+        {/each}
+      </select>
+    </div>
+
     <Contactlist {contacts} {selectedId} onselect={select} />
 
     <div class="add-friend">
@@ -226,6 +255,25 @@
     flex-direction: column;
     background: #0a0a0a;
     border-right: 1px solid #2a2a2a;
+  }
+  .language-selector {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px;
+    border-bottom: 1px solid #2a2a2a;
+  }
+  .language-selector label {
+    font-size: 14px;
+    color: #fafafa;
+  }
+  .language-selector select {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: inherit;
+    font-size: 14px;
   }
   .add-friend {
     display: flex;

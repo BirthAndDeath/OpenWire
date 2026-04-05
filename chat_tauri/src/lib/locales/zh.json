@@ -1,5 +1,10 @@
 {
     "about": "关于",
     "details": "详情:",
-    "home": "主页"
+    "home": "主页",
+    "add_friend": "添加好友",
+    "language": "语言",
+    "secure_chat": "安全聊天",
+    "tagline1": "端到端加密 · 去中心化 · 隐私优先",
+    "tagline2": "简单、安全、可靠"
 }

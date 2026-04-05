@@ -11,9 +11,9 @@
         >
             <img src="/logo.svg" alt="Chat Logo" />
         </a>
-        <h1>Secure Chat</h1>
-        <p class="tagline">端到端加密 · 去中心化 · 隐私优先</p>
-        <p class="tagline">Simple, Safe, Secure</p>
+        <h1>{$_("secure_chat")}</h1>
+        <p class="tagline">{$_("tagline1")}</p>
+        <p class="tagline">{$_("tagline2")}</p>
     </div>
 
     <div class="links">
