@@ -19,7 +19,7 @@ pub const BOOTSTRAP: &[(&str, &str)] = &[
         "QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
         "/dnsaddr/sg1.bootstrap.libp2p.io",
     ),
-    (
+    /*(
         "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
         "/ip4/104.131.131.82/tcp/4001",
     ),
@@ -54,7 +54,7 @@ pub const BOOTSTRAP: &[(&str, &str)] = &[
     (
         "QmSoLju6m7xTh3DuokvT3886QRYqxAzb1kShaanJgW36yx",
         "/ip4/104.236.151.122/tcp/4001",
-    ),
+    ), */
 ];
 
 /// 解析 dnsaddr 为实际地址

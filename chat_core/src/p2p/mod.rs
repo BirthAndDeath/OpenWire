@@ -4,7 +4,7 @@ use libp2p::request_response::{
     ProtocolSupport, cbor, cbor::codec::Codec,
 };
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, dcutr, dns, identify, mdns, noise, ping, relay,
+    PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
@@ -24,10 +24,8 @@ use crate::{ChatCore, ChatMessage, ChatMessageType, ChatResponse};
 /// - mDNS: 零配置局域网发现，无需中心服务器
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
-    rr: cbor::Behaviour<ChatMessage, ChatResponse>,
-    /*Gossipsub 协议：发布/订阅消息广播
-    状态：正在弃用迁移
-    pub gossipsub: gossipsub::Behaviour,*/
+    pub rr_msg: cbor::Behaviour<ChatMessage, ChatResponse>,
+
     /// mDNS 协议：局域网内自动发现对等节点
     mdns: mdns::tokio::Behaviour,
     /// Kademlia 协议：分布式哈希表，用于节点定位和路由
@@ -55,7 +53,7 @@ use std::sync::LazyLock;
 static PROTOCOL_KAD: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1"));
 static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
-    LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1/request-response/0.0.1"));
+    LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1/rr_msg/0.0.1"));
 pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -71,33 +69,12 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
         .with_dns()?
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
-            /*// --- Gossipsub 配置 ---
 
-            let message_id_fn = |message: &gossipsub::Message| {
-                let hash = blake3::hash(&message.data);
-                gossipsub::MessageId::from(hash.to_hex().as_str())
-            };
-
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(1))
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .message_id_fn(message_id_fn)
-                .max_transmit_size(64 * 1024)
-                .mesh_outbound_min(2)
-                .mesh_n_low(2)
-                .mesh_n_high(6)
-                .build()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;*/
             let codec = Codec::<ChatMessage, ChatResponse>::default()
-                .set_request_size_maximum(10 * 1024 * 1024) // 10MB
-                .set_response_size_maximum(100 * 1024 * 1024); // 100MB
+                .set_request_size_maximum(1024 * 1024) // 1MB
+                .set_response_size_maximum(64 * 1024); // 64KB
 
-            let rr = cbor::Behaviour::with_codec(
+            let rr_msg = cbor::Behaviour::with_codec(
                 codec,
                 [(PROTOCOL_MSGRR.deref().to_owned(), ProtocolSupport::Full)],
                 rrconfig::default(),
@@ -119,7 +96,7 @@ pub fn swarm_init() -> anyhow::Result<Swarm<MyBehaviour>> {
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
             Ok(MyBehaviour {
-                rr,
+                rr_msg,
                 //gossipsub,
                 mdns,
                 kademlia,
@@ -180,7 +157,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
     match event {
         //request-response
         // 收到请求
-        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::Message {
+        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
             peer,
             connection_id,
             message:
@@ -203,7 +180,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
             if let Err(e) = core
                 .swarm
                 .behaviour_mut()
-                .rr
+                .rr_msg
                 .send_response(channel, response)
             {
                 eprintln!("发送响应失败: {:?}", e);
@@ -211,7 +188,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         }
 
         // 收到响应
-        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::Message {
+        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
             message: RequestResponseMessage::Response { response, .. },
             ..
         })) => {
@@ -219,7 +196,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         }
 
         // 请求发送失败
-        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::OutboundFailure {
+        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::OutboundFailure {
             peer,
             error,
             ..
@@ -228,7 +205,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         }
 
         // 入站失败
-        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::InboundFailure {
+        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::InboundFailure {
             peer,
             error,
             ..
@@ -237,7 +214,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         }
 
         // 响应已发送
-        SwarmEvent::Behaviour(MyBehaviourEvent::Rr(RequestResponseEvent::ResponseSent {
+        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::ResponseSent {
             ..
         })) => {
             println!("响应已发送");

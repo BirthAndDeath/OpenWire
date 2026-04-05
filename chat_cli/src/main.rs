@@ -32,6 +32,9 @@ async fn main() -> anyhow::Result<()> {
         } else {
             tui_run(&mut app).await?;
         }
+    } else {
+        //非终端输出，面向shell调用，输出精简的json格式
+        todo!("实现json输出");
     }
 
     Ok(())

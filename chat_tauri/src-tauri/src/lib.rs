@@ -4,20 +4,23 @@ use chat_core::{ChatMessage, MessageEvent};
 mod p2p_protocol;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-async fn send(state: tauri::State<'_, AppData>, message: &str) -> Result<bool, String> {
+async fn send(state: tauri::State<'_, AppData>, peer_id: &str, message: &str) -> Result<bool, String> {
+    let peer_id = match peer_id.parse() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
+    };
     let result = state
         .cmd_tx
         .send(ChatCommand::SendMessage {
-            message:{ChatMessage{
-                msgtype:ChatMessageType::Text,
+            peerid: peer_id,
+            message: ChatMessage {
+                msgtype: ChatMessageType::Text,
                 
                 data: message.to_string().into_bytes(),
             }
+        }).await;
             
-        }
-        })
-        .await;
-
+        
     match result {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("发送消息失败: {}", e)),
@@ -140,7 +143,7 @@ pub struct AppData {
                                         MessageEvent::Log => {
                                           
                                         }
-                                        MessageEvent::NewMessage => {
+                                        MessageEvent::ReceiveMessage => {
                                             app_handle_for_events.emit("chat-message", msg.data).ok();
                                         }
                                         MessageEvent::Warning => {

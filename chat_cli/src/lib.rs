@@ -5,7 +5,7 @@ use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 pub mod notui;
 pub mod tui;
-
+use chat_core::storage::*;
 pub struct AppData {
     pub cmd_tx: mpsc::Sender<ChatCommand>,
 }
@@ -24,7 +24,8 @@ pub struct App {
 
     should_quit: bool,
     core: Option<ChatCore>,
-    core_handle: chat_core::CoreHandle,
+    core_handle: chat_core::corehandle::CoreHandle,
+    contacts: Vec<Contact>, // 联系人列表
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 // 定义焦点枚举
@@ -50,6 +51,7 @@ impl App {
         let cfg = chat_core::CoreConfig::new(database_path, Some(log_path), Some(log_level));
         let core = chat_core::ChatCore::try_init(cfg).await?;
         let core_handle = core.core_handle.clone();
+        let contacts = list_contacts(pool().unwrap()).await?;
 
         Ok(App {
             current_focus: Focus::Input,
@@ -64,6 +66,7 @@ impl App {
             should_quit: false,
             core: Some(core),
             core_handle,
+            contacts,
         })
     }
 }

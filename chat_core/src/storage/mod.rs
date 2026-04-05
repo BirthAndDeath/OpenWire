@@ -254,7 +254,7 @@ pub async fn get_messages(
     .map_err(Into::into)
 }
 
-/// 获取最后一条消息（修复：返回完整Message结构）
+/// 获取最后一条消息
 pub async fn get_last_message(
     pool: &Pool<Sqlite>,
     peer_id: &str,

@@ -9,8 +9,10 @@ mod coreconfig;
 mod log;
 mod p2p;
 use log::init_logger;
-mod storage;
+pub mod corehandle;
+pub mod storage;
 pub use coreconfig::CoreConfig;
+use corehandle::CoreHandle;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,14 +38,17 @@ pub struct ChatResponse {
 #[derive(Debug)]
 pub enum ChatCommand {
     /// 发送消息到网络
-    SendMessage { message: ChatMessage },
+    SendMessage {
+        peerid: PeerId,
+        message: ChatMessage,
+    },
     /// 优雅关闭核心
     Shutdown,
 }
 /// 消息事件类型：用于向外部（UI）通知状态
 pub enum MessageEvent {
     /// 收到新消息
-    NewMessage,
+    ReceiveMessage,
     /// 发生错误
     Error,
     /// 日志信息（连接状态等）
@@ -58,16 +63,11 @@ pub struct ChatcoreEvent {
 }
 /// 初始化：首次运行时执行
 fn first_run() {}
-#[derive(Debug, Clone)]
-pub struct CoreHandle{
-pub cmd_tx: mpsc::Sender<ChatCommand>,
-}
+
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
     pub swarm: Swarm<p2p::MyBehaviour>,
-    /*/// 当前订阅的话题（聊天室标识）
-    pub topic: gossipsub::IdentTopic,*/
     /// 消息发送通道：向外部（UI）发送事件
     pub tx_message: mpsc::Sender<ChatcoreEvent>,
     /// 消息接收通道：外部可取走事件（Option 用于 run() 时 take）
@@ -81,7 +81,7 @@ pub struct ChatCore {
 
 impl ChatCore {
     /// 异步初始化核心
-    const MDNS_CACHE_SIZE: usize =2000;//mdns缓存大小
+    const MDNS_CACHE_SIZE: usize = 2000; //mdns缓存大小
     pub async fn try_init(cfg: CoreConfig) -> anyhow::Result<Self> {
         if let Err(e) = init_logger(&cfg) {
             return Err(anyhow::anyhow!("Failed to init logger:{}", e));
@@ -102,7 +102,7 @@ impl ChatCore {
         Ok(ChatCore {
             swarm,
             tx_message: tx,
-            rx_message: Some(rx),    
+            rx_message: Some(rx),
             rx_cmd: cmd_rx,
             mdns_cache,
             core_handle: CoreHandle { cmd_tx },
@@ -126,7 +126,6 @@ impl ChatCore {
                 .expect("Failed to build tokio runtime");
 
             rt.block_on(async move {
-                
                 // 主事件循环：三路 select
                 loop {
                     tokio::select! {
@@ -137,10 +136,10 @@ impl ChatCore {
 
                         // 2. 控制命令：外部发送（UI/CLI）
                         Some(cmd) = self.rx_cmd.recv() => {
-                            
+
                             match cmd {
-                                ChatCommand::SendMessage { message} => {
-                                    self.send_message(ChatMessage{msgtype:ChatMessageType::Text,data: message.data});
+                                ChatCommand::SendMessage {peerid, message} => {
+                                    self.send_message(peerid, message);
                                 }
                                 ChatCommand::Shutdown => {
                                     tracing::info!("P2P thread shutting down...");
@@ -156,24 +155,13 @@ impl ChatCore {
         })
     }
 
-    /// 发送消息到 Gossipsub 网络
-    ///
-    /// - 无确认机制：不保证送达，依赖 Gossipsub 的传播
-    pub fn send_message(&mut self, data: ChatMessage) -> anyhow::Result<()> {
-        let bytes =
-            postcard::to_allocvec(&data).map_err(|e| anyhow::anyhow!("Postcard failed: {}", e))?;
-        /*if let Err(e) = self
-            .swarm
+    /// 发送消息到网络
+    fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
+        self.swarm
             .behaviour_mut()
-            .gossipsub
-            .publish(self.topic.clone(), bytes)
-        {
-            tracing::error!("Publish error: {e:?}");
-        }*/
-        Ok(())
+            .rr_msg
+            .send_request(&peerid, message);
     }
-    pub fn send_to() {}
-
     /// 发送日志事件到外部通道
     async fn send_log_mpsc(&mut self, data: String) {
         let message = ChatcoreEvent {
@@ -189,7 +177,7 @@ impl ChatCore {
     /// 发送新消息事件到外部通道
     async fn send_message_mpsc(&mut self, data: String) {
         let message = ChatcoreEvent {
-            event: MessageEvent::NewMessage,
+            event: MessageEvent::ReceiveMessage,
             data,
         };
         if let Err(e) = self.tx_message.send(message).await {
