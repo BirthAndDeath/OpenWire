@@ -56,7 +56,6 @@ declare module '$env/static/private' {
 	export const CHROME_DESKTOP: string;
 	export const HOME: string;
 	export const KDE_APPLICATIONS_AS_SCOPE: string;
-	export const OLDPWD: string;
 	export const DESKTOP_SESSION: string;
 	export const TERM_PROGRAM_VERSION: string;
 	export const npm_package_json: string;
@@ -92,6 +91,7 @@ declare module '$env/static/private' {
 	export const npm_config_cache: string;
 	export const FC_FONTATIONS: string;
 	export const TAURI_ENV_DEBUG: string;
+	export const CODELLDB_LAUNCH_CONNECT_FILE: string;
 	export const GTK2_RC_FILES: string;
 	export const npm_config_node_gyp: string;
 	export const PATH: string;
@@ -244,7 +244,6 @@ declare module '$env/dynamic/private' {
 		CHROME_DESKTOP: string;
 		HOME: string;
 		KDE_APPLICATIONS_AS_SCOPE: string;
-		OLDPWD: string;
 		DESKTOP_SESSION: string;
 		TERM_PROGRAM_VERSION: string;
 		npm_package_json: string;
@@ -280,6 +279,7 @@ declare module '$env/dynamic/private' {
 		npm_config_cache: string;
 		FC_FONTATIONS: string;
 		TAURI_ENV_DEBUG: string;
+		CODELLDB_LAUNCH_CONNECT_FILE: string;
 		GTK2_RC_FILES: string;
 		npm_config_node_gyp: string;
 		PATH: string;

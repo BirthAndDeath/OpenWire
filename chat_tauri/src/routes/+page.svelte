@@ -2,6 +2,7 @@
   import "../lib/i18n";
   import { _, locale } from "svelte-i18n";
   import { listen } from "@tauri-apps/api/event";
+  import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import Input from "./Input.svelte";
   import Messagelist from "./Messagelist.svelte";
@@ -20,10 +21,98 @@
     { code: "ja", name: "日本語" },
   ];
 
+  interface ContactDto {
+    peer_id: string;
+    name: string;
+    added_at: number;
+  }
+
+  interface IdentityDto {
+    id: number;
+    peer_id: string;
+    is_current: boolean;
+  }
+
   // 切换语言
   function changeLanguage(lang: string) {
     locale.set(lang);
   }
+
+  let identities = $state<IdentityDto[]>([]);
+  let currentIdentity = $state("");
+  let loadingIdentities = $state(false);
+  let loadingContacts = $state(false);
+
+  const loadContacts = async () => {
+    loadingContacts = true;
+    try {
+      const list: ContactDto[] = await invoke("list_contacts");
+      contacts = list.map((c, index) => ({
+        order: index,
+        peerid: c.peer_id,
+        name: c.name,
+        lastMsg: "最近聊天",
+        lastTime: c.added_at * 1000,
+        unread: 0,
+        online: false,
+      }));
+      if (!selectedId && contacts.length) selectedId = contacts[0].peerid;
+    } catch (e) {
+      warning = `加载联系人失败：${e}`;
+    } finally {
+      loadingContacts = false;
+    }
+  };
+
+  const loadIdentities = async () => {
+    loadingIdentities = true;
+    try {
+      identities = await invoke<IdentityDto[]>("list_identities");
+      currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
+    } catch (e) {
+      warning = `加载身份失败：${e}`;
+    } finally {
+      loadingIdentities = false;
+    }
+  };
+
+  const selectIdentity = async (peerid: string) => {
+    if (!peerid) return;
+    try {
+      const ok = await invoke<boolean>("select_identity", { peerId: peerid });
+      if (ok) {
+        currentIdentity = peerid;
+        await loadIdentities();
+      }
+    } catch (e) {
+      warning = `切换身份失败：${e}`;
+    }
+  };
+
+  const deleteIdentity = async (peerid: string) => {
+    if (!peerid) return;
+    try {
+      const ok = await invoke<boolean>("delete_identity", { peerId: peerid });
+      if (ok) {
+        await loadIdentities();
+        currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
+      }
+    } catch (e) {
+      warning = `删除身份失败：${e}`;
+    }
+  };
+
+  const createIdentity = async () => {
+    try {
+      const ok = await invoke<boolean>("generate_identity");
+      if (ok) {
+        await loadIdentities();
+        warning = "已生成新身份";
+      }
+    } catch (e) {
+      warning = `生成身份失败：${e}`;
+    }
+  };
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -31,10 +120,14 @@
     (async () => {
       unlisten = await listen<string>("warning", (e) => {
         warning = e.payload;
+        console.warn("Received warning from backend:", warning);
         clearTimeout(timeout);
         timeout = setTimeout(() => (warning = null), 5000);
       });
     })();
+
+    loadContacts();
+    loadIdentities();
 
     return () => {
       unlisten?.();
@@ -167,12 +260,51 @@
 <main class="container">
   <aside class="sidebar" style="width: {sidebarW}px">
     <!-- 语言选择器 -->
+    <div class="identity-panel">
+      <div class="identity-control">
+        <label for="identity-select">身份：</label>
+        <select
+          id="identity-select"
+          bind:value={currentIdentity}
+          onchange={(e) =>
+            selectIdentity((e.target as HTMLSelectElement).value)}
+          disabled={loadingIdentities}
+        >
+          {#if identities.length === 0}
+            <option value="">暂无身份</option>
+          {:else}
+            {#each identities as idt}
+              <option value={idt.peer_id}>
+                {idt.peer_id}{idt.is_current ? " (当前)" : ""}
+              </option>
+            {/each}
+          {/if}
+        </select>
+      </div>
+      <button
+        type="button"
+        class="identity-btn"
+        onclick={createIdentity}
+        disabled={loadingIdentities}
+      >
+        生成身份
+      </button>
+      <button
+        type="button"
+        class="identity-btn delete"
+        onclick={() => deleteIdentity(currentIdentity)}
+        disabled={loadingIdentities || !currentIdentity}
+      >
+        删除身份
+      </button>
+    </div>
+
     <div class="language-selector">
       <label for="lang-select">{$_("language")}:</label>
       <select
         id="lang-select"
         bind:value={$locale}
-        onchange={(e) => changeLanguage(e.target.value)}
+        onchange={(e) => changeLanguage((e.target as HTMLSelectElement).value)}
       >
         {#each languages as lang}
           <option value={lang.code}>{lang.name}</option>
@@ -233,7 +365,12 @@
     ></div>
 
     <div class="input-box" style="height: {inputH}px">
-      <Input onsend={send} disabled={!selectedId} fill />
+      <Input
+        onsend={send}
+        disabled={!selectedId || !currentIdentity}
+        peerId={selectedId ?? ""}
+        fill
+      />
     </div>
   </div>
 </main>

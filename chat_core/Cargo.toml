@@ -4,26 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libp2p = { version = "0.56.0", features = [
-    "dns",
-    "tokio",
-    "cbor",
-    "request-response",
-    "mdns",
-    "relay",
-    "identify",
-    "ping",
-    "dcutr",
-    "noise",
-    "macros",
-    "tcp",
-    "yamux",
-    "quic",
-    "kad",
-    "rsa",
-    "secp256k1",
-    "ed25519",
-] }
+libp2p = { workspace = true }
 anyhow = "1.0.102"
 futures = "0.3.32"
 quinn = "0.11.9"

@@ -6,10 +6,12 @@
         onsend,
         disabled = false,
         fill = false,
+        peerId = "",
     } = $props<{
         onsend?: (t: string) => void;
         disabled?: boolean;
         fill?: boolean;
+        peerId?: string;
     }>();
 
     let text = $state("");
@@ -19,11 +21,11 @@
     let area: HTMLTextAreaElement;
 
     async function submit() {
-        if (!text.trim() || sending || disabled) return;
+        if (!text.trim() || sending || disabled || !peerId) return;
         sending = true;
         err = "";
         try {
-            await invoke("send", { message: text.trim() });
+            await invoke("send", { peerId: peerId, message: text.trim() });
             onsend?.(text.trim());
             text = "";
             ok = true;
