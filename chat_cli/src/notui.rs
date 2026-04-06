@@ -1,8 +1,5 @@
 use crate::App;
 use chat_core::ChatCommand;
-use chat_core::ChatMessage;
-use chat_core::ChatMessageType;
-
 use chat_core::MessageEvent;
 use std::io::Write;
 
@@ -22,13 +19,19 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
                 MessageEvent::ReceiveMessage => {
                     println!("[网络] {}", msg.data);
                 }
-                _ => {}
+                MessageEvent::Log => {
+                    println!("[日志] {}", msg.data);
+                }
+                MessageEvent::Warning => {
+                    println!("[警告] {}", msg.data);
+                }
+                MessageEvent::Error => {
+                    eprintln!("[错误] {}", msg.data);
+                }
             }
         }
     });
 
-    // 创建一个任务来处理用户输入
-    let cmd_tx = app.core_handle.cmd_tx.clone();
     let input_handler = tokio::spawn(async move {
         println!("输入消息回车发送,Ctrl+C 退出：");
 
@@ -41,9 +44,9 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
             std::io::stdin().read_line(&mut peer_id).unwrap();
             let peer_id = peer_id.trim();
 
-            if peer_id.is_empty() {
-                println!("Peer ID不能为空，退出程序");
-                break;
+            if peer_id.parse::<libp2p::PeerId>().is_err() {
+                println!("Peer ID格式不正确，请重新输入");
+                continue;
             }
 
             // 获取消息内容
@@ -56,22 +59,13 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
 
             if message.is_empty() {
                 println!("消息不能为空，退出程序");
-                break;
+                continue;
             }
 
             // 发送消息
-            if let false = handle
-                .send_msg(
-                    peer_id,
-                    ChatMessage {
-                        msgtype: ChatMessageType::Text,
-                        data: message.to_string().into_bytes(),
-                    },
-                )
-                .await
-            {
+            if !handle.send_text(peer_id, message).await {
                 eprintln!("无法发送消息");
-                break;
+                continue;
             }
 
             // 显示自己发送的消息

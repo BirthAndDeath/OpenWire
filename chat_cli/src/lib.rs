@@ -41,14 +41,14 @@ impl App {
         list_state.select(Some(0)); // 默认选中第一条消息
 
         let home_dir = std::env::home_dir().expect("failedto get home dir");
-        let database_path = home_dir.join(".chat/database.sqlite");
-        let log_path = home_dir.join(".chat/log");
+        let data_dir = home_dir.join(".chat");
+        let log_path = data_dir.join("log");
         #[cfg(debug_assertions)]
         let log_level = "debug";
         #[cfg(not(debug_assertions))]
         let log_level = "info";
 
-        let cfg = chat_core::CoreConfig::new(database_path, Some(log_path), Some(log_level));
+        let cfg = chat_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
         let core = chat_core::ChatCore::try_init(cfg).await?;
         let core_handle = core.core_handle.clone();
         let contacts = list_contacts(pool().unwrap()).await?;

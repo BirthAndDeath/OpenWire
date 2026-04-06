@@ -15,6 +15,26 @@ ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
 chat_core = { path = "chat_core" }
 tokio = { version = "1.51.0", features = ["full"] }
+libp2p = { version = "0.56.0", features = [
+    "dns",
+    "tokio",
+    "cbor",
+    "request-response",
+    "mdns",
+    "relay",
+    "identify",
+    "ping",
+    "dcutr",
+    "noise",
+    "macros",
+    "tcp",
+    "yamux",
+    "quic",
+    "kad",
+    "rsa",
+    "secp256k1",
+    "ed25519",
+] }
 tracing = "0.1.44"
 [profile.dev]
 incremental = true

@@ -955,6 +955,7 @@ dependencies = [
  "crossterm",
  "futures",
  "hex",
+ "libp2p",
  "ratatui",
  "serde_json",
  "socket2 0.6.3",
