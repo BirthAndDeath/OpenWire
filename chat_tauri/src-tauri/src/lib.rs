@@ -1,29 +1,158 @@
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
-use chat_core::{ChatCommand, ChatMessageType};
-use chat_core::{ChatMessage, MessageEvent};
+use serde::Serialize;
+use chat_core::{ChatCommand, ChatMessageType, MessageEvent};
+use chat_core::storage;
 mod p2p_protocol;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 async fn send(state: tauri::State<'_, AppData>, peer_id: &str, message: &str) -> Result<bool, String> {
-    let peer_id = match peer_id.parse() {
+    let peer_id: libp2p::PeerId = match peer_id.parse() {
         Ok(p) => p,
         Err(e) => return Err(format!("无效的 PeerId: {}", e)),
     };
+
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    storage::upsert_contact(pool, &peer_id.to_string(), None)
+        .await
+        .map_err(|e| format!("保存联系人失败: {}", e))?;
+    storage::add_message(pool, &peer_id.to_string(), message, true, false)
+        .await
+        .map_err(|e| format!("保存消息失败: {}", e))?;
+
     let result = state
         .cmd_tx
-        .send(ChatCommand::SendMessage {
+        .send(ChatCommand::SendText {
             peerid: peer_id,
-            message: ChatMessage {
-                msgtype: ChatMessageType::Text,
-                
-                data: message.to_string().into_bytes(),
-            }
-        }).await;
-            
-        
+            msgtype: ChatMessageType::Text,
+            data: message.to_string().into_bytes(),
+        })
+        .await;
+
     match result {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("发送消息失败: {}", e)),
+    }
+}
+
+#[derive(Serialize)]
+struct ContactDto {
+    peer_id: String,
+    name: String,
+    added_at: i64,
+}
+
+#[derive(Serialize)]
+struct IdentityDto {
+    id: i64,
+    peer_id: String,
+    is_current: bool,
+}
+
+#[tauri::command]
+async fn list_contacts() -> Result<Vec<ContactDto>, String> {
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let contacts = storage::list_contacts(pool)
+        .await
+        .map_err(|e| format!("加载联系人失败: {}", e))?
+        .into_iter()
+        .map(|c| ContactDto {
+            peer_id: c.peer_id,
+            name: c.name.unwrap_or_else(|| "未知联系人".to_string()),
+            added_at: c.added_at,
+        })
+        .collect();
+    Ok(contacts)
+}
+
+#[tauri::command]
+async fn list_identities() -> Result<Vec<IdentityDto>, String> {
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let identities = storage::list_identities(pool)
+        .await
+        .map_err(|e| format!("加载身份失败: {}", e))?
+        .into_iter()
+        .map(|id| IdentityDto {
+            id: id.id,
+            peer_id: id.peer_id,
+            is_current: id.is_current == 1,
+        })
+        .collect();
+    Ok(identities)
+}
+
+#[tauri::command]
+async fn select_identity(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppData>,
+    peer_id: &str,
+) -> Result<bool, String> {
+    // Validate peer_id format
+    let _peer_id: libp2p::PeerId = match peer_id.parse() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
+    };
+
+    // Check if identity exists
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let identities = storage::list_identities(pool)
+        .await
+        .map_err(|e| format!("加载身份失败: {}", e))?;
+    if !identities.iter().any(|id| id.peer_id == peer_id) {
+        return Err("身份不存在".to_string());
+    }
+
+    let result = state
+        .cmd_tx
+        .send(ChatCommand::SelectIdentity {
+            peer_id: peer_id.to_string(),
+        })
+        .await;
+    match result {
+        Ok(_) => {
+            // 切换身份成功后重启应用
+            app.restart();
+            
+        }
+        Err(e) => Err(format!("切换身份失败: {}", e)),
+    }
+}
+
+#[tauri::command]
+async fn delete_identity(
+    state: tauri::State<'_, AppData>,
+    peer_id: &str,
+) -> Result<bool, String> {
+    let _peer_id: libp2p::PeerId = match peer_id.parse() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
+    };
+
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let identities = storage::list_identities(pool)
+        .await
+        .map_err(|e| format!("加载身份失败: {}", e))?;
+    if !identities.iter().any(|id| id.peer_id == peer_id) {
+        return Err("身份不存在".to_string());
+    }
+
+    let result = state
+        .cmd_tx
+        .send(ChatCommand::DeleteIdentity {
+            peer_id: peer_id.to_string(),
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) => Err(format!("删除身份失败: {}", e)),
+    }
+}
+
+#[tauri::command]
+async fn generate_identity(state: tauri::State<'_, AppData>) -> Result<bool, String> {
+    let result = state.cmd_tx.send(ChatCommand::GenerateIdentity).await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) => Err(format!("生成身份失败: {}", e)),
     }
 }
 
@@ -84,31 +213,26 @@ pub struct AppData {
                            
                         
     
-                            let db_path = apphandle
+let data_dir = apphandle
                                 .path()
                                 .app_data_dir()
-                                .expect("获取数据目录失败")
-                                .join("database.sqlite");
+                                .expect("获取数据目录失败");
                             let log_path = apphandle
                                 .path()
                                 .app_log_dir()
                                 .expect("获取log目录失败")
                                 ;
-    
+
                             // 确保目录存在
-                            if let Some(parent) = db_path.parent() {
-                                std::fs::create_dir_all(parent).ok();
-                            }
-                            if let Some(parent) = log_path.parent() {
-                                std::fs::create_dir_all(parent).ok();
-                            }
+                            std::fs::create_dir_all(&data_dir).ok();
+                            std::fs::create_dir_all(&log_path).ok();
                             #[cfg(debug_assertions)]
                             let log_level = "debug";
                             #[cfg(not(debug_assertions))]
                             let log_level = "info";
-    
+
                             let cfg = chat_core::CoreConfig::new(
-                                db_path,
+                                data_dir,
                                 
                                 Some(log_path),
                                 Some(log_level)
@@ -169,7 +293,7 @@ pub struct AppData {
     
                 Ok(())
             })
-            .invoke_handler(tauri::generate_handler![send])
+            .invoke_handler(tauri::generate_handler![send, list_contacts, list_identities, select_identity, delete_identity, generate_identity])
             .build(tauri::generate_context!())
       .expect("error while running tauri application")
             .run(|apphandle, event| match event {

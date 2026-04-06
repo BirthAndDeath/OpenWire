@@ -9,7 +9,19 @@
   import Contactlist from "./Contactlist.svelte";
   import { fly } from "svelte/transition";
   let warning = $state<string | null>(null);
-  let timeout: ReturnType<typeof setTimeout>;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+
+  // 显示 warning 的统一函数
+  const showWarning = (message: string, duration: number = 5000) => {
+    warning = message;
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    timeout = setTimeout(() => {
+      warning = null;
+      timeout = null;
+    }, duration);
+  };
 
   // 语言选项
   const languages = [
@@ -58,7 +70,7 @@
       }));
       if (!selectedId && contacts.length) selectedId = contacts[0].peerid;
     } catch (e) {
-      warning = `加载联系人失败：${e}`;
+      showWarning(`加载联系人失败：${e}`);
     } finally {
       loadingContacts = false;
     }
@@ -70,7 +82,7 @@
       identities = await invoke<IdentityDto[]>("list_identities");
       currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
     } catch (e) {
-      warning = `加载身份失败：${e}`;
+      showWarning(`加载身份失败：${e}`);
     } finally {
       loadingIdentities = false;
     }
@@ -85,7 +97,7 @@
         await loadIdentities();
       }
     } catch (e) {
-      warning = `切换身份失败：${e}`;
+      showWarning(`切换身份失败：${e}`);
     }
   };
 
@@ -98,7 +110,7 @@
         currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
       }
     } catch (e) {
-      warning = `删除身份失败：${e}`;
+      showWarning(`删除身份失败：${e}`);
     }
   };
 
@@ -107,10 +119,20 @@
       const ok = await invoke<boolean>("generate_identity");
       if (ok) {
         await loadIdentities();
-        warning = "已生成新身份";
+        showWarning("已生成新身份", 3000);
       }
     } catch (e) {
-      warning = `生成身份失败：${e}`;
+      showWarning(`生成身份失败：${e}`);
+    }
+  };
+
+  const copyPeerId = async () => {
+    if (!currentIdentity) return;
+    try {
+      await navigator.clipboard.writeText(currentIdentity);
+      showWarning("PeerID 已复制到剪贴板", 3000);
+    } catch (e) {
+      showWarning(`复制失败：${e}`);
     }
   };
 
@@ -119,10 +141,8 @@
 
     (async () => {
       unlisten = await listen<string>("warning", (e) => {
-        warning = e.payload;
-        console.warn("Received warning from backend:", warning);
-        clearTimeout(timeout);
-        timeout = setTimeout(() => (warning = null), 5000);
+        showWarning(e.payload, 5000);
+        console.warn("Received warning from backend:", e.payload);
       });
     })();
 
@@ -131,7 +151,10 @@
 
     return () => {
       unlisten?.();
-      clearTimeout(timeout);
+      if (timeout) {
+        clearTimeout(timeout);
+        timeout = null;
+      }
     };
   });
 
@@ -261,8 +284,20 @@
   <aside class="sidebar" style="width: {sidebarW}px">
     <!-- 语言选择器 -->
     <div class="identity-panel">
+      {#if currentIdentity}
+        <button 
+          type="button"
+          class="current-identity-display" 
+          onclick={copyPeerId} 
+          title="点击复制 PeerID"
+          aria-label="复制当前身份 PeerID"
+        >
+          <span class="current-label">当前身份:</span>
+          <code class="peerid-badge">{currentIdentity}</code>
+        </button>
+      {/if}
       <div class="identity-control">
-        <label for="identity-select">身份：</label>
+        <label for="identity-select">切换身份：</label>
         <select
           id="identity-select"
           bind:value={currentIdentity}
@@ -281,22 +316,33 @@
           {/if}
         </select>
       </div>
-      <button
-        type="button"
-        class="identity-btn"
-        onclick={createIdentity}
-        disabled={loadingIdentities}
-      >
-        生成身份
-      </button>
-      <button
-        type="button"
-        class="identity-btn delete"
-        onclick={() => deleteIdentity(currentIdentity)}
-        disabled={loadingIdentities || !currentIdentity}
-      >
-        删除身份
-      </button>
+      <div class="identity-actions">
+        <button
+          type="button"
+          class="identity-btn"
+          onclick={createIdentity}
+          disabled={loadingIdentities}
+        >
+          生成身份
+        </button>
+        <button
+          type="button"
+          class="identity-btn"
+          onclick={copyPeerId}
+          disabled={loadingIdentities || !currentIdentity}
+          title="复制当前 PeerID"
+        >
+          复制身份
+        </button>
+        <button
+          type="button"
+          class="identity-btn delete"
+          onclick={() => deleteIdentity(currentIdentity)}
+          disabled={loadingIdentities || !currentIdentity}
+        >
+          删除身份
+        </button>
+      </div>
     </div>
 
     <div class="language-selector">
@@ -529,5 +575,103 @@
   .input-box {
     border-top: 1px solid #2a2a2a;
     background: #1a1a1a;
+  }
+  .identity-panel {
+    padding: 12px;
+    border-bottom: 1px solid #2a2a2a;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .current-identity-display {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #000000;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+    /* Reset button default styles */
+    border: none;
+    outline: none;
+    font: inherit;
+    color: inherit;
+    width: 100%;
+    text-align: left;
+  }
+  .current-identity-display:hover {
+    background: #1a1a1a;
+  }
+  .current-identity-display:focus-visible {
+    outline: 2px solid #3b82f6;
+    outline-offset: 2px;
+  }
+  .current-label {
+    font-size: 13px;
+    color: #fafafa;
+    white-space: nowrap;
+    font-weight: 500;
+  }
+  .peerid-badge {
+    flex: 1;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: #ffffff;
+    background: #000000;
+    padding: 4px 8px;
+    border-radius: 4px;
+    word-break: break-all;
+    text-align: right;
+    border: 1px solid #333333;
+  }
+  .identity-control {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .identity-control label {
+    font-size: 14px;
+    color: #fafafa;
+    white-space: nowrap;
+  }
+  .identity-control select {
+    flex: 1;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: inherit;
+    font-size: 14px;
+    min-width: 0;
+  }
+  .identity-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .identity-btn {
+    flex: 1;
+    padding: 6px 12px;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    color: #fafafa;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background-color 0.2s;
+  }
+  .identity-btn:hover:not(:disabled) {
+    background: #2a2a2a;
+  }
+  .identity-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .identity-btn.delete {
+    border-color: #ef4444;
+    color: #ef4444;
+  }
+  .identity-btn.delete:hover:not(:disabled) {
+    background: rgba(239, 68, 68, 0.1);
   }
 </style>

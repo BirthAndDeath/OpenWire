@@ -1,4 +1,4 @@
-use chat_core::{ChatCommand, ChatMessage, ChatMessageType};
+use chat_core::ChatCommand;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
@@ -15,12 +15,13 @@ use tokio::time::interval;
 use crate::{App, Focus};
 
 fn getcontacts(app: &App, contacts_list: &mut Vec<ListItem>) {
-    let list = app.contacts
+    let list = app
+        .contacts
         .iter()
         .filter_map(|c| c.name.clone()) // 过滤掉 None，保留 Some(value)
         .collect::<Vec<String>>();
-    
-    *contacts_list= list
+
+    *contacts_list = list
         .iter()
         .map(|m| ListItem::new(Text::from(m.clone())))
         .collect::<Vec<ListItem>>();
@@ -81,12 +82,12 @@ fn tui_render(frame: &mut Frame, app: &App) {
         messages_area,
         &mut app.message_list_state.clone(),
     );
-     let mut contacts: Vec<ListItem> = vec!["none"]
+    let mut contacts: Vec<ListItem> = vec!["none"]
         .into_iter()
         .map(|s| ListItem::new(Text::from(s.to_string())))
         .collect();
-        
-    getcontacts(app,&mut contacts);
+
+    getcontacts(app, &mut contacts);
 
     let contact_list = List::new(contacts)
         .block(
@@ -132,29 +133,29 @@ fn tui_render(frame: &mut Frame, app: &App) {
 
     //  渲染状态栏
     let status = match app.current_focus {
-        Focus::Messages => format!(" 模式: 浏览消息 (↑/↓选择)"),
-        Focus::Input => format!(" 模式: 输入文本 (Enter发送，Tab切换焦点，Esc退出应用)"),
-        Focus::SidebarArea => format!(" 模式:选择聊天对象↑/↓选择"),
+        Focus::Messages => " 模式: 浏览消息 (↑/↓选择)".to_string(),
+        Focus::Input => " 模式: 输入文本 (Enter发送，Tab切换焦点，Esc退出应用)".to_string(),
+        Focus::SidebarArea => " 模式:选择聊天对象↑/↓选择".to_string(),
     };
     let status_bar = Paragraph::new(status).block(Block::default().borders(Borders::TOP));
     frame.render_widget(status_bar, messages_area);
 }
 
-fn handle_event(app: &mut App, event: Event) -> std::io::Result<()> {
+async fn handle_event(app: &mut App, event: Event) -> std::io::Result<()> {
     match event {
         //状态机
         Event::Key(key) if key.kind == KeyEventKind::Press => match app.current_focus {
-            Focus::Messages => handle_messages_focus(app, key.code),
-            Focus::Input => handle_input_focus(app, key.code),
-            Focus::SidebarArea => handle_sidebar_area_focus(app, key.code),
+            Focus::Messages => handle_messages_focus(app, key.code).await,
+            Focus::Input => handle_input_focus(app, key.code).await,
+            Focus::SidebarArea => handle_sidebar_area_focus(app, key.code).await,
         },
         _ => {}
     }
     Ok(())
 }
 
-fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
-    let list_len = app.contacts.len(); 
+async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
+    let list_len = app.contacts.len();
     match key_code {
         KeyCode::Up => {
             if list_len > 0 {
@@ -171,18 +172,18 @@ fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
         }
         KeyCode::Enter => {
             // 当选择一个联系人时，可以执行相应操作
-            if let Some(i) = app.contact_list_state.selected() {
-                if let Some(_contact) = app.contacts.get(i) {
-                    // 这里可以显示与该联系人的聊天记录或做其他处理
-                    app.current_focus = Focus::Input; // 切换到输入框准备发送消息
-                }
+            if let Some(i) = app.contact_list_state.selected()
+                && let Some(_contact) = app.contacts.get(i)
+            {
+                // 这里可以显示与该联系人的聊天记录或做其他处理
+                app.current_focus = Focus::Input; // 切换到输入框准备发送消息
             }
         }
         _ => {}
     }
 }
 
-fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
+async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
     let list_len = app.messages.len();
     match key_code {
         KeyCode::Up => {
@@ -201,37 +202,31 @@ fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
 
         KeyCode::Enter => {
             // 回复选中的消息
-            if let Some(i) = app.message_list_state.selected() {
-                if let Some(msg) = app.messages.get(i) {
-                    app.input = format!("回复「{}」: ", msg);
-                    app.current_focus = Focus::Input;
-                }
+            if let Some(i) = app.message_list_state.selected()
+                && let Some(msg) = app.messages.get(i)
+            {
+                app.input = format!("回复「{}」: ", msg);
+                app.current_focus = Focus::Input;
             }
         }
         _ => {}
     }
 }
 
-fn handle_input_focus(app: &mut App, key_code: KeyCode) {
+async fn handle_input_focus(app: &mut App, key_code: KeyCode) {
     match key_code {
         KeyCode::Enter => {
             // 发送消息
             if !app.input.trim().is_empty() {
                 app.messages.push(app.input.clone());
-                
+
                 // 获取当前选中的联系人ID
                 let selected_contact_index = app.contact_list_state.selected().unwrap_or(0);
-                let peer_id = app.contacts.get(selected_contact_index).unwrap_or(&"default_peer".to_string()).clone();
+                let contact = app.contacts.get(selected_contact_index).unwrap().clone();
 
-                app.core_handle.send_msg(
-                    peer_id, // 添加 peer_id 参数
-                    message: 
-                        ChatMessage {
-                            msgtype: ChatMessageType::Text,
-                            data: app.input.clone().into_bytes(),
-                        }
-                 
-                );
+                app.core_handle
+                    .send_text(contact.peer_id.as_str(), &app.input)
+                    .await;
                 //send
                 app.input.clear();
                 // 自动滚动到最新消息
@@ -283,7 +278,7 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
                  text));
                  // 自动滚动到最新消息
                 app.message_list_state.select(Some(app.messages.len() - 1));
-                 terminal.draw(|frame| tui_render(frame, &app))?;
+                 terminal.draw(|frame| tui_render(frame, app))?;
 
             }
             Some(Ok(event)) = event_stream.next() => {
@@ -293,15 +288,15 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
                     KeyCode::Esc=> break,
                     KeyCode::Tab =>app.current_focus= app.current_focus.next_focus(),
                     _=>{
-                        
+
                     },
                 }}
-                handle_event(app, event)?;
+                handle_event(app, event).await?;
             }
 
 
 
-            _ = tick.tick() => {terminal.draw(|frame| tui_render(frame, &app))?;}
+            _ = tick.tick() => {terminal.draw(|frame| tui_render(frame, app))?;}
             else =>{
                 break;
             }
@@ -310,7 +305,7 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
         if app.should_quit {
             break;
         }
-        terminal.draw(|frame| tui_render(frame, &app))?;
+        terminal.draw(|frame| tui_render(frame, app))?;
     }
     let result_cmd = app.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
     print!("结束通道命令结果{:?}", result_cmd);

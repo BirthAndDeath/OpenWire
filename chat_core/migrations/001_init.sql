@@ -1,7 +1,9 @@
 -- 身份表
 CREATE TABLE IF NOT EXISTS identity (
-    peer_id TEXT PRIMARY KEY,
-    key_enc BLOB
+    id INTEGER PRIMARY KEY,
+    peer_id TEXT UNIQUE NOT NULL,
+    public_key BLOB NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1))
 );
 
 -- 联系人表
