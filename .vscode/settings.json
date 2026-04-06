@@ -10,5 +10,9 @@
   "rust-analyzer.check.command": "clippy",
   // 补全与辅助
   "rust-analyzer.completion.autoimport.enable": true,
-  "rust-analyzer.assist.emitMustUse": true
+  "rust-analyzer.assist.emitMustUse": true,
+  "chat.tools.terminal.autoApprove": {
+    "cargo check": true,
+    "cargo clippy": true
+  }
 }

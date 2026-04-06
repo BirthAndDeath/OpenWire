@@ -56,6 +56,7 @@ declare module '$env/static/private' {
 	export const CHROME_DESKTOP: string;
 	export const HOME: string;
 	export const KDE_APPLICATIONS_AS_SCOPE: string;
+	export const OLDPWD: string;
 	export const DESKTOP_SESSION: string;
 	export const TERM_PROGRAM_VERSION: string;
 	export const npm_package_json: string;
@@ -243,6 +244,7 @@ declare module '$env/dynamic/private' {
 		CHROME_DESKTOP: string;
 		HOME: string;
 		KDE_APPLICATIONS_AS_SCOPE: string;
+		OLDPWD: string;
 		DESKTOP_SESSION: string;
 		TERM_PROGRAM_VERSION: string;
 		npm_package_json: string;
