@@ -34,9 +34,9 @@
       },
       "csp": {
         "default-src": "'self'",
-        "script-src": "'self' 'unsafe-eval' 'unsafe-inline'",
-        "style-src": "'self' 'unsafe-inline'",
-        "img-src": "'self' data: blob:",
+        "script-src": "'self'",
+        "style-src": "'self' ",
+        "img-src": "'self' ",
         "font-src": "'self'",
         "connect-src": "'self'",
         "media-src": "'self'",

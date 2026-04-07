@@ -56,9 +56,11 @@ declare module '$env/static/private' {
 	export const CHROME_DESKTOP: string;
 	export const HOME: string;
 	export const KDE_APPLICATIONS_AS_SCOPE: string;
+	export const OLDPWD: string;
 	export const DESKTOP_SESSION: string;
 	export const TERM_PROGRAM_VERSION: string;
 	export const npm_package_json: string;
+	export const GK_GL_PATH: string;
 	export const GTK_RC_FILES: string;
 	export const KDE_SESSION_VERSION: string;
 	export const SDL_IM_MODULE: string;
@@ -122,6 +124,7 @@ declare module '$env/static/private' {
 	export const npm_lifecycle_event: string;
 	export const npm_package_version: string;
 	export const NO_AT_BRIDGE: string;
+	export const GK_GL_ADDR: string;
 	export const GPG_AGENT_INFO: string;
 	export const QT_IM_MODULE: string;
 	export const TAURI_ENV_FAMILY: string;
@@ -244,9 +247,11 @@ declare module '$env/dynamic/private' {
 		CHROME_DESKTOP: string;
 		HOME: string;
 		KDE_APPLICATIONS_AS_SCOPE: string;
+		OLDPWD: string;
 		DESKTOP_SESSION: string;
 		TERM_PROGRAM_VERSION: string;
 		npm_package_json: string;
+		GK_GL_PATH: string;
 		GTK_RC_FILES: string;
 		KDE_SESSION_VERSION: string;
 		SDL_IM_MODULE: string;
@@ -310,6 +315,7 @@ declare module '$env/dynamic/private' {
 		npm_lifecycle_event: string;
 		npm_package_version: string;
 		NO_AT_BRIDGE: string;
+		GK_GL_ADDR: string;
 		GPG_AGENT_INFO: string;
 		QT_IM_MODULE: string;
 		TAURI_ENV_FAMILY: string;
