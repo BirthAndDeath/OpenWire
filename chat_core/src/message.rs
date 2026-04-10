@@ -1,10 +1,12 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow;
 use libp2p::identity;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
+use snap::raw::decompress_len;
+use snap::raw::{Decoder, Encoder};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ChatMessageType {
@@ -47,6 +49,50 @@ impl ChatMessage {
         hasher.finalize().to_vec()
     }
 
+    /// 压缩数据
+    fn compress_data(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut encoder = Encoder::new();
+        let compressed = encoder.compress_vec(data)?;
+        Ok(compressed)
+    }
+
+    /// 解压缩数据
+    fn decompress_data(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        const MAX_SIZE: usize = 1024 * 1024; // 1 MB
+
+        if data.is_empty() {
+            return Err(anyhow::anyhow!("Compressed data is empty"));
+        }
+
+        // 限制输入数据大小，防止处理过大的非有效负载或潜在的 DoS
+
+        if data.len() > MAX_SIZE * 2 {
+            return Err(anyhow::anyhow!(
+                "Compressed data is suspiciously large: {} bytes",
+                data.len()
+            ));
+        }
+
+        // 预检解压后的大小
+        let decompressed_len = decompress_len(data)?;
+
+        if decompressed_len > MAX_SIZE {
+            return Err(anyhow::anyhow!(
+                "Decompressed data exceeds size limit: {} bytes",
+                decompressed_len
+            ));
+        }
+
+        let mut decoder = Decoder::new();
+        // 根据预检的大小分配缓冲区
+        let mut buffer = vec![0u8; decompressed_len];
+
+        // 执行解压
+        decoder.decompress(data, &mut buffer)?;
+
+        Ok(buffer)
+    }
+
     pub fn new_signed(
         msgtype: ChatMessageType,
         data: Vec<u8>,
@@ -55,7 +101,12 @@ impl ChatMessage {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let mut nonce = [0u8; 16];
         rng().fill(&mut nonce);
-        let hash = Self::compute_hash(msgtype, timestamp, &nonce, &data);
+
+        // 压缩数据
+        let compressed_data = Self::compress_data(&data)?;
+
+        // 对压缩后的数据进行哈希和签名
+        let hash = Self::compute_hash(msgtype, timestamp, &nonce, &compressed_data);
         let signature = keypair.sign(&hash)?;
         let sender_public_key = keypair.public().encode_protobuf();
 
@@ -63,11 +114,16 @@ impl ChatMessage {
             msgtype,
             timestamp,
             nonce,
-            data,
+            data: compressed_data,
             hash,
             signature,
             sender_public_key,
         })
+    }
+
+    /// 获取解压缩后的数据
+    pub fn get_decompressed_data(&self) -> anyhow::Result<Vec<u8>> {
+        Self::decompress_data(&self.data)
     }
 
     pub fn verify(&self, sender_peer_id: &libp2p::PeerId) -> anyhow::Result<bool> {
@@ -78,6 +134,7 @@ impl ChatMessage {
         if !self.is_fresh() {
             return Ok(false);
         }
+        // 验证时使用压缩后的数据（存储在 self.data 中）
         let computed = Self::compute_hash(self.msgtype, self.timestamp, &self.nonce, &self.data);
         if computed != self.hash {
             return Ok(false);

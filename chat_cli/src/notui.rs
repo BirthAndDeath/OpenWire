@@ -63,7 +63,7 @@ pub async fn no_tui_run(app: &mut App) -> std::io::Result<()> {
             }
 
             // 发送消息
-            if !handle.send_text(peer_id, message).await {
+            if !handle.send_msg(peer_id, message).await {
                 eprintln!("无法发送消息");
                 continue;
             }

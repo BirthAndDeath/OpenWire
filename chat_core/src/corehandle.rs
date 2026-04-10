@@ -7,7 +7,7 @@ pub struct CoreHandle {
     pub cmd_tx: mpsc::Sender<crate::ChatCommand>,
 }
 impl CoreHandle {
-    pub async fn send_msg(&self, peer_id: &str, message: crate::ChatMessage) -> bool {
+    pub async fn send_msg(&self, peer_id: &str, text: &str) -> bool {
         let peer_id = match peer_id.parse() {
             Ok(p) => p,
             Err(_) => return false,
@@ -15,28 +15,6 @@ impl CoreHandle {
         let result = self
             .cmd_tx
             .send(ChatCommand::SendMessage {
-                peerid: peer_id,
-                message,
-            })
-            .await;
-
-        match result {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::info!("Failed to send message: {e}");
-                false
-            }
-        }
-    }
-
-    pub async fn send_text(&self, peer_id: &str, text: &str) -> bool {
-        let peer_id = match peer_id.parse() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        let result = self
-            .cmd_tx
-            .send(ChatCommand::SendText {
                 peerid: peer_id,
                 msgtype: ChatMessageType::Text,
                 data: text.as_bytes().to_vec(),

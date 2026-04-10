@@ -225,7 +225,7 @@ async fn handle_input_focus(app: &mut App, key_code: KeyCode) {
                 let contact = app.contacts.get(selected_contact_index).unwrap().clone();
 
                 app.core_handle
-                    .send_text(contact.peer_id.as_str(), &app.input)
+                    .send_msg(contact.peer_id.as_str(), &app.input)
                     .await;
                 //send
                 app.input.clear();

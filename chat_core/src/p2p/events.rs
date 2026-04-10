@@ -37,25 +37,35 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
 
                 if let ChatMessageType::Text = request.msgtype {
                     match request.verify(&peer) {
-                        Ok(true) => match String::from_utf8(request.data.clone()) {
-                            Ok(text) => {
-                                if let Err(e) = storage::add_message(
-                                    pool,
-                                    &peer.to_string(),
-                                    &text,
-                                    false,
-                                    false,
-                                )
-                                .await
-                                {
-                                    tracing::warn!("保存接收消息失败: {}", e);
+                        Ok(true) => {
+                            // 解压缩数据
+                            match request.get_decompressed_data() {
+                                Ok(decompressed_data) => {
+                                    match String::from_utf8(decompressed_data) {
+                                        Ok(text) => {
+                                            if let Err(e) = storage::add_message(
+                                                pool,
+                                                &peer.to_string(),
+                                                &text,
+                                                false,
+                                                false,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!("保存接收消息失败: {}", e);
+                                            }
+                                            core.send_message_mpsc(text).await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("接收消息不是合法 UTF-8: {}", e);
+                                        }
+                                    }
                                 }
-                                core.send_message_mpsc(text).await;
+                                Err(e) => {
+                                    tracing::warn!("解压缩消息失败: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!("接收消息不是合法 UTF-8: {}", e);
-                            }
-                        },
+                        }
                         Ok(false) => {
                             tracing::warn!("来自 {} 的消息校验失败，已忽略", peer);
                         }
@@ -191,11 +201,14 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         }
 
         // 外拨连接失败
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            if let Some(pid) = peer_id {
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
+            Some(pid) => {
                 tracing::error!("Connect failed to {pid}: {error:?}");
             }
-        }
+            None => {
+                tracing::debug!("Outgoing connection error (no peer id): {error:?}");
+            }
+        },
 
         // 入站连接错误
         SwarmEvent::IncomingConnectionError {

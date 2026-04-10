@@ -1,21 +1,17 @@
 use libp2p::PeerId;
 
-use crate::message::{ChatMessage, ChatMessageType};
+use crate::message::ChatMessageType;
 
 /// 控制命令：外部向核心发送的指令
 #[derive(Debug)]
 pub enum ChatCommand {
-    /// 发送消息到网络
+    /// 发送消息到网络,由核心封装签名/时间戳/hash
     SendMessage {
-        peerid: PeerId,
-        message: ChatMessage,
-    },
-    /// 发送文本消息，由核心封装签名/时间戳/hash
-    SendText {
         peerid: PeerId,
         msgtype: ChatMessageType,
         data: Vec<u8>,
     },
+
     /// 生成新身份
     GenerateIdentity,
     /// 选择当前身份

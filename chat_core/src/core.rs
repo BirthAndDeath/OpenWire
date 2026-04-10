@@ -5,6 +5,7 @@ use libp2p::{PeerId, Swarm, identity};
 use lru::LruCache;
 use tokio::sync::mpsc;
 use tokio::try_join;
+use std::thread::available_parallelism;
 
 use crate::{
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
@@ -49,11 +50,14 @@ impl ChatCore {
         tracing::info!("Initializing chat core with data dir: {:?}", cfg.data_dir);
 
         let _ = try_join!(storage::init(&cfg))?;
-        
+
         // 加载或生成身份
         let keypair = load_or_generate_identity(&cfg).await?;
         // 记录当前加载的身份 ID，便于确认是否复用了旧身份
-        tracing::info!("Loaded identity with Peer ID: {}", keypair.public().to_peer_id());
+        tracing::info!(
+            "Loaded identity with Peer ID: {}",
+            keypair.public().to_peer_id()
+        );
 
         let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone())?;
 
@@ -79,19 +83,20 @@ impl ChatCore {
         })
     }
 
-    /// 启动核心事件循环（阻塞，在新线程运行）
-    ///
-    /// # 设计决策
-    /// - 使用独立线程 + tokio current_thread runtime：避免与 UI 线程冲突
-    /// - 单线程足够：libp2p 使用异步，无需多线程竞争
+    /// 启动核心事件循环
     ///
     /// # 返回
     /// JoinHandle：可用于等待线程结束或强制终止
     pub fn run(mut self) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            // 创建 tokio runtime：current_thread 模式足够，无需多线程调度
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
+             // 自动获取 CPU 核心数
+        let worker_threads = available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()  // 改为多线程。
+            .worker_threads(worker_threads)  
+            .enable_all()
                 .build()
                 .expect("Failed to build tokio runtime");
 
@@ -108,14 +113,31 @@ impl ChatCore {
                         Some(cmd) = self.rx_cmd.recv() => {
 
                             match cmd {
-                                ChatCommand::SendMessage {peerid, message} => {
-                                    self.send_message(peerid, message);
-                                }
-                                ChatCommand::SendText { peerid, msgtype, data } => {
-                                    if let Err(e) = self.send_text(peerid, msgtype, data) {
+                                ChatCommand::SendMessage {peerid,msgtype,data} => {
+                                    match msgtype {
+                                        ChatMessageType::Text => {
+                                           match self.send_text(peerid, msgtype, data) {
+                                        Ok(_) => {
+
+                                            tracing::info!("Message sent to {}", peerid);
+                                        }
+                                        Err(e) => {
                                         tracing::error!("Failed to build signed message: {e}");
                                     }
+                                    }
+                                        }
+                                        ChatMessageType::FileHash => {
+                                            todo!();
+                                            tracing::info!("Received SendMessage command for peer {}: File message with {} bytes", peerid, data.len());
+
+                                        }
+                                        ChatMessageType::__NonExhaustive=>{}
+                                    }
+                                    
+
+
                                 }
+
                                 ChatCommand::GenerateIdentity => {
                                     self.generate_identity().await;
                                 }
