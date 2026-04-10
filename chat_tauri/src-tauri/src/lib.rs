@@ -21,7 +21,7 @@ async fn send(state: tauri::State<'_, AppData>, peer_id: &str, message: &str) ->
 
     let result = state
         .cmd_tx
-        .send(ChatCommand::SendText {
+        .send(ChatCommand::SendMessage {
             peerid: peer_id,
             msgtype: ChatMessageType::Text,
             data: message.to_string().into_bytes(),

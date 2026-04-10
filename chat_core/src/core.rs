@@ -61,10 +61,7 @@ impl ChatCore {
 
         let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone())?;
 
-        /*// 创建并订阅 Gossipsub 话题
-        // 注意：需使用相同话题名才能互通
-        let topic = gossipsub::IdentTopic::new("test-net");
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;*/
+        
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(64);
@@ -81,6 +78,9 @@ impl ChatCore {
             data_dir: cfg.data_dir.clone(),
             core_handle: CoreHandle { cmd_tx },
         })
+    }
+    pub fn handler(&self) -> CoreHandle {
+        self.core_handle.clone()
     }
 
     /// 启动核心事件循环
