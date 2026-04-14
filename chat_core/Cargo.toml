@@ -20,7 +20,11 @@ tracing = { workspace = true }
 aes-gcm = "0.10.3"
 
 
-keyring = "3.6.3"
+keyring = { version = "3.6.3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 hex = "0.4.3"
 snap = "1.1.1"
 blake3 = "1.8.4"
