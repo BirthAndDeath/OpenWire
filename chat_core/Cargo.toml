@@ -18,6 +18,8 @@ tokio = { workspace = true }
 tracing-appender = "0.2.4"
 tracing = { workspace = true }
 aes-gcm = "0.10.3"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+pqcrypto-kyber = "0.8.1"
 
 
 keyring = { version = "3.6.3", features = [
@@ -32,6 +34,7 @@ rand = "0.10.1"
 lru = "0.16.3"
 sled = "0.34.7"
 redb = "4.0.0"
+pqcrypto-traits = "0.3.5"
 
 [package.metadata.docs.rs]
 #no-deps = true

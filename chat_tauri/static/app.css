@@ -1,3 +1,70 @@
-  .svelte-body-container {
-      display: contents;
-  }
+/* 确保焦点元素在滚动容器中可见 */
+*:focus {
+  scroll-margin: 16px;
+}
+
+/* ==================== 暗色主题（默认）==================== */
+[data-theme="dark"] {
+  --bg-primary: #0f0f0f;
+  --bg-secondary: #0a0a0a;
+  --bg-tertiary: #1a1a1a;
+  --text-primary: #fafafa;
+  --text-secondary: #737373;
+  --border-color: #2a2a2a;
+}
+
+/* ==================== 亮色主题 ==================== */
+[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #e5e5e5;
+  --text-primary: #171717;
+  --text-secondary: #525252;
+  --border-color: #d4d4d4;
+}
+
+/* ==================== 加载状态样式 ==================== */
+.loading-state {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  color: var(--text-secondary, #737373);
+  font-family: system-ui;
+  background: var(--bg-primary, #0f0f0f);
+}
+
+.loading-state p {
+  font-size: 16px;
+  margin: 0;
+}
+
+/* ==================== 设置页面 - Select 元素主题样式 ==================== */
+
+/* 暗色主题下的下拉箭头 */
+[data-theme="dark"] .language-selector select,
+[data-theme="dark"] .theme-selector select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23737373' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+}
+
+/* 亮色主题下的下拉箭头和背景 */
+[data-theme="light"] .language-selector select,
+[data-theme="light"] .theme-selector select {
+  background-color: var(--bg-secondary, #f5f5f5);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23525252' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+  color: var(--text-primary, #171717);
+  border-color: var(--border-color, #d4d4d4);
+}
+
+/* 亮色主题下的 hover 状态 */
+[data-theme="light"] .language-selector select:hover,
+[data-theme="light"] .theme-selector select:hover {
+  background-color: var(--bg-tertiary, #e5e5e5);
+}
+
+/* 亮色主题下的选项样式 */
+[data-theme="light"] .language-selector select option,
+[data-theme="light"] .theme-selector select option {
+  background: var(--bg-secondary, #f5f5f5);
+  color: var(--text-primary, #171717);
+}
