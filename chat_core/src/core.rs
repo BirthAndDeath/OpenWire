@@ -1,8 +1,9 @@
-use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
 
 use futures::StreamExt;
-use libp2p::{PeerId, Swarm, identity};
+use libp2p::{PeerId, Swarm};
 use lru::LruCache;
+use pqcrypto_mlkem::mlkem768;
 use tokio::sync::mpsc;
 use tokio::try_join;
 use std::thread::available_parallelism;
@@ -11,7 +12,8 @@ use crate::{
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
     coreconfig::CoreConfig,
     corehandle::CoreHandle,
-    identity::load_or_generate_identity,
+    crypto,
+    identity,
     log::init_logger,
     message::{ChatMessage, ChatMessageType},
     p2p, storage,
@@ -22,7 +24,7 @@ pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
     pub swarm: Swarm<p2p::MyBehaviour>,
     /// 当前身份私钥，用于对消息签名
-    pub identity_keypair: identity::Keypair,
+    pub identity_keypair: libp2p::identity::Keypair,
     /// 消息发送通道：向外部（UI）发送事件
     pub tx_message: mpsc::Sender<ChatcoreEvent>,
     /// 消息接收通道：外部可取走事件（Option 用于 run() 时 take）
@@ -153,8 +155,6 @@ impl ChatCore {
                                 }
                             }
                         }
-
-
                     }
                 }
             });
@@ -177,7 +177,7 @@ impl ChatCore {
         ChatMessage::new_signed(msgtype, data, &self.identity_keypair)
     }
 
-    fn send_text(
+    async fn send_text(
         &mut self,
         peerid: PeerId,
         msgtype: ChatMessageType,
@@ -189,7 +189,7 @@ impl ChatCore {
     }
 
     async fn generate_identity(&mut self) {
-        // 使用统一的身份生成逻辑
+        // 使用统一的 ML-KEM 身份生成逻辑
         let temp_cfg = crate::coreconfig::CoreConfig {
             data_dir: self.data_dir.clone(),
             ..Default::default()

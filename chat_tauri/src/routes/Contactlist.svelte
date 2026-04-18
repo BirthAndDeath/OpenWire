@@ -143,7 +143,7 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: #0f0f0f;
+        background: var(--bg-primary, #0f0f0f);
     }
 
     .search {
@@ -151,21 +151,21 @@
         align-items: center;
         gap: 10px;
         padding: 12px 16px;
-        border-bottom: 1px solid #2a2a2a;
+        border-bottom: 1px solid var(--border-color, #2a2a2a);
     }
     .search svg {
-        color: #525252;
+        color: var(--text-secondary, #525252);
     }
     .search input {
         flex: 1;
         background: transparent;
         border: none;
-        color: #fafafa;
+        color: var(--text-primary, #fafafa);
         font-size: 14px;
         outline: none;
     }
     .search input::placeholder {
-        color: #525252;
+        color: var(--text-secondary, #525252);
     }
     .clear {
         width: 18px;
@@ -216,7 +216,7 @@
         text-align: left;
     }
     .item:hover {
-        background: #1a1a1a;
+        background: var(--bg-tertiary, #1a1a1a);
     }
     .item.sel {
         background: #1e3a5f;
@@ -268,25 +268,25 @@
     .name {
         font-size: 15px;
         font-weight: 500;
-        color: #fafafa;
+        color: var(--text-primary, #fafafa);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
     .time {
         font-size: 11px;
-        color: #525252;
+        color: var(--text-secondary, #525252);
     }
     .msg {
         font-size: 13px;
-        color: #737373;
+        color: var(--text-secondary, #737373);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
         margin: 0;
     }
     .msg.unread {
-        color: #fafafa;
+        color: var(--text-primary, #fafafa);
         font-weight: 500;
     }
 
@@ -305,8 +305,8 @@
 
     .foot {
         padding: 12px 16px;
-        border-top: 1px solid #2a2a2a;
+        border-top: 1px solid var(--border-color, #2a2a2a);
         font-size: 12px;
-        color: #525252;
+        color: var(--text-secondary, #525252);
     }
 </style>

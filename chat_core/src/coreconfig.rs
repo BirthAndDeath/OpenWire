@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 /// 核心配置：初始化参数集合
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CoreConfig {
     /// 数据目录路径，示例: "/path/to/data"
     pub data_dir: PathBuf,

@@ -1,7 +1,8 @@
 <script lang="ts">
     import { invoke } from "@tauri-apps/api/core";
     import { slide } from "svelte/transition";
-
+    import "../lib/i18n";
+    import { _, locale } from "svelte-i18n";
     let {
         onsend,
         disabled = false,
@@ -25,7 +26,10 @@
         sending = true;
         err = "";
         try {
-            await invoke("send", { peerId: peerId, message: text.trim() });
+            await invoke("send", {
+                pubkey_identity_id: peerId,
+                message: text.trim(),
+            });
             onsend?.(text.trim());
             text = "";
             ok = true;
@@ -52,7 +56,7 @@
 
 <div class="wrap" class:disabled class:fill>
     {#if disabled}
-        <div class="mask">选择联系人以开始聊天</div>
+        <div class="mask"><p>{$_("select_contact_to_chat")}</p></div>
     {/if}
 
     <div class="badge">
@@ -133,8 +137,8 @@
 <style>
     .wrap {
         position: relative;
-        background: #1a1a1a;
-        border: 1px solid #2a2a2a;
+        background: var(--bg-tertiary, #1a1a1a);
+        border: 1px solid var(--border-color, #2a2a2a);
         border-radius: 12px;
         padding: 12px 16px;
     }
@@ -192,7 +196,7 @@
     }
     .box {
         flex: 1;
-        background: #0f0f0f;
+        background: var(--bg-primary, #0f0f0f);
         border: 1px solid #333;
         border-radius: 8px;
         padding: 10px 12px;
@@ -207,13 +211,13 @@
         max-height: 300px;
         background: transparent;
         border: none;
-        color: #fafafa;
+        color: var(--text-primary, #fafafa);
         font-size: 15px;
         resize: none;
         outline: none;
     }
     textarea::placeholder {
-        color: #525252;
+        color: var(--text-secondary, #525252);
     }
     textarea:disabled {
         cursor: not-allowed;
@@ -224,7 +228,7 @@
         justify-content: space-between;
         margin-top: 6px;
         font-size: 11px;
-        color: #525252;
+        color: var(--text-secondary, #525252);
         font-family: monospace;
     }
     .hints.disabled {

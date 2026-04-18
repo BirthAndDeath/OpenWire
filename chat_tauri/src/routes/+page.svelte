@@ -4,23 +4,18 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import { goto } from "$app/navigation";
   import Input from "./Input.svelte";
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
-  import { fly } from "svelte/transition";
-  let warning = $state<string | null>(null);
-  let timeout: ReturnType<typeof setTimeout> | null = null;
+  import Toast from "./Toast.svelte";
 
+  // 主题和语言在layout.svelte 中统一初始化
+
+  let warning = $state<string>("");
   // 显示 warning 的统一函数
   const showWarning = (message: string, duration: number = 5000) => {
     warning = message;
-    if (timeout) {
-      clearTimeout(timeout);
-    }
-    timeout = setTimeout(() => {
-      warning = null;
-      timeout = null;
-    }, duration);
   };
 
   // 语言选项
@@ -39,20 +34,6 @@
     added_at: number;
   }
 
-  interface IdentityDto {
-    id: number;
-    peer_id: string;
-    is_current: boolean;
-  }
-
-  // 切换语言
-  function changeLanguage(lang: string) {
-    locale.set(lang);
-  }
-
-  let identities = $state<IdentityDto[]>([]);
-  let currentIdentity = $state("");
-  let loadingIdentities = $state(false);
   let loadingContacts = $state(false);
 
   const loadContacts = async () => {
@@ -76,66 +57,6 @@
     }
   };
 
-  const loadIdentities = async () => {
-    loadingIdentities = true;
-    try {
-      identities = await invoke<IdentityDto[]>("list_identities");
-      currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
-    } catch (e) {
-      showWarning(`加载身份失败：${e}`);
-    } finally {
-      loadingIdentities = false;
-    }
-  };
-
-  const selectIdentity = async (peerid: string) => {
-    if (!peerid) return;
-    try {
-      const ok = await invoke<boolean>("select_identity", { peerId: peerid });
-      if (ok) {
-        currentIdentity = peerid;
-        await loadIdentities();
-      }
-    } catch (e) {
-      showWarning(`切换身份失败：${e}`);
-    }
-  };
-
-  const deleteIdentity = async (peerid: string) => {
-    if (!peerid) return;
-    try {
-      const ok = await invoke<boolean>("delete_identity", { peerId: peerid });
-      if (ok) {
-        await loadIdentities();
-        currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
-      }
-    } catch (e) {
-      showWarning(`删除身份失败：${e}`);
-    }
-  };
-
-  const createIdentity = async () => {
-    try {
-      const ok = await invoke<boolean>("generate_identity");
-      if (ok) {
-        await loadIdentities();
-        showWarning("已生成新身份", 3000);
-      }
-    } catch (e) {
-      showWarning(`生成身份失败：${e}`);
-    }
-  };
-
-  const copyPeerId = async () => {
-    if (!currentIdentity) return;
-    try {
-      await navigator.clipboard.writeText(currentIdentity);
-      showWarning("PeerID 已复制到剪贴板", 3000);
-    } catch (e) {
-      showWarning(`复制失败：${e}`);
-    }
-  };
-
   onMount(() => {
     let unlisten: (() => void) | undefined;
 
@@ -147,14 +68,9 @@
     })();
 
     loadContacts();
-    loadIdentities();
 
     return () => {
       unlisten?.();
-      if (timeout) {
-        clearTimeout(timeout);
-        timeout = null;
-      }
     };
   });
 
@@ -163,7 +79,11 @@
   let selectedId = $state<string | null>(null);
   let sidebarW = $state(300);
   let inputH = $state(150);
-  let friendInput = $state("");
+
+  // 添加好友相关状态
+  let showAddFriendModal = $state(false);
+  let newFriendPubkeyIdentityId = $state(""); // ML-KEM公钥的hex编码
+  let newFriendName = $state("");
 
   let contacts = $state([
     {
@@ -173,33 +93,6 @@
       lastMsg: "欢迎来到聊天室",
       lastTime: Date.now(),
       unread: 0,
-      online: true,
-    },
-    {
-      order: 1,
-      peerid: "1",
-      name: "Alice",
-      lastMsg: "好的，明天见",
-      lastTime: Date.now(),
-      unread: 2,
-      online: true,
-    },
-    {
-      order: 2,
-      peerid: "2",
-      name: "Bob",
-      lastMsg: "收到",
-      lastTime: Date.now() - 864e5,
-      unread: 0,
-      online: false,
-    },
-    {
-      order: 3,
-      peerid: "3",
-      name: "Charlie",
-      lastMsg: "在吗？",
-      lastTime: Date.now() - 1728e5,
-      unread: 5,
       online: true,
     },
   ]);
@@ -258,117 +151,179 @@
     );
   };
 
-  const addFriend = () => {
-    const key = friendInput.trim();
-    if (!key) return;
-    contacts = [
-      ...contacts,
-      {
-        order: contacts.length,
-        peerid: crypto.randomUUID(),
-        name: `User ${key.slice(0, 8)}...`,
-        lastMsg: "新朋友",
-        lastTime: Date.now(),
-        unread: 0,
-        online: false,
-      },
-    ];
-    friendInput = "";
+  const addFriend = async () => {
+    if (!newFriendPubkeyIdentityId.trim()) {
+      showWarning("请输入 Pubkey 身份 ID (ML-KEM公钥的hex编码)");
+      return;
+    }
+
+    try {
+      // 验证hex格式
+      const hex = newFriendPubkeyIdentityId.replace(/\s/g, "");
+      if (hex.length % 2 !== 0) {
+        showWarning("Pubkey身份ID格式无效：长度必须是偶数");
+        return;
+      }
+
+      // 验证hex字符
+      if (!/^[0-9a-fA-F]+$/.test(hex)) {
+        showWarning("Pubkey身份ID格式无效：只能包含0-9, a-f, A-F字符");
+        return;
+      }
+
+      const success: boolean = await invoke("add_contact", {
+        pubkey_identity_id: hex,
+        name: newFriendName.trim() || undefined,
+      });
+
+      if (success) {
+        showWarning("好友添加成功！");
+        showAddFriendModal = false;
+        newFriendPubkeyIdentityId = "";
+        newFriendName = "";
+        await loadContacts();
+      }
+    } catch (e) {
+      showWarning(`添加好友失败：${e}`);
+    }
   };
 
-  const onKey = (e: KeyboardEvent) =>
-    e.key === "Enter" && (e.preventDefault(), addFriend());
+  // 跳转到设置页面
+  function goToSettings() {
+    goto("/settings");
+  }
+
+  // 跳转到身份管理页面
+  function goToIdentity() {
+    goto("/identity");
+  }
 </script>
 
 <main class="container">
   <aside class="sidebar" style="width: {sidebarW}px">
-    <!-- 语言选择器 -->
-    <div class="identity-panel">
-      {#if currentIdentity}
-        <button 
-          type="button"
-          class="current-identity-display" 
-          onclick={copyPeerId} 
-          title="点击复制 PeerID"
-          aria-label="复制当前身份 PeerID"
-        >
-          <span class="current-label">当前身份:</span>
-          <code class="peerid-badge">{currentIdentity}</code>
-        </button>
-      {/if}
-      <div class="identity-control">
-        <label for="identity-select">切换身份：</label>
-        <select
-          id="identity-select"
-          bind:value={currentIdentity}
-          onchange={(e) =>
-            selectIdentity((e.target as HTMLSelectElement).value)}
-          disabled={loadingIdentities}
-        >
-          {#if identities.length === 0}
-            <option value="">暂无身份</option>
-          {:else}
-            {#each identities as idt}
-              <option value={idt.peer_id}>
-                {idt.peer_id}{idt.is_current ? " (当前)" : ""}
-              </option>
-            {/each}
-          {/if}
-        </select>
-      </div>
-      <div class="identity-actions">
-        <button
-          type="button"
-          class="identity-btn"
-          onclick={createIdentity}
-          disabled={loadingIdentities}
-        >
-          生成身份
-        </button>
-        <button
-          type="button"
-          class="identity-btn"
-          onclick={copyPeerId}
-          disabled={loadingIdentities || !currentIdentity}
-          title="复制当前 PeerID"
-        >
-          复制身份
-        </button>
-        <button
-          type="button"
-          class="identity-btn delete"
-          onclick={() => deleteIdentity(currentIdentity)}
-          disabled={loadingIdentities || !currentIdentity}
-        >
-          删除身份
-        </button>
-      </div>
-    </div>
-
-    <div class="language-selector">
-      <label for="lang-select">{$_("language")}:</label>
-      <select
-        id="lang-select"
-        bind:value={$locale}
-        onchange={(e) => changeLanguage((e.target as HTMLSelectElement).value)}
+    <!-- 设置按钮 -->
+    <div class="icon-buttons-container">
+      <button
+        class="icon-btn"
+        onclick={goToSettings}
+        title={$_("settings")}
+        aria-label="打开设置"
       >
-        {#each languages as lang}
-          <option value={lang.code}>{lang.name}</option>
-        {/each}
-      </select>
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <circle cx="12" cy="12" r="3"></circle>
+          <path
+            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"
+          ></path>
+        </svg>
+      </button>
+
+      <button
+        class="icon-btn"
+        onclick={goToIdentity}
+        title={$_("identity_management")}
+        aria-label="身份管理"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M20 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+          <circle cx="12" cy="7" r="4"></circle>
+        </svg>
+      </button>
     </div>
 
     <Contactlist {contacts} {selectedId} onselect={select} />
 
-    <div class="add-friend">
-      <input
-        bind:value={friendInput}
-        onkeydown={onKey}
-        placeholder={$_("add_friend")}
-      />
-      <button onclick={addFriend} disabled={!friendInput.trim()}>+</button>
+    <!-- 添加好友按钮 -->
+    <div class="add-friend-wrapper">
+      <button
+        class="add-friend-btn"
+        onclick={() => (showAddFriendModal = true)}
+        aria-label={$_("add_friend")}
+      >
+        <svg
+          width="20"
+          height="20"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+        >
+          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <line x1="19" y1="8" x2="19" y2="14" />
+          <line x1="22" y1="11" x2="16" y2="11" />
+        </svg>
+        <span>{$_("add_friend")}</span>
+      </button>
     </div>
   </aside>
+
+  <!-- 添加好友模态框 -->
+  {#if showAddFriendModal}
+    <div
+      class="modal-overlay"
+      onclick={(e) =>
+        e.target === e.currentTarget && (showAddFriendModal = false)}
+      onkeydown={(e) => e.key === "Escape" && (showAddFriendModal = false)}
+      role="dialog"
+      aria-label="添加好友对话框"
+      tabindex="0"
+    >
+      <div class="modal-content" role="document" aria-label="添加好友表单">
+        <h3>{$_("add_friend")}</h3>
+        <div class="form-group">
+          <label for="pubkey-identity-id">Pubkey 身份 ID *</label>
+          <input
+            id="pubkey-identity-id"
+            type="text"
+            placeholder="ML-KEM公钥的hex编码 (例如: 1234abcd...)"
+            bind:value={newFriendPubkeyIdentityId}
+          />
+          <small>ML-KEM公钥的十六进制编码，作为唯一身份标识</small>
+        </div>
+        <div class="form-group">
+          <label for="friend-name">{$_("name")} (可选)</label>
+          <input
+            id="friend-name"
+            type="text"
+            placeholder="好友姓名"
+            bind:value={newFriendName}
+          />
+        </div>
+        <div class="modal-actions">
+          <button
+            type="button"
+            class="btn-cancel"
+            onclick={() => (showAddFriendModal = false)}
+          >
+            取消
+          </button>
+          <button type="button" class="btn-confirm" onclick={addFriend}>
+            添加好友
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <div
     class="resizer-v"
@@ -386,21 +341,12 @@
       {#if selectedId}
         <Messagelist bind:this={msgListRef} />
       {:else}
-        <div class="empty">选择联系人开始聊天</div>
+        <div class="empty">{$_("select_contact_to_chat")}</div>
       {/if}
     </div>
-    {#if warning}
-      <div
-        class="toast"
-        transition:fly={{
-          y: -20,
-          duration: 300,
-          easing: (t) => Math.sin((t * Math.PI) / 2),
-        }}
-      >
-        {warning}
-      </div>
-    {/if}
+
+    <Toast message={warning || ""} />
+
     <div
       class="resizer-h"
       style="top: calc(100% - {inputH}px)"
@@ -413,7 +359,7 @@
     <div class="input-box" style="height: {inputH}px">
       <Input
         onsend={send}
-        disabled={!selectedId || !currentIdentity}
+        disabled={!selectedId}
         peerId={selectedId ?? ""}
         fill
       />
@@ -424,109 +370,87 @@
 <style>
   :global(:root) {
     font-family: system-ui;
-    background: #0f0f0f;
-    color: #f6f6f6;
   }
+
+  /* 暗色主题（默认） */
+  :global([data-theme="dark"]) {
+    --bg-primary: #0f0f0f;
+    --bg-secondary: #0a0a0a;
+    --bg-tertiary: #1a1a1a;
+    --text-primary: #f6f6f6;
+    --text-secondary: #737373;
+    --border-color: #2a2a2a;
+  }
+
+  /* 亮色主题 */
+  :global([data-theme="light"]) {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f5f5f5;
+    --bg-tertiary: #fafafa;
+    --text-primary: #1a1a1a;
+    --text-secondary: #666666;
+    --border-color: #e0e0e0;
+  }
+
   .container {
     display: flex;
     height: 100vh;
     overflow: hidden;
+    background: var(--bg-primary);
+    color: var(--text-primary);
   }
 
   .sidebar {
     display: flex;
     flex-direction: column;
-    background: #0a0a0a;
-    border-right: 1px solid #2a2a2a;
-  }
-  .language-selector {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px;
-    border-bottom: 1px solid #2a2a2a;
-  }
-  .language-selector label {
-    font-size: 14px;
-    color: #fafafa;
-  }
-  .language-selector select {
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 4px 8px;
-    color: inherit;
-    font-size: 14px;
-  }
-  .add-friend {
-    display: flex;
-    gap: 8px;
-    padding: 12px;
-    border-top: 1px solid #2a2a2a;
-  }
-  .add-friend input {
-    flex: 1;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 8px;
-    color: inherit;
-  }
-  .add-friend button {
-    width: 32px;
-    background: #3b82f6;
-    border: none;
-    border-radius: 6px;
-    color: white;
-    cursor: pointer;
-  }
-  .add-friend button:disabled {
-    background: #2a2a2a;
-    cursor: not-allowed;
-  }
-  .toast {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: rgba(255, 68, 68, 0.95);
-    color: white;
-    padding: 12px 20px;
-    border-radius: 40px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    z-index: 1000;
-    font-weight: 500;
-    font-size: 14px;
-    text-align: center;
-    max-width: 80vw;
-    word-break: break-word;
-    backdrop-filter: blur(4px);
-    animation: fadeOut 4s ease forwards;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border-color);
   }
 
-  @keyframes fadeOut {
-    0% {
-      opacity: 0;
-      transform: translate(-50%, -50%) scale(0.9);
-    }
-    15% {
-      opacity: 1;
-      transform: translate(-50%, -50%) scale(1);
-    }
-    85% {
-      opacity: 1;
-      transform: translate(-50%, -50%) scale(1);
-    }
-    100% {
-      opacity: 0;
-      transform: translate(-50%, -50%) scale(0.9);
-      visibility: hidden;
-    }
+  .icon-buttons-container {
+    padding: 12px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    gap: 8px;
   }
+
+  .icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s;
+    padding: 0;
+  }
+
+  .icon-btn:hover {
+    background: var(--border-color);
+    border-color: #3b82f6;
+    color: #3b82f6;
+  }
+
+  .icon-btn:hover svg {
+    transform: rotate(30deg);
+  }
+
+  .icon-btn svg {
+    transition: transform 0.3s ease;
+  }
+
+  .icon-btn:active svg {
+    transform: rotate(30deg) scale(0.95);
+  }
+
   .resizer-v,
   .resizer-h {
     position: absolute;
-    background: #2a2a2a;
+    background: var(--border-color);
     z-index: 10;
   }
   .resizer-v {
@@ -554,7 +478,7 @@
     position: absolute;
     top: 16px;
     right: 16px;
-    color: #737373;
+    color: var(--text-secondary);
     text-decoration: none;
     font-size: 14px;
   }
@@ -570,108 +494,135 @@
     display: grid;
     place-items: center;
     height: 100%;
-    color: #525252;
+    color: var(--text-secondary);
   }
   .input-box {
-    border-top: 1px solid #2a2a2a;
-    background: #1a1a1a;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
   }
-  .identity-panel {
+
+  /* 添加好友按钮样式 */
+  .add-friend-wrapper {
     padding: 12px;
-    border-bottom: 1px solid #2a2a2a;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+    border-top: 1px solid var(--border-color);
+    margin-top: auto;
   }
-  .current-identity-display {
+
+  .add-friend-btn {
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: 8px;
-    padding: 8px 12px;
-    background: #000000;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background-color 0.2s;
-    /* Reset button default styles */
-    border: none;
-    outline: none;
-    font: inherit;
-    color: inherit;
     width: 100%;
-    text-align: left;
-  }
-  .current-identity-display:hover {
-    background: #1a1a1a;
-  }
-  .current-identity-display:focus-visible {
-    outline: 2px solid #3b82f6;
-    outline-offset: 2px;
-  }
-  .current-label {
-    font-size: 13px;
-    color: #fafafa;
-    white-space: nowrap;
-    font-weight: 500;
-  }
-  .peerid-badge {
-    flex: 1;
-    font-family: 'Courier New', monospace;
-    font-size: 11px;
-    color: #ffffff;
-    background: #000000;
-    padding: 4px 8px;
-    border-radius: 4px;
-    word-break: break-all;
-    text-align: right;
-    border: 1px solid #333333;
-  }
-  .identity-control {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .identity-control label {
-    font-size: 14px;
-    color: #fafafa;
-    white-space: nowrap;
-  }
-  .identity-control select {
-    flex: 1;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    padding: 4px 8px;
-    color: inherit;
-    font-size: 14px;
-    min-width: 0;
-  }
-  .identity-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .identity-btn {
-    flex: 1;
-    padding: 6px 12px;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-    color: #fafafa;
+    padding: 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-primary);
     cursor: pointer;
-    font-size: 12px;
-    transition: background-color 0.2s;
+    transition: all 0.2s;
+    font-size: 14px;
   }
-  .identity-btn:hover:not(:disabled) {
-    background: #2a2a2a;
+
+  .add-friend-btn:hover {
+    background: var(--border-color);
+    color: #3b82f6;
+    border-color: #3b82f6;
   }
-  .identity-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+
+  /* 模态框样式 */
+  .modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
   }
-  .identity-btn.delete {
-    border-color: #ef4444;
-    color: #ef4444;
+
+  .modal-content {
+    background: var(--bg-secondary);
+    padding: 24px;
+    border-radius: 12px;
+    width: 90%;
+    max-width: 400px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-color);
   }
-  .identity-btn.delete:hover:not(:disabled) {
-    background: rgba(239, 68, 68, 0.1);
+
+  .modal-content h3 {
+    margin-top: 0;
+    margin-bottom: 20px;
+    color: var(--text-primary);
+  }
+
+  .form-group {
+    margin-bottom: 16px;
+  }
+
+  .form-group label {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text-secondary);
+    font-size: 14px;
+  }
+
+  .form-group input,
+  .form-group textarea {
+    width: 100%;
+    padding: 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-family: inherit;
+    box-sizing: border-box;
+  }
+
+  .form-group input:focus,
+  .form-group textarea:focus {
+    outline: none;
+    border-color: #3b82f6;
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-top: 24px;
+  }
+
+  .btn-cancel,
+  .btn-confirm {
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+  }
+
+  .btn-cancel {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+  }
+
+  .btn-cancel:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .btn-confirm {
+    background: #3b82f6;
+    border: 1px solid #3b82f6;
+    color: white;
+  }
+
+  .btn-confirm:hover {
+    background: #2563eb;
   }
 </style>
