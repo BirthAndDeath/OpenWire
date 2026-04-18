@@ -303,17 +303,26 @@ let data_dir = apphandle
 })
             
     }
-const FORCE_EXIT_TIMEOUT :std::time::Duration= std::time::Duration::from_secs(30) ;
+const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
   fn cleanup(app: &AppHandle) {
     let start_time = std::time::Instant::now();
-    while let Err(e) = app.state::<AppData>().cmd_tx.try_send(chat_core::ChatCommand::Shutdown) {
-        if start_time.elapsed() >= FORCE_EXIT_TIMEOUT{
+    while let Err(e) = app
+        .state::<AppData>()
+        .cmd_tx
+        .try_send(chat_core::ChatCommand::Shutdown)
+    {
+        if start_time.elapsed() >= FORCE_EXIT_TIMEOUT {
             tracing::error!("Shutdown command timeout after 30 seconds, forcing exit");
-            app.emit("warning","Shutdown command timeout after 30 seconds, forcing exit" ).ok();
+            app.emit(
+                "warning",
+                "Shutdown command timeout after 30 seconds, forcing exit",
+            )
+            .ok();
             std::thread::sleep(std::time::Duration::from_millis(100));
             break;
         }
-        app.emit("warning",format!("Error sending shutdown command: {e}")).ok();
+        app.emit("warning", format!("Error sending shutdown command: {e}"))
+            .ok();
         tracing::error!("Error sending shutdown command: {}", e);
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
