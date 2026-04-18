@@ -49,8 +49,6 @@ strip = true
 debug = false
 debug-assertions = false
 overflow-checks = true
-rpath = false
-
 
 [profile.flame]
 inherits = "release"
