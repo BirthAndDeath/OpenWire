@@ -1,5 +1,5 @@
 mod bootstrap;
-mod dht;
+pub mod dht;
 mod behaviour;
 mod swarm;
 mod events;

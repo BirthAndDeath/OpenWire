@@ -3,7 +3,6 @@ use std::{num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
 use futures::StreamExt;
 use libp2p::{PeerId, Swarm};
 use lru::LruCache;
-use pqcrypto_mlkem::mlkem768;
 use tokio::sync::mpsc;
 use tokio::try_join;
 use std::thread::available_parallelism;

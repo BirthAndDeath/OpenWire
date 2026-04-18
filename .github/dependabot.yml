@@ -19,12 +19,12 @@ updates:
           - "minor"
           - "patch"
       tauri:
-        patterns: ["tauri*", "serde*", "specta*"]
+        patterns: [ "tauri*", "serde*", "specta*" ]
 
     versioning-strategy: "auto"
 
   - package-ecosystem: "npm"
-    directory: "/chat-tauri"
+    directory: "/chat_tauri"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -35,12 +35,12 @@ updates:
     open-pull-requests-limit: 10
     groups:
       tauri-frontend:
-        patterns: ["@tauri-apps/*", "svelte*", "vite*"]
-        update-types: [minor, patch]
+        patterns: [ "@tauri-apps/*", "svelte*", "vite*" ]
+        update-types: [ minor, patch ]
       types:
-        patterns: ["@types/*", "typescript*"]
+        patterns: [ "@types/*", "typescript*" ]
       lint:
-        patterns: ["eslint*", "prettier*"]
+        patterns: [ "eslint*", "prettier*" ]
   # 检查 GitHub Actions 工作流
   - package-ecosystem: "github-actions"
     directory: "/"
