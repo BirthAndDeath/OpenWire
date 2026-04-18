@@ -571,8 +571,7 @@
     font-size: 14px;
   }
 
-  .form-group input,
-  .form-group textarea {
+  .form-group input {
     width: 100%;
     padding: 10px;
     background: var(--bg-primary);
@@ -583,8 +582,7 @@
     box-sizing: border-box;
   }
 
-  .form-group input:focus,
-  .form-group textarea:focus {
+  .form-group input:focus {
     outline: none;
     border-color: #3b82f6;
   }
