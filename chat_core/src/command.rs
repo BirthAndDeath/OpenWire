@@ -12,6 +12,13 @@ pub enum ChatCommand {
         data: Vec<u8>,
     },
 
+    /// 添加好友（交换公钥）
+    AddContact {
+        peer_id: String,
+        public_key: Vec<u8>,
+        name: Option<String>,
+    },
+
     /// 生成新身份
     GenerateIdentity,
     /// 选择当前身份
