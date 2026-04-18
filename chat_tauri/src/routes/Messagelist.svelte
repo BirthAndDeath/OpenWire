@@ -50,7 +50,7 @@
 <style>
     :global(.virtua-scroll-view) {
         padding: 16px;
-        background: #0f0f0f;
+        background: var(--bg-primary, #0f0f0f);
         height: 100%;
     }
 
@@ -68,8 +68,8 @@
         max-width: 70%;
         padding: 12px 16px;
         border-radius: 16px;
-        background: #1a1a1a;
-        color: #fafafa;
+        background: var(--bg-tertiary, #1a1a1a);
+        color: var(--text-primary, #fafafa);
     }
     .me .bubble {
         background: #3b82f6;

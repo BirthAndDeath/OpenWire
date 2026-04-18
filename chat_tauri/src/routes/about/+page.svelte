@@ -60,8 +60,8 @@
 <style>
     :global(body) {
         margin: 0;
-        background: #0a0a0a;
-        color: #fafafa;
+        background: var(--bg-secondary, #0a0a0a);
+        color: var(--text-primary, #fafafa);
         font-family:
             system-ui,
             -apple-system,
@@ -107,14 +107,14 @@
         font-size: 2.5rem;
         font-weight: 700;
         margin: 1rem 0 0.5rem;
-        background: linear-gradient(135deg, #fafafa 0%, #818183 100%);
+        background: linear-gradient(135deg, var(--text-primary, #fafafa) 0%, #818183 100%);
         -webkit-background-clip: text;
         background-clip: text;
         -webkit-text-fill-color: transparent;
     }
 
     .tagline {
-        color: #737373;
+        color: var(--text-secondary, #737373);
         font-size: 1rem;
         margin: 0;
     }
@@ -147,13 +147,13 @@
     }
 
     .btn.secondary {
-        background: #1a1a1a;
-        color: #fafafa;
-        border: 1px solid #2a2a2a;
+        background: var(--bg-tertiary, #1a1a1a);
+        color: var(--text-primary, #fafafa);
+        border: 1px solid var(--border-color, #2a2a2a);
     }
 
     .btn.secondary:hover {
-        background: #252525;
+        background: var(--bg-primary, #252525);
         border-color: #3b82f6;
     }
 
@@ -162,9 +162,9 @@
         align-items: center;
         gap: 0.75rem;
         padding: 1rem 1.5rem;
-        background: #141414;
+        background: var(--bg-primary, #141414);
         border-radius: 12px;
-        border: 1px solid #2a2a2a;
+        border: 1px solid var(--border-color, #2a2a2a);
     }
 
     .bili-link {
@@ -182,14 +182,14 @@
     }
 
     .support span {
-        color: #737373;
+        color: var(--text-secondary, #737373);
         font-size: 0.9rem;
     }
 
     .desc {
         max-width: 400px;
         text-align: center;
-        color: #525252;
+        color: var(--text-secondary, #525252);
         font-size: 0.875rem;
         line-height: 1.6;
         margin-top: 2rem;
