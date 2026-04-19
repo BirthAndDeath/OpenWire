@@ -21,7 +21,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(kad_event)) => {
             handle_kademlia_event(kad_event, core);
         }
-        
+
         //request-response
         // 收到请求
         SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
@@ -108,14 +108,17 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                                             .flatten()
                                     {
                                         // 从安全存储中获取私钥
-                                        match rootcell::identity::PrivateKeyHandle::load(&core.data_dir, &peer_id_str)
-                                        {
+                                        match rootcell::identity::PrivateKeyHandle::load(
+                                            &core.data_dir,
+                                            &peer_id_str,
+                                        ) {
                                             Ok(private_key_handle) => {
-                                                let private_key_bytes = private_key_handle.get_private_key();
+                                                let private_key_bytes =
+                                                    private_key_handle.get_private_key();
                                                 // 解密消息（使用私钥）
                                                 match crypto::decrypt_message(
                                                     &compressed_data,
-                                                    &private_key_bytes,
+                                                    private_key_bytes,
                                                 ) {
                                                     Ok(decrypted_data) => {
                                                         match String::from_utf8(decrypted_data) {
@@ -340,7 +343,7 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             tracing::error!("Address expired: {address}");
         }
-        
+
         // 其他事件（忽略）
         _ => {}
     }
@@ -359,7 +362,7 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
                     // 验证找到的记录
                     if let Some(publisher) = &record.record.publisher {
                         let mut validator = core.validator.write().unwrap();
-                        
+
                         // 使用 validator 验证记录
                         let record_size = record.record.value.len();
                         if !validator.validate_dht_record(
@@ -373,7 +376,7 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
                             );
                             return;
                         }
-                        
+
                         tracing::debug!(
                             "Validated DHT record from {} (size: {} bytes)",
                             publisher,
@@ -389,37 +392,33 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
                 }
             }
         }
-        
+
         // 记录发布事件
         kad::Event::OutboundQueryProgressed {
             result: QueryResult::PutRecord(result),
             ..
-        } => {
-            match result {
-                Ok(ok) => {
-                    tracing::debug!("Successfully published DHT record to {:?}", ok.key);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to publish DHT record: {:?}", e);
-                }
+        } => match result {
+            Ok(ok) => {
+                tracing::debug!("Successfully published DHT record to {:?}", ok.key);
             }
-        }
-        
+            Err(e) => {
+                tracing::warn!("Failed to publish DHT record: {:?}", e);
+            }
+        },
+
         // 提供者查询
         kad::Event::OutboundQueryProgressed {
             result: QueryResult::GetProviders(result),
             ..
-        } => {
-            match result {
-                Ok(ok) => {
-                    tracing::debug!("Found providers: {:?}", ok);
-                }
-                Err(e) => {
-                    tracing::warn!("Get providers query failed: {:?}", e);
-                }
+        } => match result {
+            Ok(ok) => {
+                tracing::debug!("Found providers: {:?}", ok);
             }
-        }
-        
+            Err(e) => {
+                tracing::warn!("Get providers query failed: {:?}", e);
+            }
+        },
+
         // 路由表更新
         kad::Event::RoutingUpdated {
             peer,
@@ -429,13 +428,17 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
             ..
         } => {
             if is_new_peer {
-                tracing::info!("New peer added to routing table: {} with {} addresses", peer, addresses.len());
+                tracing::info!(
+                    "New peer added to routing table: {} with {} addresses",
+                    peer,
+                    addresses.len()
+                );
             }
             if let Some(old) = old_peer {
                 tracing::debug!("Peer {} replaced by {} in routing table", old, peer);
             }
         }
-        
+
         // 其他 Kademlia 事件
         _ => {
             tracing::trace!("Unhandled Kademlia event: {:?}", kad_event);

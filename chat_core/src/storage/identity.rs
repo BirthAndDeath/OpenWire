@@ -1,15 +1,9 @@
 use crate::CoreConfig;
-use hex;
-use keyring;
-use sha2::{Digest, Sha256};
 use sqlx::{
     FromRow, Pool, Row, Sqlite,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 use tracing;
 
 static DB_POOL: std::sync::OnceLock<Pool<Sqlite>> = std::sync::OnceLock::new();
