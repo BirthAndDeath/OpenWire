@@ -12,6 +12,7 @@
     "store:allow-load",
     "store:allow-get",
     "store:allow-set",
-    "store:allow-save"
+    "store:allow-save",
+    "stronghold:default"
   ]
 }
