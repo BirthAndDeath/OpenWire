@@ -1,5 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use crate::crypto::constant_time_compare;
 use anyhow;
 use libp2p::identity;
 use rand::{RngExt, rng};
@@ -7,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use snap::raw::decompress_len;
 use snap::raw::{Decoder, Encoder};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ChatMessageType {

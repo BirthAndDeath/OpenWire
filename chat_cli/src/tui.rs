@@ -157,18 +157,14 @@ async fn handle_event(app: &mut App, event: Event) -> std::io::Result<()> {
 async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
     let list_len = app.contacts.len();
     match key_code {
-        KeyCode::Up => {
-            if list_len > 0 {
-                let i = app.contact_list_state.selected().unwrap_or(0);
-                app.contact_list_state.select(Some(i.saturating_sub(1)));
-            }
+        KeyCode::Up if list_len > 0 => {
+            let i = app.contact_list_state.selected().unwrap_or(0);
+            app.contact_list_state.select(Some(i.saturating_sub(1)));
         }
-        KeyCode::Down => {
-            if list_len > 0 {
-                let i = app.contact_list_state.selected().unwrap_or(0);
-                app.contact_list_state
-                    .select(Some((i + 1).min(list_len - 1)));
-            }
+        KeyCode::Down if list_len > 0 => {
+            let i = app.contact_list_state.selected().unwrap_or(0);
+            app.contact_list_state
+                .select(Some((i + 1).min(list_len - 1)));
         }
         KeyCode::Enter => {
             // 当选择一个联系人时，可以执行相应操作
@@ -186,18 +182,14 @@ async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
 async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
     let list_len = app.messages.len();
     match key_code {
-        KeyCode::Up => {
-            if list_len > 0 {
-                let i = app.message_list_state.selected().unwrap_or(0);
-                app.message_list_state.select(Some(i.saturating_sub(1)));
-            }
+        KeyCode::Up if list_len > 0 => {
+            let i = app.message_list_state.selected().unwrap_or(0);
+            app.message_list_state.select(Some(i.saturating_sub(1)));
         }
-        KeyCode::Down => {
-            if list_len > 0 {
-                let i = app.message_list_state.selected().unwrap_or(0);
-                app.message_list_state
-                    .select(Some((i + 1).min(list_len - 1)));
-            }
+        KeyCode::Down if list_len > 0 => {
+            let i = app.message_list_state.selected().unwrap_or(0);
+            app.message_list_state
+                .select(Some((i + 1).min(list_len - 1)));
         }
 
         KeyCode::Enter => {
@@ -215,9 +207,9 @@ async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
 
 async fn handle_input_focus(app: &mut App, key_code: KeyCode) {
     match key_code {
-        KeyCode::Enter => {
+        KeyCode::Enter
             // 发送消息
-            if !app.input.trim().is_empty() {
+            if !app.input.trim().is_empty() => {
                 app.messages.push(app.input.clone());
 
                 // 获取当前选中的联系人ID
@@ -232,7 +224,6 @@ async fn handle_input_focus(app: &mut App, key_code: KeyCode) {
                 // 自动滚动到最新消息
                 app.message_list_state.select(Some(app.messages.len() - 1));
             }
-        }
 
         KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => {

@@ -7,14 +7,15 @@
   import { goto } from "$app/navigation";
   import Toast from "../Toast.svelte";
 
-  interface IdentityDto {
+  interface MlKemIdentityDto {
     id: number;
-    peer_id: string;
+    identity_id: string;
+    public_key_hex: string;
     is_current: boolean;
   }
 
-  let identities = $state<IdentityDto[]>([]);
-  let currentIdentity = $state("");
+  let identities = $state<MlKemIdentityDto[]>([]);
+  let currentIdentity = $state<MlKemIdentityDto | null>(null);
   let loadingIdentities = $state(false);
   let warning = $state<string>("");
 
@@ -26,8 +27,8 @@
   const loadIdentities = async () => {
     loadingIdentities = true;
     try {
-      identities = await invoke<IdentityDto[]>("list_identities");
-      currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
+      identities = await invoke<MlKemIdentityDto[]>("list_identities");
+      currentIdentity = identities.find((id) => id.is_current) ?? null;
     } catch (e) {
       showWarning(`加载身份失败：${e}`);
     } finally {
@@ -35,29 +36,24 @@
     }
   };
 
-  const selectIdentity = async (peerid: string) => {
-    if (!peerid) return;
+  const selectIdentity = async (identityId: string) => {
+    if (!identityId) return;
     try {
-      const ok = await invoke<boolean>("select_identity", { peerId: peerid });
-      if (ok) {
-        currentIdentity = peerid;
-        await loadIdentities();
-        showWarning("身份切换成功", 3000);
-      }
+      await invoke("select_identity", { identityId });
+      await loadIdentities();
+      showWarning("身份切换成功", 3000);
     } catch (e) {
       showWarning(`切换身份失败：${e}`);
     }
   };
 
-  const deleteIdentity = async (peerid: string) => {
-    if (!peerid) return;
+  const deleteIdentity = async (identityId: string) => {
+    if (!identityId) return;
     try {
-      const ok = await invoke<boolean>("delete_identity", { peerId: peerid });
-      if (ok) {
-        await loadIdentities();
-        currentIdentity = identities.find((id) => id.is_current)?.peer_id ?? "";
-        showWarning("身份删除成功", 3000);
-      }
+      await invoke("delete_identity", { identityId });
+      await loadIdentities();
+      currentIdentity = identities.find((id) => id.is_current) ?? null;
+      showWarning("身份删除成功", 3000);
     } catch (e) {
       showWarning(`删除身份失败：${e}`);
     }
@@ -65,21 +61,19 @@
 
   const createIdentity = async () => {
     try {
-      const ok = await invoke<boolean>("generate_identity");
-      if (ok) {
-        await loadIdentities();
-        showWarning("已生成新身份", 3000);
-      }
+      await invoke("generate_identity");
+      await loadIdentities();
+      showWarning("已生成新身份", 3000);
     } catch (e) {
       showWarning(`生成身份失败：${e}`);
     }
   };
 
-  const copyPeerId = async (peerId: string) => {
-    if (!peerId) return;
+  const copyToClipboard = async (text: string, label: string = "内容") => {
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(peerId);
-      showWarning("PeerID 已复制到剪贴板", 3000);
+      await navigator.clipboard.writeText(text);
+      showWarning(`${label} 已复制到剪贴板`, 3000);
     } catch (e) {
       showWarning(`复制失败：${e}`);
     }
@@ -119,17 +113,37 @@
   <main class="identity-content">
     <!-- 当前身份显示 -->
     {#if currentIdentity}
+      {@const identity = currentIdentity}
       <section class="current-identity-section">
         <h2>{$_("current_identity")}</h2>
-        <button
-          class="current-identity-card"
-          onclick={() => copyPeerId(currentIdentity)}
-          title={$_("click_to_copy")}
-          type="button"
-        >
-          <code class="peerid-display">{currentIdentity}</code>
-          <span class="copy-hint">{$_("click_to_copy")}</span>
-        </button>
+        <div class="current-identity-card">
+          <div class="identity-field">
+            <label for="identity-id-display">身份 ID:</label>
+            <button
+              id="identity-id-display"
+              class="copyable-value"
+              onclick={() => copyToClipboard(identity.identity_id, "身份 ID")}
+              title="点击复制"
+              type="button"
+            >
+              <code>{identity.identity_id}</code>
+              <span class="copy-icon">📋</span>
+            </button>
+          </div>
+          <div class="identity-field">
+            <label for="public-key-display">ML-KEM 公钥 (持久化身份):</label>
+            <button
+              id="public-key-display"
+              class="copyable-value"
+              onclick={() => copyToClipboard(identity.public_key_hex, "公钥")}
+              title="点击复制"
+              type="button"
+            >
+              <code class="public-key-display">{identity.public_key_hex}</code>
+              <span class="copy-icon">📋</span>
+            </button>
+          </div>
+        </div>
       </section>
     {/if}
 
@@ -174,10 +188,21 @@
         </div>
       {:else}
         <div class="identities-list">
-          {#each identities as identity (identity.peer_id)}
+          {#each identities as identity (identity.id)}
             <div class="identity-item" class:current={identity.is_current}>
               <div class="identity-info">
-                <code class="identity-peerid">{identity.peer_id}</code>
+                <div class="identity-details">
+                  <div class="detail-row">
+                    <span class="detail-label">ID:</span>
+                    <code class="identity-id">{identity.identity_id}</code>
+                  </div>
+                  <div class="detail-row">
+                    <span class="detail-label">公钥:</span>
+                    <code class="public-key-short"
+                      >{identity.public_key_hex.substring(0, 16)}...</code
+                    >
+                  </div>
+                </div>
                 {#if identity.is_current}
                   <span class="current-badge">{$_("current")}</span>
                 {/if}
@@ -186,7 +211,7 @@
                 {#if !identity.is_current}
                   <button
                     class="icon-btn select-btn"
-                    onclick={() => selectIdentity(identity.peer_id)}
+                    onclick={() => selectIdentity(identity.identity_id)}
                     title={$_("switch_to_this_identity")}
                   >
                     <svg
@@ -206,8 +231,9 @@
                 {/if}
                 <button
                   class="icon-btn copy-btn"
-                  onclick={() => copyPeerId(identity.peer_id)}
-                  title={$_("copy_peer_id")}
+                  onclick={() =>
+                    copyToClipboard(identity.public_key_hex, "公钥")}
+                  title="复制公钥"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -230,7 +256,7 @@
                 {#if !identity.is_current}
                   <button
                     class="icon-btn delete-btn"
-                    onclick={() => deleteIdentity(identity.peer_id)}
+                    onclick={() => deleteIdentity(identity.identity_id)}
                     title={$_("delete_identity")}
                   >
                     <svg
@@ -340,6 +366,33 @@
     border: 2px solid #3b82f6;
     border-radius: 8px;
     padding: 16px;
+    width: 100%;
+  }
+
+  .identity-field {
+    margin-bottom: 16px;
+  }
+
+  .identity-field:last-child {
+    margin-bottom: 0;
+  }
+
+  .identity-field label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary, #737373);
+    margin-bottom: 6px;
+    font-weight: 500;
+  }
+
+  .copyable-value {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--bg-primary, #111111);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 6px;
+    padding: 10px 12px;
     cursor: pointer;
     transition: all 0.2s;
     width: 100%;
@@ -348,30 +401,37 @@
     color: inherit;
   }
 
-  .current-identity-card:hover {
-    background: var(--bg-primary, #111111);
+  .copyable-value:hover {
+    background: var(--bg-tertiary, #1a1a1a);
     border-color: #60a5fa;
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.2);
   }
 
-  .current-identity-card:focus {
+  .copyable-value:focus {
     outline: 2px solid #3b82f6;
     outline-offset: 2px;
   }
 
-  .peerid-display {
-    display: block;
+  .copyable-value code {
     font-family: "Courier New", monospace;
-    font-size: 13px;
+    font-size: 12px;
     color: var(--text-primary, #ffffff);
     word-break: break-all;
-    margin-bottom: 8px;
+    flex: 1;
+    margin-right: 8px;
   }
 
-  .copy-hint {
-    font-size: 12px;
-    color: var(--text-secondary, #737373);
+  .public-key-display {
+    font-size: 11px;
+  }
+
+  .copy-icon {
+    font-size: 16px;
+    opacity: 0.6;
+    transition: opacity 0.2s;
+  }
+
+  .copyable-value:hover .copy-icon {
+    opacity: 1;
   }
 
   /* 操作按钮 */
@@ -459,11 +519,32 @@
     min-width: 0;
   }
 
-  .identity-peerid {
+  .identity-details {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .detail-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .detail-row:last-child {
+    margin-bottom: 0;
+  }
+
+  .detail-label {
+    font-size: 11px;
+    color: var(--text-secondary, #737373);
+    min-width: 40px;
+  }
+
+  .public-key-short {
     font-family: "Courier New", monospace;
-    font-size: 12px;
+    font-size: 11px;
     color: var(--text-primary, #fafafa);
-    word-break: break-all;
   }
 
   .current-badge {
