@@ -127,18 +127,28 @@ impl ChatMessage {
     }
 
     pub fn verify(&self, sender_peer_id: &libp2p::PeerId) -> anyhow::Result<bool> {
-        let public_key = identity::PublicKey::try_decode_protobuf(&self.sender_public_key)?;
+        // 1. 验证公钥格式并解码
+        let public_key = identity::PublicKey::try_decode_protobuf(&self.sender_public_key)
+            .map_err(|e| anyhow::anyhow!("Invalid sender public key format: {}", e))?;
+
+        // 2. 验证公钥对应的 PeerID 是否匹配
         if &public_key.to_peer_id() != sender_peer_id {
             return Ok(false);
         }
+
+        // 3. 验证消息新鲜度 (防止重放攻击的一部分)
         if !self.is_fresh() {
             return Ok(false);
         }
-        // 验证时使用压缩后的数据（存储在 self.data 中）
+
+        // 4. 验证数据完整性 (Hash)
+        // 注意：hash 是基于压缩后的数据计算的
         let computed = Self::compute_hash(self.msgtype, self.timestamp, &self.nonce, &self.data);
-        if computed != self.hash {
+        if !constant_time_compare(&computed, &self.hash) {
             return Ok(false);
         }
+
+        // 5. 验证签名
         Ok(public_key.verify(&computed, &self.signature))
     }
 

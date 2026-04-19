@@ -5,19 +5,46 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent};
 mod p2p_protocol;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
-async fn send(state: tauri::State<'_, AppData>, peer_id: &str, message: &str) -> Result<bool, String> {
-    let peer_id: libp2p::PeerId = match peer_id.parse() {
-        Ok(p) => p,
-        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
-    };
+async fn send(
+    state: tauri::State<'_, AppData>,
+    pubkey_identity_id: &str, // ML-KEM公钥的hex编码
+    message: &str,
+) -> Result<bool, String> {
+    // 验证pubkey_identity_id格式（应该是hex编码的ML-KEM公钥）
+    if pubkey_identity_id.is_empty() {
+        return Err("pubkey身份ID不能为空".to_string());
+    }
+
+    // 尝试解析为hex，验证格式
+    let public_key_bytes =
+        hex::decode(pubkey_identity_id).map_err(|e| format!("无效的pubkey身份ID格式: {}", e))?;
+
+    // 严格验证 ML-KEM-768 公钥长度 (1184 bytes)
+    const MLKEM768_PUBLIC_KEY_SIZE: usize = 1184;
+    if public_key_bytes.len() != MLKEM768_PUBLIC_KEY_SIZE {
+        return Err(format!(
+            "无效的ML-KEM公钥长度: 期望 {} 字节, 实际 {} 字节",
+            MLKEM768_PUBLIC_KEY_SIZE,
+            public_key_bytes.len()
+        ));
+    }
 
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    storage::upsert_contact(pool, &peer_id.to_string(), None)
-        .await
-        .map_err(|e| format!("保存联系人失败: {}", e))?;
-    storage::add_message(pool, &peer_id.to_string(), message, true, false)
+
+    // 保存消息到数据库（使用 pubkey 作为标识）
+    storage::add_message(pool, pubkey_identity_id, message, true, false)
         .await
         .map_err(|e| format!("保存消息失败: {}", e))?;
+
+    // 通过 chat_core 提供的优雅 API 从 DHT 查询 PeerID
+    let peer_id = chat_core::lookup_peerid_by_pubkey(&state.data_dir, pubkey_identity_id)
+        .map_err(|e| format!("查询 DHT 失败: {}", e))?
+        .ok_or_else(|| {
+            format!(
+                "未找到 pubkey {} 对应的 PeerID，对方可能不在线",
+                pubkey_identity_id
+            )
+        })?;
 
     let result = state
         .cmd_tx
@@ -41,13 +68,6 @@ struct ContactDto {
     added_at: i64,
 }
 
-#[derive(Serialize)]
-struct IdentityDto {
-    id: i64,
-    peer_id: String,
-    is_current: bool,
-}
-
 #[tauri::command]
 async fn list_contacts() -> Result<Vec<ContactDto>, String> {
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
@@ -55,25 +75,34 @@ async fn list_contacts() -> Result<Vec<ContactDto>, String> {
         .await
         .map_err(|e| format!("加载联系人失败: {}", e))?
         .into_iter()
-        .map(|c| ContactDto {
-            peer_id: c.peer_id,
-            name: c.name.unwrap_or_else(|| "未知联系人".to_string()),
-            added_at: c.added_at,
+        .map(|contact| ContactDto {
+            peer_id: contact.peer_id.clone(),
+            name: contact.name.unwrap_or(contact.peer_id),
+            added_at: contact.added_at,
         })
         .collect();
     Ok(contacts)
 }
 
+#[derive(Serialize)]
+struct MlKemIdentityDto {
+    id: i64,
+    identity_id: String,
+    public_key_hex: String,
+    is_current: bool,
+}
+
 #[tauri::command]
-async fn list_identities() -> Result<Vec<IdentityDto>, String> {
+async fn list_identities() -> Result<Vec<MlKemIdentityDto>, String> {
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let identities = storage::list_identities(pool)
+    let identities = storage::list_mlkem_identities(pool)
         .await
         .map_err(|e| format!("加载身份失败: {}", e))?
         .into_iter()
-        .map(|id| IdentityDto {
+        .map(|id| MlKemIdentityDto {
             id: id.id,
-            peer_id: id.peer_id,
+            identity_id: id.identity_id.clone(),
+            public_key_hex: hex::encode(&id.public_key),
             is_current: id.is_current == 1,
         })
         .collect();
@@ -84,34 +113,27 @@ async fn list_identities() -> Result<Vec<IdentityDto>, String> {
 async fn select_identity(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppData>,
-    peer_id: &str,
-) -> Result<bool, String> {
-    // Validate peer_id format
-    let _peer_id: libp2p::PeerId = match peer_id.parse() {
-        Ok(p) => p,
-        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
-    };
-
+    identity_id: &str,
+) -> Result<(), String> {
     // Check if identity exists
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let identities = storage::list_identities(pool)
+    let identities = storage::list_mlkem_identities(pool)
         .await
         .map_err(|e| format!("加载身份失败: {}", e))?;
-    if !identities.iter().any(|id| id.peer_id == peer_id) {
+    if !identities.iter().any(|id| id.identity_id == identity_id) {
         return Err("身份不存在".to_string());
     }
 
     let result = state
         .cmd_tx
         .send(ChatCommand::SelectIdentity {
-            peer_id: peer_id.to_string(),
+            peer_id: identity_id.to_string(),
         })
         .await;
     match result {
         Ok(_) => {
             // 切换身份成功后重启应用
             app.restart();
-            
         }
         Err(e) => Err(format!("切换身份失败: {}", e)),
     }
@@ -120,30 +142,64 @@ async fn select_identity(
 #[tauri::command]
 async fn delete_identity(
     state: tauri::State<'_, AppData>,
-    peer_id: &str,
+    identity_id: &str,
 ) -> Result<bool, String> {
-    let _peer_id: libp2p::PeerId = match peer_id.parse() {
-        Ok(p) => p,
-        Err(e) => return Err(format!("无效的 PeerId: {}", e)),
-    };
-
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let identities = storage::list_identities(pool)
+    let identities = storage::list_mlkem_identities(pool)
         .await
         .map_err(|e| format!("加载身份失败: {}", e))?;
-    if !identities.iter().any(|id| id.peer_id == peer_id) {
+    if !identities.iter().any(|id| id.identity_id == identity_id) {
         return Err("身份不存在".to_string());
     }
 
     let result = state
         .cmd_tx
         .send(ChatCommand::DeleteIdentity {
-            peer_id: peer_id.to_string(),
+            peer_id: identity_id.to_string(),
         })
         .await;
     match result {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("删除身份失败: {}", e)),
+    }
+}
+
+#[tauri::command]
+async fn add_contact(
+    state: tauri::State<'_, AppData>,
+    pubkey_identity_id: &str, // ML-KEM公钥的hex编码
+    name: Option<String>,
+) -> Result<bool, String> {
+    // 验证pubkey_identity_id格式
+    if pubkey_identity_id.is_empty() {
+        return Err("pubkey身份ID不能为空".to_string());
+    }
+
+    // 验证hex格式
+    let public_key =
+        hex::decode(pubkey_identity_id).map_err(|e| format!("无效的pubkey身份ID格式: {}", e))?;
+
+    // 严格验证 ML-KEM-768 公钥长度 (1184 bytes)
+    const MLKEM768_PUBLIC_KEY_SIZE: usize = 1184;
+    if public_key.len() != MLKEM768_PUBLIC_KEY_SIZE {
+        return Err(format!(
+            "无效的ML-KEM公钥长度: 期望 {} 字节, 实际 {} 字节",
+            MLKEM768_PUBLIC_KEY_SIZE,
+            public_key.len()
+        ));
+    }
+
+    let result = state
+        .cmd_tx
+        .send(ChatCommand::AddContact {
+            peer_id: pubkey_identity_id.to_string(), // 使用pubkey身份ID作为peer_id
+            public_key,
+            name,
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) => Err(format!("添加好友失败: {}", e)),
     }
 }
 
@@ -156,18 +212,21 @@ async fn generate_identity(state: tauri::State<'_, AppData>) -> Result<bool, Str
     }
 }
 
+use std::path::PathBuf;
 use tokio::sync::mpsc;
-
 
 pub struct AppData {
     pub cmd_tx: mpsc::Sender<ChatCommand>,
+    pub data_dir: PathBuf,
 }
-    #[cfg_attr(mobile, tauri::mobile_entry_point)]
-    pub fn run() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-    
-        let handle = rt.handle().clone();
-        tauri::Builder::default()
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let handle = rt.handle().clone();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_stronghold::Builder::new(|pass| todo!()).build())
+        .plugin(tauri_plugin_store::Builder::new().build())
         /* .register_uri_scheme_protocol("p2p", |app, request| {
             let uri = request.uri().to_string();
             
@@ -238,7 +297,7 @@ let data_dir = apphandle
                                 Some(log_level)
                             );
     
-                            let mut core = match chat_core::ChatCore::try_init(cfg).await {
+                            let mut core = match chat_core::ChatCore::try_init(cfg.clone()).await {
                                 Ok(c) => c,
                                 Err(e) => {
                                     eprintln!("Core 初始化失败: {}", e);
@@ -247,6 +306,7 @@ let data_dir = apphandle
                             };
                             apphandle.manage(AppData {
                                 cmd_tx: core.core_handle.cmd_tx.clone(),
+                                data_dir: cfg.data_dir.clone(),
 
                             });
     
@@ -254,10 +314,10 @@ let data_dir = apphandle
     
     
                             let mut rx = core.rx_message.take().unwrap();
-                            // 启动事件转发任务（多线程安全）
+                            // 启动核心服务（在独立线程中运行）
                             let app_handle_for_events = apphandle.clone();
                             core.run();
-    
+
                             // 主事件循环
                             loop {
                         tokio::select! {
@@ -293,7 +353,7 @@ let data_dir = apphandle
     
                 Ok(())
             })
-            .invoke_handler(tauri::generate_handler![send, list_contacts, list_identities, select_identity, delete_identity, generate_identity])
+            .invoke_handler(tauri::generate_handler![send, list_contacts, list_identities, select_identity, delete_identity, generate_identity, add_contact])
             .build(tauri::generate_context!())
       .expect("error while running tauri application")
             .run(|apphandle, event| match event {
@@ -301,10 +361,9 @@ let data_dir = apphandle
     RunEvent::Ready=> {},
     _=>{}
 })
-            
-    }
+}
 const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-  fn cleanup(app: &AppHandle) {
+fn cleanup(app: &AppHandle) {
     let start_time = std::time::Instant::now();
     while let Err(e) = app
         .state::<AppData>()

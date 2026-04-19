@@ -1,113 +1,130 @@
+use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use libp2p::identity;
 
 use crate::{coreconfig::CoreConfig, storage};
 
-/// 生成新身份并保存到存储
-async fn generate_and_save_identity(cfg: &CoreConfig) -> anyhow::Result<identity::Keypair> {
-    let pool = storage::pool().ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
+/// 生成ML-KEM密钥对
+fn generate_mlkem_keypair() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let decap_key = DecapsulationKey::generate(&ML_KEM_768)
+        .map_err(|e| anyhow::anyhow!("Failed to generate ML-KEM keypair: {:?}", e))?;
 
+    let encap_key = decap_key
+        .encapsulation_key()
+        .map_err(|e| anyhow::anyhow!("Failed to get encapsulation key: {:?}", e))?;
+
+    let public_key = encap_key
+        .key_bytes()
+        .map_err(|e| anyhow::anyhow!("Failed to serialize public key: {:?}", e))?;
+    let secret_key = decap_key
+        .key_bytes()
+        .map_err(|e| anyhow::anyhow!("Failed to serialize private key: {:?}", e))?;
+
+    Ok((public_key.as_ref().to_vec(), secret_key.as_ref().to_vec()))
+}
+
+/// 生成临时PeerID（Ed25519密钥对）
+pub fn generate_temporary_peerid() -> anyhow::Result<identity::Keypair> {
     let keypair = identity::Keypair::generate_ed25519();
-    let peer_id = keypair.public().to_peer_id();
-    let peer_id_str = peer_id.to_string();
-    let public_key_bytes = keypair.public().encode_protobuf();
-    let private_key_bytes = keypair.to_protobuf_encoding()?;
-
-    tracing::info!("Generating new identity: {}", peer_id_str);
-    
-    // 第一步：保存私钥到文件系统/keyring（遵循"先落盘文件资源"原则）
-    match storage::set_private_key(&cfg.data_dir, &peer_id_str, &private_key_bytes) {
-        Ok(used_file) => {
-            if used_file {
-                tracing::info!("Private key saved to local file for {}", peer_id_str);
-            } else {
-                tracing::info!("Private key saved to keyring for {}", peer_id_str);
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to save private key for {}: {}", peer_id_str, e);
-            anyhow::bail!("Failed to save private key: {}", e);
-        }
-    }
-    
-    // 第二步：添加身份到数据库
-    storage::add_identity(pool, &peer_id_str, &public_key_bytes).await?;
-    tracing::debug!("Added identity to database: {}", peer_id_str);
-    
-    // 第三步：设置为当前身份
-    storage::set_current_identity(pool, &peer_id_str).await?;
-    tracing::info!("Set current identity to: {}", peer_id_str);
-
-    tracing::info!("Identity generation completed successfully: {}", peer_id_str);
     Ok(keypair)
 }
 
-/// 生成新身份（公共接口）
-pub async fn generate_identity(cfg: &CoreConfig) -> anyhow::Result<identity::Keypair> {
-    generate_and_save_identity(cfg).await
+/// 生成ML-KEM身份并保存
+pub async fn generate_mlkem_identity(cfg: &CoreConfig) -> anyhow::Result<Vec<u8>> {
+    let pool = storage::pool().ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
+
+    // 生成ML-KEM密钥对
+    let (public_key, secret_key) = generate_mlkem_keypair()?;
+    let identity_id = hex::encode(&public_key);
+
+    tracing::info!("Generating new ML-KEM identity: {}", identity_id);
+
+    // 使用rootcell的PrivateKeyHandle保存私钥
+    let (_handle, backend) = rootcell::identity::PrivateKeyHandle::save(
+        &cfg.data_dir,
+        &identity_id,
+        &secret_key,
+    )?;
+
+    match backend {
+        rootcell::identity::StorageBackend::Keyring => {
+            tracing::info!("ML-KEM private key saved to keyring for {}", identity_id);
+        }
+        rootcell::identity::StorageBackend::EncryptedFile => {
+            tracing::info!(
+                "ML-KEM private key saved to encrypted file for {} (keyring unavailable)",
+                identity_id
+            );
+        }
+    }
+
+    // 私钥已在PrivateKeyHandle中管理，这里立即清零临时副本
+    drop(secret_key);
+
+    // 添加ML-KEM身份到数据库
+    storage::add_mlkem_identity(pool, &identity_id, &public_key).await?;
+    tracing::debug!("Added ML-KEM identity to database: {}", identity_id);
+
+    // 设置为当前身份
+    storage::set_current_mlkem_identity(pool, &identity_id).await?;
+    tracing::info!("Set current ML-KEM identity to: {}", identity_id);
+
+    tracing::info!(
+        "ML-KEM identity generation completed successfully: {}",
+        identity_id
+    );
+    Ok(public_key)
 }
 
-/// 加载或生成身份
-pub async fn load_or_generate_identity(cfg: &CoreConfig) -> anyhow::Result<identity::Keypair> {
+/// 加载或生成ML-KEM身份
+pub async fn load_or_generate_mlkem_identity(cfg: &CoreConfig) -> anyhow::Result<Vec<u8>> {
     let pool = storage::pool().ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
     tracing::info!(
-        "Loading or generating identity, data_dir: {:?}",
+        "Loading or generating ML-KEM identity, data_dir: {:?}",
         cfg.data_dir
     );
 
-    if let Some((peer_id_str, public_key_bytes)) = storage::get_current_identity(pool).await? {
-        tracing::info!("Found current identity in database: {}", peer_id_str);
-        
-        // 诊断私钥存储状态
-        let diagnosis = storage::diagnose_private_key_storage(&cfg.data_dir, &peer_id_str);
-        tracing::debug!("Private key storage diagnosis:\n{}", diagnosis);
+    if let Some((identity_id, public_key)) = storage::get_current_mlkem_public_key(pool).await? {
+        tracing::info!("Found current ML-KEM identity in database: {}", identity_id);
 
-        // 尝试从存储加载私钥
-        match storage::get_private_key(&cfg.data_dir, &peer_id_str) {
-            Ok(private_key_bytes) => {
-                // 显式标注类型以确保正确推断为 Vec<u8>
-                let private_key_bytes: Vec<u8> = private_key_bytes;
-                tracing::info!("Successfully loaded private key for {}", peer_id_str);
-                // 重建Keypair
-                let keypair = identity::Keypair::from_protobuf_encoding(&private_key_bytes)?;
-                // 验证peer_id和public_key匹配
-                if keypair.public().to_peer_id().to_string() != peer_id_str
-                    || keypair.public().encode_protobuf() != public_key_bytes
-                {
-                    tracing::warn!(
-                        "Stored peer_id or public_key does not match reconstructed keypair"
-                    );
-                    anyhow::bail!(
-                        "Identity mismatch for {}. Please clear database or restore correct private key.",
-                        peer_id_str
-                    );
-                } else {
-                    tracing::info!("Identity loaded successfully: {}", peer_id_str);
-                    Ok(keypair)
-                }
+        // 诊断私钥存储状态
+        let diagnosis =
+            rootcell::identity::PrivateKeyHandle::diagnose_storage(&cfg.data_dir, &identity_id);
+        tracing::debug!("ML-KEM private key storage diagnosis:\n{}", diagnosis);
+
+        // 尝试从存储加载私钥（使用PrivateKeyHandle）
+        match rootcell::identity::PrivateKeyHandle::load(&cfg.data_dir, &identity_id) {
+            Ok(handle) => {
+                tracing::info!(
+                    "Successfully loaded ML-KEM private key for {} (backend: {:?})",
+                    identity_id,
+                    handle.backend()
+                );
+                // Handle会在drop时自动清理和解锁内存
+                drop(handle);
+                Ok(public_key)
             }
             Err(e) => {
                 tracing::error!(
-                    "Failed to load private key for {}: {}. The existing identity record will be removed and a new one generated.",
-                    peer_id_str,
+                    "Failed to load ML-KEM private key for {}: {}. The existing identity record will be removed and a new one generated.",
+                    identity_id,
                     e
                 );
-                // 私钥丢失时，删除无效的 identity 记录，然后生成新身份
-                // 这样可以避免数据库中积累无效的 identity 记录
+                // 私钥丢失时，删除无效的身份记录，然后生成新身份
                 if let Err(del_err) =
-                    storage::delete_identity(pool, &cfg.data_dir, &peer_id_str).await
+                    storage::delete_mlkem_identity(pool, &cfg.data_dir, &identity_id).await
                 {
                     tracing::warn!(
-                        "Failed to delete invalid identity {}: {}",
-                        peer_id_str,
+                        "Failed to delete invalid ML-KEM identity {}: {}",
+                        identity_id,
                         del_err
                     );
                 }
-                generate_and_save_identity(cfg).await
+                generate_mlkem_identity(cfg).await
             }
         }
     } else {
-        tracing::debug!("No current identity found in database, generating new identity");
+        tracing::debug!("No current ML-KEM identity found in database, generating new identity");
         // 生成新身份
-        generate_and_save_identity(cfg).await
+        generate_mlkem_identity(cfg).await
     }
 }

@@ -12,6 +12,7 @@ use std::time::Duration;
 use super::behaviour::MyBehaviour;
 use super::bootstrap;
 use super::dht;
+use super::validator::{ChallengeValidator, ChallengeValidatorConfig};
 use crate::{ChatMessage, ChatResponse};
 
 use std::sync::LazyLock;
@@ -20,6 +21,12 @@ static PROTOCOL_KAD: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1"));
 static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/rr_msg/0.0.1"));
+
+/// Swarm 初始化结果，包含 swarm 和 validator
+pub struct SwarmWithValidator {
+    pub swarm: Swarm<MyBehaviour>,
+    pub validator: Arc<std::sync::RwLock<ChallengeValidator>>,
+}
 
 /// 初始化 libp2p Swarm
 ///
@@ -30,7 +37,7 @@ static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
 pub fn swarm_init(
     data_dir: &std::path::Path,
     keypair: libp2p::identity::Keypair,
-) -> anyhow::Result<Swarm<MyBehaviour>> {
+) -> anyhow::Result<SwarmWithValidator> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         // QUIC 传输层：内置 TLS 1.3，0-RTT，更好 NAT 穿透
@@ -81,7 +88,16 @@ pub fn swarm_init(
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
 
-    Ok(swarm)
+    // 创建挑战验证器
+    let validator_config = ChallengeValidatorConfig {
+        challenge_timeout: Duration::from_secs(30),
+        max_records_per_peer: 1000,
+        max_pending_challenges: 1000,
+        strict_validation: true,
+    };
+    let validator = Arc::new(std::sync::RwLock::new(ChallengeValidator::new(validator_config)));
+
+    Ok(SwarmWithValidator { swarm, validator })
 }
 
 /// 创建 Kademlia 行为

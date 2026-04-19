@@ -1,3 +1,4 @@
+use libp2p::kad::{self, GetRecordOk, QueryResult};
 use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identify, mdns};
@@ -13,8 +14,14 @@ const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// # 事件分类处理
 /// - mDNS：局域网节点发现/过期
 /// - 连接管理：建立、关闭、错误
+/// - Kademlia：DHT 记录验证和管理
 pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCore) {
     match event {
+        // Kademlia 事件处理
+        SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(kad_event)) => {
+            handle_kademlia_event(kad_event, core);
+        }
+        
         //request-response
         // 收到请求
         SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
@@ -27,11 +34,64 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                     request_id: _,
                 },
         })) => {
-            println!("收到: {:?} from {}", request, peer);
+            tracing::info!("收到: {:?} from {}", request.msgtype, peer);
 
             if let Some(pool) = storage::pool() {
-                if let Err(e) = storage::upsert_contact(pool, &peer.to_string(), None).await {
-                    tracing::warn!("保存联系人失败: {}", e);
+                // 首先检查发送方是否是已添加的联系人（好友）
+                match storage::is_contact_exists(pool, &peer.to_string()).await {
+                    Ok(true) => {
+                        tracing::debug!("消息来自已知联系人: {}", peer);
+                    }
+                    Ok(false) => {
+                        tracing::warn!("收到来自未知用户 {} 的消息，已拒绝", peer);
+                        // 仍然发送响应，但不处理消息内容
+                        let response = ChatResponse {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                        };
+                        if let Err(e) = core
+                            .swarm
+                            .behaviour_mut()
+                            .rr_msg
+                            .send_response(channel, response)
+                        {
+                            eprintln!("发送响应失败: {:?}", e);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("检查联系人状态失败: {}", e);
+                        // 出错时保守处理，不接收消息
+                        let response = ChatResponse {
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                        };
+                        if let Err(e) = core
+                            .swarm
+                            .behaviour_mut()
+                            .rr_msg
+                            .send_response(channel, response)
+                        {
+                            eprintln!("发送响应失败: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+
+                // 保存或更新联系人（包含公钥）- 仅在确认是好友后更新公钥
+                if let Err(e) = storage::upsert_contact(
+                    pool,
+                    &peer.to_string(),
+                    None,
+                    Some(&request.sender_public_key),
+                )
+                .await
+                {
+                    tracing::warn!("更新联系人公钥失败: {}", e);
                 }
 
                 if let ChatMessageType::Text = request.msgtype {
@@ -39,25 +99,63 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                         Ok(true) => {
                             // 解压缩数据
                             match request.get_decompressed_data() {
-                                Ok(decompressed_data) => {
-                                    match String::from_utf8(decompressed_data) {
-                                        Ok(text) => {
-                                            if let Err(e) = storage::add_message(
-                                                pool,
-                                                &peer.to_string(),
-                                                &text,
-                                                false,
-                                                false,
-                                            )
+                                Ok(compressed_data) => {
+                                    // 获取当前身份的公钥
+                                    if let Some((peer_id_str, _public_key_bytes)) =
+                                        storage::get_current_mlkem_identity(pool)
                                             .await
-                                            {
-                                                tracing::warn!("保存接收消息失败: {}", e);
+                                            .ok()
+                                            .flatten()
+                                    {
+                                        // 从安全存储中获取私钥
+                                        match rootcell::identity::PrivateKeyHandle::load(&core.data_dir, &peer_id_str)
+                                        {
+                                            Ok(private_key_handle) => {
+                                                let private_key_bytes = private_key_handle.get_private_key();
+                                                // 解密消息（使用私钥）
+                                                match crypto::decrypt_message(
+                                                    &compressed_data,
+                                                    &private_key_bytes,
+                                                ) {
+                                                    Ok(decrypted_data) => {
+                                                        match String::from_utf8(decrypted_data) {
+                                                            Ok(text) => {
+                                                                if let Err(e) =
+                                                                    storage::add_message(
+                                                                        pool,
+                                                                        &peer.to_string(),
+                                                                        &text,
+                                                                        false,
+                                                                        false,
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    tracing::warn!(
+                                                                        "保存接收消息失败: {}",
+                                                                        e
+                                                                    );
+                                                                }
+                                                                core.send_message_mpsc(text).await;
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(
+                                                                    "解密后的消息不是合法 UTF-8: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("解密消息失败: {}", e);
+                                                    }
+                                                }
                                             }
-                                            core.send_message_mpsc(text).await;
+                                            Err(e) => {
+                                                tracing::warn!("获取 ML-KEM 私钥失败: {}", e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("接收消息不是合法 UTF-8: {}", e);
-                                        }
+                                    } else {
+                                        tracing::warn!("未找到当前 ML-KEM 身份");
                                     }
                                 }
                                 Err(e) => {
@@ -242,8 +340,105 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::ExpiredListenAddr { address, .. } => {
             tracing::error!("Address expired: {address}");
         }
-
-        // 其他事件
+        
+        // 其他事件（忽略）
         _ => {}
+    }
+}
+
+/// 处理 Kademlia 事件
+fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
+    match kad_event {
+        // 记录查询结果
+        kad::Event::OutboundQueryProgressed {
+            result: QueryResult::GetRecord(result),
+            ..
+        } => {
+            match result {
+                Ok(GetRecordOk::FoundRecord(record)) => {
+                    // 验证找到的记录
+                    if let Some(publisher) = &record.record.publisher {
+                        let mut validator = core.validator.write().unwrap();
+                        
+                        // 使用 validator 验证记录
+                        let record_size = record.record.value.len();
+                        if !validator.validate_dht_record(
+                            publisher,
+                            record_size,
+                            &record.record.key,
+                        ) {
+                            tracing::warn!(
+                                "Rejected DHT record from {}: validation failed",
+                                publisher
+                            );
+                            return;
+                        }
+                        
+                        tracing::debug!(
+                            "Validated DHT record from {} (size: {} bytes)",
+                            publisher,
+                            record_size
+                        );
+                    }
+                }
+                Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                    tracing::debug!("DHT query finished with no additional records");
+                }
+                Err(e) => {
+                    tracing::warn!("DHT get record query failed: {:?}", e);
+                }
+            }
+        }
+        
+        // 记录发布事件
+        kad::Event::OutboundQueryProgressed {
+            result: QueryResult::PutRecord(result),
+            ..
+        } => {
+            match result {
+                Ok(ok) => {
+                    tracing::debug!("Successfully published DHT record to {:?}", ok.key);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to publish DHT record: {:?}", e);
+                }
+            }
+        }
+        
+        // 提供者查询
+        kad::Event::OutboundQueryProgressed {
+            result: QueryResult::GetProviders(result),
+            ..
+        } => {
+            match result {
+                Ok(ok) => {
+                    tracing::debug!("Found providers: {:?}", ok);
+                }
+                Err(e) => {
+                    tracing::warn!("Get providers query failed: {:?}", e);
+                }
+            }
+        }
+        
+        // 路由表更新
+        kad::Event::RoutingUpdated {
+            peer,
+            is_new_peer,
+            addresses,
+            old_peer,
+            ..
+        } => {
+            if is_new_peer {
+                tracing::info!("New peer added to routing table: {} with {} addresses", peer, addresses.len());
+            }
+            if let Some(old) = old_peer {
+                tracing::debug!("Peer {} replaced by {} in routing table", old, peer);
+            }
+        }
+        
+        // 其他 Kademlia 事件
+        _ => {
+            tracing::trace!("Unhandled Kademlia event: {:?}", kad_event);
+        }
     }
 }

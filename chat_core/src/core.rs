@@ -22,6 +22,8 @@ use crate::{
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
     pub swarm: Swarm<p2p::MyBehaviour>,
+    /// DHT 挑战验证器
+    pub validator: Arc<std::sync::RwLock<p2p::ChallengeValidator>>,
     /// 当前身份私钥，用于对消息签名
     pub identity_keypair: libp2p::identity::Keypair,
     /// 消息发送通道：向外部（UI）发送事件
@@ -56,15 +58,24 @@ impl ChatCore {
 
         let _ = try_join!(storage::init(&cfg))?;
 
-        // 加载或生成身份
-        let keypair = load_or_generate_identity(&cfg).await?;
-        // 记录当前加载的身份 ID，便于确认是否复用了旧身份
+        // 加载或生成ML-KEM身份（持久化身份）
+        let mlkem_public_key= identity::load_or_generate_mlkem_identity(&cfg).await?;
+        //注意：私钥使用handle去处理
+        let mlkem_pubkey_hex = hex::encode(&mlkem_public_key);
         tracing::info!(
-            "Loaded identity with Peer ID: {}",
-            keypair.public().to_peer_id()
+            "Loaded ML-KEM identity: {}",
+            mlkem_pubkey_hex
         );
 
-        let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone())?;
+        // 为当前会话生成临时的 libp2p PeerID（不持久化）
+        let keypair = identity::generate_temporary_peerid()?;
+        let peer_id = keypair.public().to_peer_id();
+        tracing::info!(
+            "Generated temporary PeerID for transport: {}",
+            peer_id
+        );
+
+        let p2p::SwarmWithValidator { swarm, validator } = p2p::swarm_init(&cfg.data_dir, keypair.clone())?;
 
         
 
@@ -73,8 +84,14 @@ impl ChatCore {
         let mdns_cache = LruCache::new(NonZeroUsize::new(Self::MDNS_CACHE_SIZE).unwrap());
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<ChatCommand>(64);
+        
+        // 保存 ML-KEM pubkey 用于后续 DHT 注册
+        let mlkem_pubkey_hex_for_dht = mlkem_pubkey_hex.clone();
+        let peer_id_for_dht = peer_id;
+        
         Ok(ChatCore {
             swarm,
+            validator,
             identity_keypair: keypair,
             tx_message: tx,
             rx_message: Some(rx),
@@ -82,6 +99,8 @@ impl ChatCore {
             mdns_cache,
             data_dir: cfg.data_dir.clone(),
             core_handle: CoreHandle { cmd_tx },
+            mlkem_pubkey_hex: Some(mlkem_pubkey_hex_for_dht),
+            current_peer_id: Some(peer_id_for_dht),
         })
     }
     pub fn handler(&self) -> CoreHandle {
@@ -94,53 +113,94 @@ impl ChatCore {
     /// JoinHandle：可用于等待线程结束或强制终止
     pub fn run(mut self) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-             // 自动获取 CPU 核心数
-        let worker_threads = available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+            // 自动获取 CPU 核心数
+            let worker_threads = available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
 
             let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)  
-            .enable_all()
+                .worker_threads(worker_threads)
+                .enable_all()
                 .build()
                 .expect("Failed to build tokio runtime");
 
             rt.block_on(async move {
-                // 主事件循环：三路 select
+                // 启动 DHT 定期注册任务（优化版本：复用数据库连接）
+                let mlkem_pubkey = self.mlkem_pubkey_hex.clone();
+                let peer_id = self.current_peer_id;
+                let data_dir = self.data_dir.clone();
+                
+                if let (Some(pubkey), Some(pid)) = (mlkem_pubkey, peer_id) {
+                    tokio::spawn(async move {
+                        // 打开一次数据库，复用连接
+                        let dht_path = data_dir.join("dht.redb");
+                        let db = match redb::Database::create(&dht_path) {
+                            Ok(db) => Arc::new(db),
+                            Err(e) => {
+                                tracing::error!("Failed to open DHT database: {}", e);
+                                return; // 退出任务
+                            }
+                        };
+                        
+                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 每5分钟注册一次
+                        loop {
+                            interval.tick().await;
+                            
+                            let store = p2p::dht::RedbRecordStore::new(db.clone());
+                            if let Err(e) = store.set_pubkey_peerid(&pubkey, &pid) {
+                                tracing::warn!("Failed to refresh DHT registration: {}", e);
+                            } else {
+                                tracing::debug!("Refreshed DHT registration: {} -> {}", pubkey, pid);
+                            }
+                        }
+                    });
+                }
+                
+                // 启动 Validator 定期清理任务
+                let validator = self.validator.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60)); // 每分钟清理一次
+                    loop {
+                        interval.tick().await;
+                        if let Ok(mut v) = validator.write() {
+                            v.cleanup_expired_challenges();
+                        }
+                    }
+                });
+                
+                // 主事件循环：处理网络事件和控制命令
                 loop {
                     tokio::select! {
                         // 1. 网络事件：swarm 产生（新连接、消息到达等）
                         event = self.swarm.select_next_some() => {
-                           p2p::swarm_event(event, &mut self).await;
+                            p2p::swarm_event(event, &mut self).await;
                         }
 
                         // 2. 控制命令：外部发送（UI/CLI)
                         Some(cmd) = self.rx_cmd.recv() => {
-
                             match cmd {
                                 ChatCommand::SendMessage {peerid,msgtype,data} => {
                                     match msgtype {
                                         ChatMessageType::Text => {
-                                           match self.send_text(peerid, msgtype, data) {
-                                        Ok(_) => {
-
-                                            tracing::info!("Message sent to {}", peerid);
-                                        }
-                                        Err(e) => {
-                                        tracing::error!("Failed to build signed message: {e}");
-                                    }
-                                    }
+                                            match self.send_text(peerid, msgtype, data).await {
+                                                Ok(_) => {
+                                                    tracing::info!("Message sent to {}", peerid);
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("Failed to send message: {e}");
+                                                }
+                                            }
                                         }
                                         ChatMessageType::FileHash => {
-                                            todo!();
                                             tracing::info!("Received SendMessage command for peer {}: File message with {} bytes", peerid, data.len());
-
+                                            // TODO: Implement file hash message handling
                                         }
                                         ChatMessageType::__NonExhaustive=>{}
                                     }
-                                    
+                                }
 
-
+                                ChatCommand::AddContact { peer_id, public_key, name } => {
+                                    self.add_contact(peer_id, public_key, name).await;
                                 }
 
                                 ChatCommand::GenerateIdentity => {
@@ -153,7 +213,7 @@ impl ChatCore {
                                     self.delete_identity(peer_id).await;
                                 }
                                 ChatCommand::Shutdown => {
-                                    tracing::info!("P2P thread shutting down...");
+                                    tracing::info!("P2P core shutting down...");
                                     break;
                                 }
                             }
@@ -186,7 +246,32 @@ impl ChatCore {
         msgtype: ChatMessageType,
         data: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let message = self.build_signed_message(msgtype, data)?;
+        // 从数据库获取接收方的公钥
+        let recipient_public_key = if let Some(pool) = storage::pool() {
+            match storage::get_contact_public_key(pool, &peerid.to_string()).await {
+                Ok(Some(pubkey)) => pubkey,
+                Ok(None) => {
+                    return Err(anyhow::anyhow!(
+                        "未找到联系人 {} 的公钥，请先添加好友",
+                        peerid
+                    ));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("查询联系人公钥失败: {}", e));
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("数据库连接不可用"));
+        };
+
+        // 加密消息数据（使用接收方公钥）
+        let encrypted_data = crypto::encrypt_message(
+            &data,
+            &recipient_public_key,
+        )?;
+
+        // 构建签名的消息（包含加密后的数据）
+        let message = self.build_signed_message(msgtype, encrypted_data)?;
         self.send_message(peerid, message);
         Ok(())
     }
@@ -198,55 +283,88 @@ impl ChatCore {
             ..Default::default()
         };
 
-        match crate::identity::generate_identity(&temp_cfg).await {
-            Ok(keypair) => {
-                let peer_id_str = keypair.public().to_peer_id().to_string();
-                // 检查是否使用了本地文件存储（keyring失败）
-                match storage::set_private_key(
-                    &self.data_dir,
-                    &peer_id_str,
-                    &keypair.to_protobuf_encoding().unwrap(),
-                ) {
-                    Ok(true) => {
-                        // keyring 失败，使用了本地文件
-                        let msg =
-                            "Keyring 无法保存私钥，已使用本地备份存储，请及时检查权限或配置。"
-                                .to_string();
-                        tracing::warn!("{}", msg);
-                        self.send_warning_mpsc(msg).await;
-                    }
-                    Ok(false) => {
-                        // 成功使用 keyring
-                        tracing::info!("Generated new identity: {}", peer_id_str);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to verify private key storage: {e}");
-                    }
-                }
+        match crate::identity::generate_mlkem_identity(&temp_cfg).await {
+            Ok(public_key ) => {
+                let identity_id = hex::encode(&public_key);
+                tracing::info!("Generated new ML-KEM identity: {}", identity_id);
+                
+                let msg = format!("已生成新的 ML-KEM 身份: {}", &identity_id[..16]);
+                self.send_log_mpsc(msg).await;
             }
             Err(e) => {
-                tracing::error!("Failed to generate identity: {e}");
+                tracing::error!("Failed to generate ML-KEM identity: {e}");
+                let msg = format!("生成 ML-KEM 身份失败: {}", e);
+                self.send_warning_mpsc(msg).await;
             }
         }
     }
-    ///外部需重启应用
-    async fn select_identity(&mut self, peer_id: String) {
+    
+    /// 选择当前 ML-KEM 身份（热切换身份待实现？）
+    async fn select_identity(&mut self, identity_id: String) {
         if let Some(pool) = storage::pool() {
-            if let Err(e) = storage::set_current_identity(pool, &peer_id).await {
+            if let Err(e) = storage::set_current_mlkem_identity(pool, &identity_id).await {
                 tracing::error!("Failed to select identity: {e}");
             } else {
-                tracing::info!("Selected identity: {}", peer_id);
+                tracing::info!("Selected identity: {}", identity_id);
             }
         }
     }
 
-    async fn delete_identity(&mut self, peer_id: String) {
+    async fn delete_identity(&mut self, identity_id: String) {
         if let Some(pool) = storage::pool() {
-            if let Err(e) = storage::delete_identity(pool, &self.data_dir, &peer_id).await {
+            if let Err(e) = storage::delete_mlkem_identity(pool, &self.data_dir, &identity_id).await {
                 tracing::error!("Failed to delete identity: {e}");
             } else {
-                tracing::info!("Deleted identity: {}", peer_id);
+                tracing::info!("Deleted identity: {}", identity_id);
             }
+        }
+    }
+
+    async fn add_contact(&mut self, peer_id: String, public_key: Vec<u8>, name: Option<String>) {
+        // 注意：这里的 public_key 应该是联系人的 ML-KEM 公钥（用于端到端加密）
+        // PeerID 是临时的传输层标识，不需要与 ML-KEM 公钥匹配
+        
+        // 验证公钥长度是否符合 ML-KEM-768 标准（1184 字节）
+        let expected_mlkem_pubkey_size = 1184;
+        if public_key.len() != expected_mlkem_pubkey_size {
+            tracing::warn!(
+                "Invalid ML-KEM public key length: expected {}, got {}",
+                expected_mlkem_pubkey_size,
+                public_key.len()
+            );
+            let msg = format!(
+                "无效的 ML-KEM 公钥长度: 期望 {} 字节，实际 {} 字节",
+                expected_mlkem_pubkey_size,
+                public_key.len()
+            );
+            self.send_warning_mpsc(msg).await;
+            return;
+        }
+
+        // 保存到数据库（ML-KEM 公钥用于后续加密消息）
+        if let Some(pool) = storage::pool() {
+            match storage::upsert_contact(
+                pool,
+                &peer_id,
+                name.as_deref(),
+                Some(&public_key),
+            )
+            .await
+            {
+                Ok(_) => {
+                    tracing::info!("Successfully added contact: {}", peer_id);
+                    let msg = format!("好友 {} 添加成功", peer_id);
+                    self.send_log_mpsc(msg).await;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to save contact: {e}");
+                    let msg = format!("保存好友信息失败: {}", e);
+                    self.send_warning_mpsc(msg).await;
+                }
+            }
+        } else {
+            tracing::error!("Database pool not available");
+            self.send_warning_mpsc("数据库不可用".to_string()).await;
         }
     }
 

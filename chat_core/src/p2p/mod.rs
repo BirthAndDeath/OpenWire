@@ -3,11 +3,11 @@ mod bootstrap;
 pub mod dht;
 mod events;
 mod swarm;
-mod validator;
+pub mod validator;
 
 pub use behaviour::MyBehaviour;
 pub use events::swarm_event;
-pub use swarm::swarm_init;
+pub use swarm::{SwarmWithValidator, swarm_init};
 pub use validator::{ChallengeValidator, ChallengeValidatorConfig};
 
 use libp2p::PeerId;

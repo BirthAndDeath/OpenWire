@@ -15,4 +15,4 @@ pub use identity::{
     generate_mlkem_identity, generate_temporary_peerid, load_or_generate_mlkem_identity,
 };
 pub use message::{ChatMessage, ChatMessageType, ChatResponse};
-pub use p2p::lookup_peerid_by_pubkey;
+pub use p2p::{lookup_peerid_by_pubkey, ChallengeValidator, ChallengeValidatorConfig};
