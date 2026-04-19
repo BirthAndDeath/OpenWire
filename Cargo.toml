@@ -27,11 +27,8 @@ libp2p = { version = "0.56.0", features = [
     "dcutr",
     "noise",
     "macros",
-    "tcp",
-    "yamux",
     "quic",
     "kad",
-    "rsa",
     "secp256k1",
     "ed25519",
 ] }
