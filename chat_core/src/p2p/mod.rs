@@ -1,12 +1,14 @@
+mod behaviour;
 mod bootstrap;
 pub mod dht;
-mod behaviour;
-mod swarm;
 mod events;
+mod swarm;
+mod validator;
 
 pub use behaviour::MyBehaviour;
-pub use swarm::swarm_init;
 pub use events::swarm_event;
+pub use swarm::swarm_init;
+pub use validator::{ChallengeValidator, ChallengeValidatorConfig};
 
 use libp2p::PeerId;
 use std::path::Path;
@@ -21,13 +23,16 @@ use std::path::Path;
 /// - `Ok(Some(peer_id))`: 找到对应的 PeerID
 /// - `Ok(None)`: 未找到记录
 /// - `Err(e)`: 数据库错误
-pub fn lookup_peerid_by_pubkey(data_dir: &Path, pubkey_hex: &str) -> anyhow::Result<Option<PeerId>> {
+pub fn lookup_peerid_by_pubkey(
+    data_dir: &Path,
+    pubkey_hex: &str,
+) -> anyhow::Result<Option<PeerId>> {
     let dht_path = data_dir.join("dht.redb");
-    
+
     if !dht_path.exists() {
         return Ok(None);
     }
-    
+
     let db = redb::Database::open(&dht_path)?;
     let store = dht::RedbRecordStore::new(std::sync::Arc::new(db));
     store.get_peerid_by_pubkey(pubkey_hex)

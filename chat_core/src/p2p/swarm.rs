@@ -24,10 +24,9 @@ static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
 /// 初始化 libp2p Swarm
 ///
 /// # 网络栈配置
-/// - 传输：TCP + Noise 加密 + Yamux 多路复用
 /// - 补充：QUIC（原生 TLS 1.3，性能更优）
 /// - 发现：mDNS 局域网自动发现
-/// - 消息：Gossipsub 广播
+/// - 消息：rrmsg
 pub fn swarm_init(
     data_dir: &std::path::Path,
     keypair: libp2p::identity::Keypair,
@@ -68,7 +67,6 @@ pub fn swarm_init(
 
             Ok(MyBehaviour {
                 rr_msg,
-                //gossipsub,
                 mdns,
                 kademlia,
                 ping,
@@ -79,12 +77,9 @@ pub fn swarm_init(
         })?
         .build();
 
-    // 监听所有接口：IPv4/IPv6 + TCP/QUIC
     // 端口 0 表示系统自动分配
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip6/::/tcp/0".parse()?)?;
 
     Ok(swarm)
 }
