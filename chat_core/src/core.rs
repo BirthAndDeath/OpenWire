@@ -34,6 +34,10 @@ pub struct ChatCore {
     pub data_dir: PathBuf,
     /// 核心句柄：用于外部控制核心
     pub core_handle: CoreHandle,
+    /// 保存 ML-KEM 公钥十六进制字符串，用于后续 DHT 注册
+    pub mlkem_pubkey_hex: Option<String>,
+    /// 保存当前临时 PeerID，用于后续 DHT 注册
+    pub current_peer_id: Option<PeerId>,
 }
 
 impl ChatCore {
@@ -95,7 +99,7 @@ impl ChatCore {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let rt = tokio::runtime::Builder::new_multi_thread()  // 改为多线程。
+            let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(worker_threads)  
             .enable_all()
                 .build()

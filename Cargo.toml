@@ -14,7 +14,7 @@ dioxus = { version = "0.7.5" }
 ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
 chat_core = { path = "chat_core" }
-tokio = { version = "1.51.1", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 libp2p = { version = "0.56.0", features = [
     "dns",
     "tokio",

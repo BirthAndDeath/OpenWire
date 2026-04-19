@@ -15,7 +15,7 @@ sha2 = "0.11"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio", "macros"] }
 tokio = { workspace = true }
-tracing-appender = "0.2.4"
+tracing-appender = "0.2.5"
 tracing = { workspace = true }
 aes-gcm = "0.10.3"
 
@@ -31,10 +31,10 @@ hex = "0.4.3"
 snap = "1.1.1"
 blake3 = "1.8.4"
 rand = "0.10.1"
-lru = "0.16.3"
+lru = "0.16.4"
 
 redb = "4.0.0"
-zeroize = { version = "1.8.0", features = ["zeroize_derive"] }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 
 [package.metadata.docs.rs]
 #no-deps = true

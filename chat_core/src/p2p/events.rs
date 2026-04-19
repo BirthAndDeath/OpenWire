@@ -4,7 +4,7 @@ use libp2p::{identify, mdns};
 use std::time::{Duration, Instant};
 
 use super::behaviour::MyBehaviourEvent;
-use crate::{ChatCore, ChatMessageType, ChatResponse, storage};
+use crate::{ChatCore, ChatMessageType, ChatResponse, crypto, storage};
 
 const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -12,7 +12,6 @@ const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 ///
 /// # 事件分类处理
 /// - mDNS：局域网节点发现/过期
-/// - Gossipsub：消息接收
 /// - 连接管理：建立、关闭、错误
 pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCore) {
     match event {
