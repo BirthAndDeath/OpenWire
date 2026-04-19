@@ -64,4 +64,4 @@ tokio = { version = "1.52", features = [
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
-tempfile = "3.10"
+tempfile = "3.27"

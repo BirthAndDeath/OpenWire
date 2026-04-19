@@ -15,20 +15,20 @@ name = "chat_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = ["isolation"] }
+tauri-build = { version = "2.5.6", features = ["isolation"] }
 
 [dependencies]
 tokio = { workspace = true }
 chat_core = { workspace = true }
 tracing = { workspace = true }
-tauri = { version = "2", features = ["isolation"] }
-tauri-plugin-opener = "2"
+tauri = { version = "2.10.1", features = ["isolation"] }
+tauri-plugin-opener = "2.5.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libp2p = { workspace = true }
-tauri-plugin-store = "2"
-hex = "0.4"
-tauri-plugin-stronghold = "2"
+tauri-plugin-store = "2.4.2"
+hex = "0.4.3"
+tauri-plugin-stronghold = "2.3.1"
 [package.metadata.docs.rs]
 # docs.rs 构建时使用
 no-deps = true

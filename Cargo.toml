@@ -1,17 +1,8 @@
 [workspace]
-members = [
-    "chat_core",
-    "rootcell",
-    "chat_cli",
-    "chat_tauri/src-tauri",
-    "chat_dioxus/packages/*",
-]
+members = ["chat_core", "rootcell", "chat_cli", "chat_tauri/src-tauri"]
 resolver = "3"
 
 [workspace.dependencies]
-dioxus = { version = "0.7.5" }
-
-ui = { path = "chat_dioxus/packages/ui" }
 rootcell = { path = "rootcell" }
 chat_core = { path = "chat_core" }
 tokio = { version = "1.52.1", features = ["full"] }
