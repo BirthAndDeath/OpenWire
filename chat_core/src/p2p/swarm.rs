@@ -1,10 +1,6 @@
 use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
-use libp2p::{
-    identify, mdns, noise, ping, relay, dcutr,
-    PeerId, StreamProtocol, Swarm,
-    tcp, yamux,
-};
+use libp2p::{PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, ping, relay};
 
 use redb::Database;
 use std::num::NonZero;
@@ -23,7 +19,7 @@ use std::sync::LazyLock;
 static PROTOCOL_KAD: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1"));
 static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
-    LazyLock::new(|| StreamProtocol::new("/chat/kad/0.0.1/rr_msg/0.0.1"));
+    LazyLock::new(|| StreamProtocol::new("/chat/rr_msg/0.0.1"));
 
 /// 初始化 libp2p Swarm
 ///
@@ -38,12 +34,6 @@ pub fn swarm_init(
 ) -> anyhow::Result<Swarm<MyBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        // TCP 传输层：Noise 加密 + Yamux 流多路复用
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,     // XX 握手模式
-            yamux::Config::default, // 流复用
-        )?
         // QUIC 传输层：内置 TLS 1.3，0-RTT，更好 NAT 穿透
         .with_quic()
         // DNS 解析（支持 /dns4, /dns6, /dnsaddr）
@@ -103,10 +93,18 @@ pub fn swarm_init(
 fn create_kademlia(
     peer_id: PeerId,
     data_dir: &std::path::Path,
-) -> kad::Behaviour<dht::RedbRecordStore> {
+) -> kad::Behaviour<dht::ResourceLimitedRecordStore> {
     let db_path = data_dir.join("dht.redb");
     let db = Arc::new(Database::create(db_path).expect("Failed to create database"));
-    let store = dht::RedbRecordStore::new(db);
+
+    // 配置资源限制
+    let limits = dht::ResourceLimits {
+        max_records_per_peer: 1000,
+        max_total_size: 100 * 1024 * 1024, // 100MB
+        enabled: true,
+    };
+
+    let store = dht::ResourceLimitedRecordStore::new(db, limits);
 
     // 配置Kademlia网络参数
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());

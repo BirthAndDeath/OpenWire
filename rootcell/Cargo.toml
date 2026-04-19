@@ -32,6 +32,24 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 
 # 错误处理
 thiserror = "2.0"
+anyhow = "1.0"
+
+# Keyring支持
+keyring = { version = "3.6.3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
+
+# Hex编码
+hex = "0.4.3"
+
+# 日志
+tracing = "0.1"
+
+# Unix mlock支持
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # WebAuthn（可选）
 webauthn-authenticator-rs = { version = "0.5", optional = true }
@@ -46,3 +64,4 @@ tokio = { version = "1.52", features = [
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }
+tempfile = "3.10"

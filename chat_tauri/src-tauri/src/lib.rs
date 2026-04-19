@@ -1,7 +1,7 @@
-use tauri::{AppHandle, Emitter, Manager, RunEvent};
-use serde::Serialize;
-use chat_core::{ChatCommand, ChatMessageType, MessageEvent};
 use chat_core::storage;
+use chat_core::{ChatCommand, ChatMessageType, MessageEvent};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 mod p2p_protocol;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
