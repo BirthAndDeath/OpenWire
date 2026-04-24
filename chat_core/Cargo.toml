@@ -19,7 +19,7 @@ tracing-appender = "0.2.5"
 tracing = { workspace = true }
 aes-gcm = "0.10.3"
 
-aws-lc-rs = "1.16"
+aws-lc-rs = { version = "1.16", features = ["unstable"] }
 
 
 keyring = { version = "3.6.3", features = [

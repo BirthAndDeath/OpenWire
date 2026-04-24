@@ -137,7 +137,8 @@
 <style>
     .wrap {
         position: relative;
-        background: var(--bg-tertiary, #1a1a1a);
+        background: transparent;
+        backdrop-filter: blur(10px);
         border: 1px solid var(--border-color, #2a2a2a);
         border-radius: 12px;
         padding: 12px 16px;

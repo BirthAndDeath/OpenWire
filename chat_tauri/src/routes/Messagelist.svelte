@@ -50,7 +50,8 @@
 <style>
     :global(.virtua-scroll-view) {
         padding: 16px;
-        background: var(--bg-primary, #0f0f0f);
+        background: transparent;
+        backdrop-filter: blur(10px);
         height: 100%;
     }
 

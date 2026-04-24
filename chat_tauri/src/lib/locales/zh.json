@@ -30,5 +30,6 @@
     "click_to_copy": "点击复制",
     "create_first_identity": "创建您的第一个身份以开始使用",
     "switch_to_this_identity": "切换到此身份",
-    "current": "当前"
+    "current": "当前",
+    "caution_words": "谨言慎行"
 }

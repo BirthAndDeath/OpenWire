@@ -143,7 +143,8 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--bg-primary, #0f0f0f);
+        background: rgba(15, 15, 15, 0.7);
+        backdrop-filter: blur(10px);
     }
 
     .search {

@@ -30,5 +30,6 @@
     "click_to_copy": "クリックしてコピー",
     "create_first_identity": "最初のアイデンティティを作成して開始",
     "switch_to_this_identity": "このアイデンティティに切り替え",
-    "current": "現在"
+    "current": "現在",
+    "caution_words": "慎重に発言してください"
 }

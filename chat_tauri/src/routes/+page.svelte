@@ -365,29 +365,31 @@
   /* 暗色主题（默认） */
   :global([data-theme="dark"]) {
     --bg-primary: #0f0f0f;
-    --bg-secondary: #0a0a0a;
-    --bg-tertiary: #1a1a1a;
+    --bg-secondary: rgba(10, 10, 10, 0.7);
+    --bg-tertiary: rgba(26, 26, 26, 0.6);
     --text-primary: #f6f6f6;
     --text-secondary: #737373;
-    --border-color: #2a2a2a;
+    --border-color: rgba(42, 42, 42, 0.5);
   }
 
   /* 亮色主题 */
   :global([data-theme="light"]) {
     --bg-primary: #ffffff;
-    --bg-secondary: #f5f5f5;
-    --bg-tertiary: #fafafa;
+    --bg-secondary: rgba(245, 245, 245, 0.7);
+    --bg-tertiary: rgba(250, 250, 250, 0.6);
     --text-primary: #1a1a1a;
     --text-secondary: #666666;
-    --border-color: #e0e0e0;
+    --border-color: rgba(224, 224, 224, 0.5);
   }
 
   .container {
     display: flex;
     height: 100vh;
     overflow: hidden;
-    background: var(--bg-primary);
+    background: transparent;
     color: var(--text-primary);
+    position: relative;
+    z-index: 1;
   }
 
   .sidebar {

@@ -293,9 +293,11 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
-    background: var(--bg-primary, #0f0f0f);
+    background: transparent;
     color: var(--text-primary, #f6f6f6);
     font-family: system-ui;
+    position: relative;
+    z-index: 1;
   }
 
   .identity-header {

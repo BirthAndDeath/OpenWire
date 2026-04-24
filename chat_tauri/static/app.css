@@ -23,6 +23,69 @@
   --border-color: #d4d4d4;
 }
 
+/* ==================== 半透明组件样式 ==================== */
+/* 对大多数组件应用半透明效果，但保持文字清晰 */
+.svelte-body-container {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* 半透明卡片和面板 */
+.card, .panel, .contact-card, .message-bubble, .input-wrap, .modal-content {
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+  backdrop-filter: blur(10px);
+  border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
+  border-radius: 8px;
+}
+
+/* 半透明按钮 */
+.btn, .button {
+  background: color-mix(in srgb, var(--bg-tertiary) 60%, transparent);
+  color: var(--text-primary);
+  border: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+  backdrop-filter: blur(5px);
+  border-radius: 6px;
+}
+
+.btn:hover, .button:hover {
+  background: color-mix(in srgb, var(--bg-tertiary) 80%, transparent);
+}
+
+/* 半透明输入框 */
+input, textarea, select {
+  background: color-mix(in srgb, var(--bg-primary) 70%, transparent);
+  color: var(--text-primary);
+  border: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
+  backdrop-filter: blur(5px);
+  border-radius: 6px;
+}
+
+input:focus, textarea:focus, select:focus {
+  border-color: #3b82f6;
+  outline: none;
+}
+
+/* 半透明列表项 */
+.list-item, .contact-item {
+  background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+  backdrop-filter: blur(8px);
+  border-radius: 6px;
+}
+
+/* 半透明侧边栏 */
+.sidebar {
+  background: color-mix(in srgb, var(--bg-primary) 80%, transparent);
+  backdrop-filter: blur(12px);
+  border-right: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
+}
+
+/* 半透明顶部导航 */
+.navbar, .header {
+  background: color-mix(in srgb, var(--bg-primary) 85%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
+}
+
 /* ==================== 加载状态样式 ==================== */
 .loading-state {
   display: flex;
@@ -50,16 +113,18 @@
 /* 亮色主题下的下拉箭头和背景 */
 [data-theme="light"] .language-selector select,
 [data-theme="light"] .theme-selector select {
-  background-color: var(--bg-secondary, #f5f5f5);
+  background-color: color-mix(in srgb, var(--bg-secondary, #f5f5f5) 70%, transparent);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23525252' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
   color: var(--text-primary, #171717);
-  border-color: var(--border-color, #d4d4d4);
+  border: 1px solid color-mix(in srgb, var(--border-color, #d4d4d4) 40%, transparent);
+  backdrop-filter: blur(5px);
+  border-radius: 6px;
 }
 
 /* 亮色主题下的 hover 状态 */
 [data-theme="light"] .language-selector select:hover,
 [data-theme="light"] .theme-selector select:hover {
-  background-color: var(--bg-tertiary, #e5e5e5);
+  background-color: color-mix(in srgb, var(--bg-tertiary, #e5e5e5) 70%, transparent);
 }
 
 /* 亮色主题下的选项样式 */
@@ -76,9 +141,10 @@
   gap: 8px;
   padding: 8px 16px;
   margin: 16px;
-  background: var(--bg-tertiary);
+  background: color-mix(in srgb, var(--bg-tertiary) 60%, transparent);
+  backdrop-filter: blur(5px);
   color: var(--text-primary);
-  border: 1px solid var(--border-color);
+  border: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
   border-radius: 6px;
   cursor: pointer;
   font-size: 14px;
@@ -86,7 +152,7 @@
 }
 
 .add-friend-btn:hover {
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
 }
 
 /* ==================== 模态框样式 ==================== */
@@ -104,11 +170,12 @@
 }
 
 .modal-content {
-  background: var(--bg-primary);
+  background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
+  backdrop-filter: blur(10px);
   color: var(--text-primary);
   padding: 24px;
   border-radius: 8px;
-  border: 1px solid var(--border-color);
+  border: 1px solid color-mix(in srgb, var(--border-color) 30%, transparent);
   max-width: 500px;
   width: 90%;
   max-height: 80vh;
@@ -136,9 +203,10 @@
 .form-group textarea {
   width: 100%;
   padding: 8px 12px;
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+  backdrop-filter: blur(5px);
   color: var(--text-primary);
-  border: 1px solid var(--border-color);
+  border: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
   border-radius: 4px;
   font-size: 14px;
 }
@@ -171,7 +239,7 @@
 }
 
 .modal-actions .cancel {
-  background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 60%, transparent);
   color: var(--text-primary);
 }
 
@@ -181,7 +249,7 @@
 }
 
 .modal-actions .cancel:hover {
-  background: var(--bg-tertiary);
+  background: color-mix(in srgb, var(--bg-tertiary) 70%, transparent);
 }
 
 .modal-actions .confirm:hover {

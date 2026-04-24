@@ -30,5 +30,6 @@
     "click_to_copy": "Click to copy",
     "create_first_identity": "Create your first identity to get started",
     "switch_to_this_identity": "Switch to this identity",
-    "current": "Current"
+    "current": "Current",
+    "caution_words": "Speak with Caution"
 }

@@ -58,16 +58,6 @@
 </main>
 
 <style>
-    :global(body) {
-        margin: 0;
-        background: var(--bg-secondary, #0a0a0a);
-        color: var(--text-primary, #fafafa);
-        font-family:
-            system-ui,
-            -apple-system,
-            sans-serif;
-    }
-
     main {
         min-height: 100vh;
         display: flex;
@@ -76,6 +66,8 @@
         justify-content: center;
         padding: 2rem;
         box-sizing: border-box;
+        position: relative;
+        z-index: 1;
     }
 
     .hero {
