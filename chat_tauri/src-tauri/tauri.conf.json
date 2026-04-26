@@ -45,28 +45,7 @@
         "base-uri": "'self'",
         "form-action": "'self'",
         "upgrade-insecure-requests": "true"
-      },
-      "capabilities": [
-        {
-          "identifier": "main-capability",
-          "windows": [
-            "main"
-          ],
-          "permissions": [
-            "core:default",
-            "core:window:default",
-            "core:window:allow-close",
-            "core:window:allow-minimize",
-            "core:window:allow-maximize",
-            "core:window:allow-start-dragging",
-            "store:default",
-            "store:allow-load",
-            "store:allow-get",
-            "store:allow-set",
-            "store:allow-save"
-          ]
-        }
-      ]
+      }
     }
   },
   "bundle": {
