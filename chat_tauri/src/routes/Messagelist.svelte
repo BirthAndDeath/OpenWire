@@ -28,8 +28,6 @@
         );
     }
 
-    add("欢迎来到聊天室", true);
-
     export function del(id: string) {
         msgs = msgs.filter((m) => m.id !== id);
     }

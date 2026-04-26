@@ -9,9 +9,37 @@
     "core:default",
     "opener:default",
     "store:default",
-    "store:allow-load",
-    "store:allow-get",
-    "store:allow-set",
-    "store:allow-save"
+    {
+      "identifier": "store:allow-load",
+      "allow": [
+        {
+          "path": ".settings"
+        }
+      ]
+    },
+    {
+      "identifier": "store:allow-get",
+      "allow": [
+        {
+          "path": ".settings"
+        }
+      ]
+    },
+    {
+      "identifier": "store:allow-set",
+      "allow": [
+        {
+          "path": ".settings"
+        }
+      ]
+    },
+    {
+      "identifier": "store:allow-save",
+      "allow": [
+        {
+          "path": ".settings"
+        }
+      ]
+    }
   ]
 }

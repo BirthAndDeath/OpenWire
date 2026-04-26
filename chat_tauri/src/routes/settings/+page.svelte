@@ -2,8 +2,8 @@
   import "../../lib/i18n";
   import { _, locale } from "svelte-i18n";
   import { goto } from "$app/navigation";
-  import { theme, setTheme } from '../../lib/theme';
-  import { language, setLanguage } from '../../lib/language';
+  import { theme, setTheme } from "../../lib/theme";
+  import { language, setLanguage } from "../../lib/language";
 
   // 语言选项
   const languages = [
@@ -26,15 +26,12 @@
 
   // 等待全局状态初始化完成
   $effect(() => {
-    // 订阅 theme 和 language store，当它们有值时说明已初始化
-    const unsubscribeTheme = theme.subscribe(() => {});
+    // 订阅 theme store，当它有值时说明已初始化
+    const unsubscribeTheme = theme.subscribe((val) => {
+      if (val) isLoading = false;
+    });
     const unsubscribeLang = language.subscribe(() => {});
-    
-    // 简单延迟以确保 Store 已加载（实际初始化在 layout 中完成）
-    setTimeout(() => {
-      isLoading = false;
-    }, 100);
-    
+
     return () => {
       unsubscribeTheme();
       unsubscribeLang();
@@ -90,7 +87,10 @@
           <select
             id="theme-select"
             value={$theme}
-            onchange={(e) => setTheme((e.target as HTMLSelectElement).value as 'dark' | 'light')}
+            onchange={(e) =>
+              setTheme(
+                (e.target as HTMLSelectElement).value as "dark" | "light",
+              )}
           >
             {#each themes as t}
               <option value={t.value}>{t.label}</option>

@@ -3,7 +3,7 @@
 
     interface Contact {
         order: number;
-        peerid: string;
+        pubkey_hex: string;
         name: string;
         avatar?: string;
         lastMsg?: string;
@@ -86,16 +86,20 @@
                 <p>{q ? "无结果" : "暂无联系人"}</p>
             </div>
         {:else}
-            <VList bind:this={list} data={filtered} getKey={(c) => c.peerid}>
+            <VList
+                bind:this={list}
+                data={filtered}
+                getKey={(c) => c.pubkey_hex}
+            >
                 {#snippet children(c)}
                     <button
                         type="button"
                         class="item"
-                        class:sel={selectedId === c.peerid}
+                        class:sel={selectedId === c.pubkey_hex}
                         class:online={c.online}
-                        onclick={() => select(c.peerid)}
+                        onclick={() => select(c.pubkey_hex)}
                         oncontextmenu={(e) => (
-                            e.preventDefault(), onctx?.(e, c.peerid)
+                            e.preventDefault(), onctx?.(e, c.pubkey_hex)
                         )}
                         aria-label={`选择联系人 ${c.name}`}
                     >

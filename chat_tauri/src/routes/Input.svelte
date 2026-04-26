@@ -7,12 +7,12 @@
         onsend,
         disabled = false,
         fill = false,
-        peerId = "",
+        mldsaPubkeyHex = "",
     } = $props<{
         onsend?: (t: string) => void;
         disabled?: boolean;
         fill?: boolean;
-        peerId?: string;
+        mldsaPubkeyHex?: string;
     }>();
 
     let text = $state("");
@@ -22,12 +22,12 @@
     let area: HTMLTextAreaElement;
 
     async function submit() {
-        if (!text.trim() || sending || disabled || !peerId) return;
+        if (!text.trim() || sending || disabled || !mldsaPubkeyHex) return;
         sending = true;
         err = "";
         try {
             await invoke("send", {
-                pubkey_identity_id: peerId,
+                mldsaPubkeyHex: mldsaPubkeyHex,
                 message: text.trim(),
             });
             onsend?.(text.trim());

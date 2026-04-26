@@ -28,13 +28,14 @@ keyring = { version = "3.6.3", features = [
     "sync-secret-service",
 ] }
 hex = "0.4.3"
-snap = "1.1.1"
-blake3 = "1.8.5"
+blake3 = "1.8.4"
 rand = "0.10.1"
 lru = "0.17.0"
 
 redb = "4.0.0"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+async-compression = { version = "0.4.42", features = ["futures-io", "zstd"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [package.metadata.docs.rs]
 #no-deps = true

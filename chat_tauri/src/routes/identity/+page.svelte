@@ -7,15 +7,14 @@
   import { goto } from "$app/navigation";
   import Toast from "../Toast.svelte";
 
-  interface MlKemIdentityDto {
+  interface IdentityDto {
     id: number;
     identity_id: string;
-    public_key_hex: string;
     is_current: boolean;
   }
 
-  let identities = $state<MlKemIdentityDto[]>([]);
-  let currentIdentity = $state<MlKemIdentityDto | null>(null);
+  let identities = $state<IdentityDto[]>([]);
+  let currentIdentity = $state<IdentityDto | null>(null);
   let loadingIdentities = $state(false);
   let warning = $state<string>("");
 
@@ -27,7 +26,7 @@
   const loadIdentities = async () => {
     loadingIdentities = true;
     try {
-      identities = await invoke<MlKemIdentityDto[]>("list_identities");
+      identities = await invoke<IdentityDto[]>("list_identities");
       currentIdentity = identities.find((id) => id.is_current) ?? null;
     } catch (e) {
       showWarning(`加载身份失败：${e}`);
@@ -130,19 +129,6 @@
               <span class="copy-icon">📋</span>
             </button>
           </div>
-          <div class="identity-field">
-            <label for="public-key-display">ML-KEM 公钥 (持久化身份):</label>
-            <button
-              id="public-key-display"
-              class="copyable-value"
-              onclick={() => copyToClipboard(identity.public_key_hex, "公钥")}
-              title="点击复制"
-              type="button"
-            >
-              <code class="public-key-display">{identity.public_key_hex}</code>
-              <span class="copy-icon">📋</span>
-            </button>
-          </div>
         </div>
       </section>
     {/if}
@@ -196,12 +182,6 @@
                     <span class="detail-label">ID:</span>
                     <code class="identity-id">{identity.identity_id}</code>
                   </div>
-                  <div class="detail-row">
-                    <span class="detail-label">公钥:</span>
-                    <code class="public-key-short"
-                      >{identity.public_key_hex.substring(0, 16)}...</code
-                    >
-                  </div>
                 </div>
                 {#if identity.is_current}
                   <span class="current-badge">{$_("current")}</span>
@@ -232,8 +212,8 @@
                 <button
                   class="icon-btn copy-btn"
                   onclick={() =>
-                    copyToClipboard(identity.public_key_hex, "公钥")}
-                  title="复制公钥"
+                    copyToClipboard(identity.identity_id, "身份 ID")}
+                  title="复制身份 ID"
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"

@@ -3,7 +3,6 @@
   import { initTheme } from "../lib/theme";
   import { initLanguage } from "../lib/language";
   import Background from "./Background.svelte";
-  import "../lib/i18n";
   import { _ } from "svelte-i18n";
 
   let { children }: { children?: () => any } = $props();
