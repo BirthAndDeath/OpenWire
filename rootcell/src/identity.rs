@@ -7,7 +7,6 @@
 //! - 跨平台支持
 
 use anyhow;
-use std::path::Path;
 use tracing;
 use zeroize::Zeroizing;
 
@@ -126,8 +125,7 @@ impl PrivateKeyHandle {
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
                 tracing::warn!("Failed to mlock private key memory: {}", err);
-                // mlock失败不致命，继续运行但记录警告
-                return Ok(());
+                anyhow::bail!("Failed to mlock private key memory: {}", err);
             }
         }
 
@@ -155,8 +153,7 @@ impl PrivateKeyHandle {
         if ret == 0 {
             let err = std::io::Error::last_os_error();
             tracing::warn!("Failed to VirtualLock private key memory: {}", err);
-            // VirtualLock失败不致命，继续运行但记录警告
-            return Ok(());
+            anyhow::bail!("Failed to VirtualLock private key memory: {}", err);
         }
 
         self.locked = true;
@@ -267,12 +264,11 @@ impl PrivateKeyHandle {
     }
 
     /// 从keyring删除私钥
-    pub fn delete_from_keyring(identifier: &str) {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, identifier) {
-            if let Err(e) = entry.delete_credential() {
-                tracing::warn!("Failed to delete keyring entry for {}: {}", identifier, e);
-            }
-        }
+    pub fn delete_from_keyring(identifier: &str) -> anyhow::Result<()> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, identifier)?;
+        entry.delete_credential()?;
+        tracing::debug!("Deleted keyring entry for {}", identifier);
+        Ok(())
     }
 
     /// 诊断存储状态
@@ -304,12 +300,5 @@ impl Drop for PrivateKeyHandle {
 
         // private_key 的类型是 Zeroizing<Vec<u8>>，Drop 时已自动清零
         // 无需显式调用 zeroize()
-    }
-}
-
-// 不允许Clone，防止意外复制私钥
-impl Clone for PrivateKeyHandle {
-    fn clone(&self) -> Self {
-        panic!("PrivateKeyHandle cannot be cloned for security reasons");
     }
 }
