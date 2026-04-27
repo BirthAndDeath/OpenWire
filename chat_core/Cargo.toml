@@ -31,7 +31,7 @@ hex = "0.4.3"
 snap = "1.1.1"
 blake3 = "1.8.4"
 rand = "0.10.1"
-lru = "0.16.4"
+lru = "0.17.0"
 
 redb = "4.0.0"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
