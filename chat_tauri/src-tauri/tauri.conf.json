@@ -26,6 +26,7 @@
       }
     ],
     "security": {
+      "freezePrototype": true,
       "pattern": {
         "use": "isolation",
         "options": {

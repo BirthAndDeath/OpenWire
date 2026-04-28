@@ -11,20 +11,8 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
 
 [net]
-#git-fetch-with-cli = true
 
 [build]
-#jobs = 4
-[unstable]
-gc = true
-[cache]
-auto-clean-frequency = "1 day"
 [target.'cfg(target_os = "linux")']
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=generic"]
-
-[target.armv7-unknown-linux-gnueabihf]
-rustflags = ["-C", "target-cpu=generic"]
