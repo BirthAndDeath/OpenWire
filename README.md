@@ -39,7 +39,6 @@ version: 0.0.1
 
 - `/chat_cli` contains the CLI project (based on ratatui, under maintenance)
 - `/chat_tauri` contains the Tauri project (under maintenance)
-- `/chat_dioxus` contains the Dioxus project (new)
 - `/chat_core` contains the core logic (evolving)
 
 ### chat_tauri
@@ -87,8 +86,6 @@ cargo run
 ```
 
 CLI usage example
-
-*(todo: consider migrating to Dioxus)*
 
 ### Build
 
@@ -157,7 +154,6 @@ version: 0.0.1
 
 - `/chat_cli` 存放 CLI 项目（基于 ratatui，维护中）
 - `/chat_tauri` 存放 Tauri 项目（维护中）
-- `/chat_dioxus` 存放 Dioxus 项目（新建）
 - `/chat_core` 存放核心项目逻辑（演进中）
 
 ### chat_tauri
@@ -205,8 +201,6 @@ cargo run
 ```
 
 运行 CLI 事例
-
-*(todo:考虑是否迁移到 dioxus)*
 
 ### 开发构建
 

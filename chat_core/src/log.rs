@@ -1,7 +1,9 @@
 use crate::CoreConfig;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt};
 //✅稳定中
 // 标记是否已初始化
@@ -9,9 +11,9 @@ static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 // 文件日志 guard（仅在文件日志模式下持有）
 static LOGGER_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-const DEFAULT_LOG_LEVEL: &str = "info";
-const DEBUG_LOG_LEVEL: &str = "debug";
-
+const DEFAULT_LOG_LEVEL: Level = Level::WARN;
+const DEBUG_LOG_LEVEL: Level = Level::DEBUG;
+const MAX_LOG_FILES: usize = 7; // 保留最近7个日志文件
 /// 初始化日志系统
 ///
 /// 根据配置决定是否记录文件日志或控制台日志。
@@ -58,9 +60,9 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
         .or_else(|_| {
             let default = level.unwrap_or({
                 if cfg!(debug_assertions) {
-                    DEBUG_LOG_LEVEL
+                    DEBUG_LOG_LEVEL.as_str()
                 } else {
-                    DEFAULT_LOG_LEVEL
+                    DEFAULT_LOG_LEVEL.as_str()
                 }
             });
             EnvFilter::try_new(default)
@@ -83,14 +85,16 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGua
     std::fs::create_dir_all(path).expect("Failed to create log directory");
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
 
-    let log_file = safe_path.join("chat.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)?;
-
-    let (non_blocking, guard) = tracing_appender::non_blocking(file);
-
+    // 使用 tracing_appender 的滚动文件写入器，按日期轮转，保留 7 天日志
+    // 日志文件格式: chat.log.YYYY-MM-DD
+    // 当日志文件达到指定日期时自动创建新文件
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY) // 按天轮转
+        .filename_prefix("chat") // 文件名前缀
+        .max_log_files(MAX_LOG_FILES)
+        .build(&safe_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create rolling file appender: {}", e))?;
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     fmt()
         .with_ansi(false)
         .with_writer(non_blocking)
@@ -101,7 +105,7 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGua
     tracing::info!(
         filter = %filter,
         path = %safe_path.display(),
-        "File logger initialized"
+        "File logger initialized with daily rotation"
     );
 
     Ok(guard)

@@ -29,17 +29,10 @@ lto = false
 
 [profile.release]
 codegen-units = 1
-lto = true
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true
 debug = false
 debug-assertions = false
 overflow-checks = true
-
-[profile.flame]
-inherits = "release"
-opt-level = 3
-strip = false
-debug = true
-lto = "thin"
