@@ -29,7 +29,7 @@ keyring = { version = "3.6.3", features = [
 ] }
 hex = "0.4.3"
 snap = "1.1.1"
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 rand = "0.10.1"
 lru = "0.17.0"
 
