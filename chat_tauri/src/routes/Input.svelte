@@ -1,5 +1,6 @@
 <script lang="ts">
     import { invoke } from "@tauri-apps/api/core";
+    import { open } from "@tauri-apps/plugin-dialog";
     import { slide } from "svelte/transition";
     import "../lib/i18n";
     import { _, locale } from "svelte-i18n";
@@ -39,6 +40,32 @@
         } finally {
             sending = false;
             area.style.height = "auto";
+        }
+    }
+
+    // 文件发送
+    async function sendFile() {
+        if (sending || disabled || !mldsaPubkeyHex) return;
+        try {
+            const selected = await open({
+                multiple: false,
+                filters: [],
+            });
+            if (!selected) return; // 用户取消选择
+            sending = true;
+            err = "";
+            const filePath = selected as string;
+            await invoke("send_file", {
+                mldsaPubkeyHex: mldsaPubkeyHex,
+                filePath: filePath,
+            });
+            onsend?.(`[文件] ${filePath.split(/[/\\]/).pop()}`);
+            ok = true;
+            setTimeout(() => (ok = false), 2000);
+        } catch (e) {
+            err = String(e);
+        } finally {
+            sending = false;
         }
     }
 
@@ -92,25 +119,17 @@
             </div>
         </div>
 
-        <button
-            type="submit"
-            class="btn"
-            class:loading={sending}
-            disabled={!text.trim() || sending || disabled}
-        >
-            {#if sending}
-                <svg class="spin" width="20" height="20" viewBox="0 0 24 24">
-                    <circle
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        fill="none"
-                        stroke-dasharray="32"
-                    />
-                </svg>
-            {:else}
+        <div class="btn-group">
+            <!-- 文件发送按钮 -->
+            <button
+                type="button"
+                class="btn file-btn"
+                class:loading={sending}
+                disabled={sending || disabled}
+                onclick={sendFile}
+                title="发送文件"
+                aria-label="发送文件"
+            >
                 <svg
                     width="20"
                     height="20"
@@ -119,12 +138,55 @@
                     stroke="currentColor"
                     stroke-width="2"
                 >
-                    <line x1="22" y1="2" x2="11" y2="13" /><polygon
-                        points="22,2 15,22 11,13 2,9"
+                    <path
+                        d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
                     />
+                    <polyline points="14 2 14 8 20 8" />
+                    <line x1="12" y1="18" x2="12" y2="12" />
+                    <line x1="9" y1="15" x2="12" y2="12" />
+                    <line x1="15" y1="15" x2="12" y2="12" />
                 </svg>
-            {/if}
-        </button>
+            </button>
+
+            <button
+                type="submit"
+                class="btn send-btn"
+                class:loading={sending}
+                disabled={!text.trim() || sending || disabled}
+            >
+                {#if sending}
+                    <svg
+                        class="spin"
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                    >
+                        <circle
+                            cx="12"
+                            cy="12"
+                            r="10"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            fill="none"
+                            stroke-dasharray="32"
+                        />
+                    </svg>
+                {:else}
+                    <svg
+                        width="20"
+                        height="20"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                    >
+                        <line x1="22" y1="2" x2="11" y2="13" /><polygon
+                            points="22,2 15,22 11,13 2,9"
+                        />
+                    </svg>
+                {/if}
+            </button>
+        </div>
     </form>
 
     {#if err}
@@ -240,12 +302,17 @@
         font-weight: 600;
     }
 
+    .btn-group {
+        display: flex;
+        gap: 8px;
+        flex-shrink: 0;
+    }
+
     .btn {
         width: 40px;
         height: 40px;
         display: grid;
         place-items: center;
-        background: #3b82f6;
         border: none;
         border-radius: 8px;
         color: white;
@@ -253,8 +320,18 @@
         transition: all 0.2s;
         flex-shrink: 0;
     }
-    .btn:hover:not(:disabled) {
+    .send-btn {
+        background: #3b82f6;
+    }
+    .send-btn:hover:not(:disabled) {
         background: #2563eb;
+        transform: translateY(-1px);
+    }
+    .file-btn {
+        background: #6b7280;
+    }
+    .file-btn:hover:not(:disabled) {
+        background: #4b5563;
         transform: translateY(-1px);
     }
     .btn:disabled {

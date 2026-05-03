@@ -9,13 +9,29 @@
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
   import Toast from "./Toast.svelte";
+  import AddFriendModal from "./AddFriendModal.svelte";
+  interface IdentityDto {
+    id: number;
+    identity_id: string;
+    is_current: boolean;
+    mlkem_pubkey_hex: string | null;
+  }
 
   // 主题和语言在layout.svelte 中统一初始化
+
+  // 格式化文件大小
+  function formatFileSize(bytes: number): string {
+    if (bytes === 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
+  }
 
   let warning = $state<string>("");
   // 显示 warning 的统一函数
   const showWarning = (message: string, duration: number = 5000) => {
     warning = message;
+    console.warn("Warning:", message);
   };
 
   // 语言选项
@@ -28,8 +44,21 @@
     { code: "ja", name: "日本語" },
   ];
 
+  let currentIdentityId = $state<string>("");
+
+  // 获取当前身份 ID，用于检查是否添加自己
+  const loadCurrentIdentity = async () => {
+    try {
+      const identities: IdentityDto[] = await invoke("list_identities");
+      const current = identities.find((id) => id.is_current);
+      currentIdentityId = current?.identity_id ?? "";
+    } catch {
+      currentIdentityId = "";
+    }
+  };
+
   interface ContactDto {
-    peer_id: string;
+    mldsa_pubkey_hex: string;
     name: string;
     added_at: number;
   }
@@ -42,37 +71,20 @@
       const list: ContactDto[] = await invoke("list_contacts");
       contacts = list.map((c, index) => ({
         order: index,
-        peerid: c.peer_id,
+        pubkey_hex: c.mldsa_pubkey_hex,
         name: c.name,
         lastMsg: "最近聊天",
         lastTime: c.added_at * 1000,
         unread: 0,
         online: false,
       }));
-      if (!selectedId && contacts.length) selectedId = contacts[0].peerid;
+      if (!selectedId && contacts.length) selectedId = contacts[0].pubkey_hex;
     } catch (e) {
       showWarning(`加载联系人失败：${e}`);
     } finally {
       loadingContacts = false;
     }
   };
-
-  onMount(() => {
-    let unlisten: (() => void) | undefined;
-
-    (async () => {
-      unlisten = await listen<string>("warning", (e) => {
-        showWarning(e.payload, 5000);
-        console.warn("Received warning from backend:", e.payload);
-      });
-    })();
-
-    loadContacts();
-
-    return () => {
-      unlisten?.();
-    };
-  });
 
   // === 状态 ===
   let msgListRef = $state<ReturnType<typeof Messagelist>>();
@@ -82,35 +94,99 @@
 
   // 添加好友相关状态
   let showAddFriendModal = $state(false);
-  let newFriendPubkeyIdentityId = $state(""); // ML-KEM公钥的hex编码
-  let newFriendName = $state("");
 
-  let contacts = $state([
+  let contacts = $state<
     {
-      order: 0,
-      peerid: "0",
-      name: "topic",
-      lastMsg: "欢迎来到聊天室",
-      lastTime: Date.now(),
-      unread: 0,
-      online: true,
-    },
-  ]);
+      order: number;
+      pubkey_hex: string;
+      name: string;
+      lastMsg: string;
+      lastTime: number;
+      unread: number;
+      online: boolean;
+    }[]
+  >([]);
 
-  // === 监听消息 ===
+  // === 监听消息和事件 ===
   onMount(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenWarning: (() => void) | undefined;
+    let unlistenMessage: (() => void) | undefined;
+    let unlistenFileProgress: (() => void) | undefined;
+
     (async () => {
-      unlisten = await listen<string>("chat-message", (e) => {
-        msgListRef?.add(e.payload, false);
+      unlistenWarning = await listen<string>("warning", (e) => {
+        showWarning(e.payload, 5000);
+        console.warn("Received warning from backend:", e.payload);
+      });
+
+      unlistenMessage = await listen<string>("chat-message", (e) => {
+        // 尝试解析结构化 JSON 消息（FileHash 类型）
+        let displayText = e.payload;
+        let msgType: "text" | "file_hash" | "file_stream" = "text";
+        let fileHashInfo: any = undefined;
+        let senderPubkey: string | undefined = undefined;
+
+        try {
+          const parsed = JSON.parse(e.payload);
+          if (parsed.type === "file_hash") {
+            msgType = "file_hash";
+            displayText = `文件分享: ${parsed.filename} (${formatFileSize(parsed.total_size)})`;
+            fileHashInfo = {
+              filename: parsed.filename,
+              total_size: parsed.total_size,
+              file_hash: parsed.file_hash,
+              file_id: parsed.file_id,
+            };
+            senderPubkey = parsed.sender;
+          } else if (parsed.type === "text" && parsed.sender) {
+            // 结构化文本消息，包含发送方信息
+            displayText = parsed.text || displayText;
+            senderPubkey = parsed.sender;
+          }
+        } catch {
+          // 不是 JSON，作为普通文本消息处理
+        }
+
+        // 将消息添加到消息列表（传入 senderPubkey 作为 mldsa_pubkey_hex 用于过滤）
+        msgListRef?.add(
+          displayText,
+          false,
+          msgType,
+          fileHashInfo,
+          senderPubkey,
+          senderPubkey, // mldsa_pubkey_hex 参数，用于按联系人过滤
+        );
+
+        // 更新联系人列表中的最后一条消息
         contacts = contacts.map((c) =>
-          c.peerid === selectedId
-            ? { ...c, lastMsg: e.payload, lastTime: Date.now() }
+          c.pubkey_hex === senderPubkey || c.pubkey_hex === selectedId
+            ? { ...c, lastMsg: displayText, lastTime: Date.now() }
             : c,
         );
       });
+
+      // 监听文件传输进度事件
+      unlistenFileProgress = await listen<string>(
+        "file-transfer-progress",
+        (e) => {
+          try {
+            const progress = JSON.parse(e.payload);
+            msgListRef?.updateFileProgress(progress);
+          } catch (err) {
+            console.error("解析文件传输进度失败:", err);
+          }
+        },
+      );
     })();
-    return () => unlisten?.();
+
+    loadContacts();
+    loadCurrentIdentity();
+
+    return () => {
+      unlistenWarning?.();
+      unlistenMessage?.();
+      unlistenFileProgress?.();
+    };
   });
 
   // === 拖动调整 ===
@@ -141,50 +217,19 @@
   // === 操作 ===
   const select = (id: string) => (selectedId = id);
 
-  const send = (text: string) => {
+  const send = async (text: string) => {
     if (!selectedId) return;
     msgListRef?.add(text, true);
     contacts = contacts.map((c) =>
-      c.peerid === selectedId
+      c.pubkey_hex === selectedId
         ? { ...c, lastMsg: text, lastTime: Date.now() }
         : c,
     );
-  };
-
-  const addFriend = async () => {
-    if (!newFriendPubkeyIdentityId.trim()) {
-      showWarning("请输入 Pubkey 身份 ID (ML-KEM公钥的hex编码)");
-      return;
-    }
-
+    // 同时调用后端发送消息
     try {
-      // 验证hex格式
-      const hex = newFriendPubkeyIdentityId.replace(/\s/g, "");
-      if (hex.length % 2 !== 0) {
-        showWarning("Pubkey身份ID格式无效：长度必须是偶数");
-        return;
-      }
-
-      // 验证hex字符
-      if (!/^[0-9a-fA-F]+$/.test(hex)) {
-        showWarning("Pubkey身份ID格式无效：只能包含0-9, a-f, A-F字符");
-        return;
-      }
-
-      const success: boolean = await invoke("add_contact", {
-        pubkey_identity_id: hex,
-        name: newFriendName.trim() || undefined,
-      });
-
-      if (success) {
-        showWarning("好友添加成功！");
-        showAddFriendModal = false;
-        newFriendPubkeyIdentityId = "";
-        newFriendName = "";
-        await loadContacts();
-      }
+      await invoke("send", { mldsaPubkeyHex: selectedId, message: text });
     } catch (e) {
-      showWarning(`添加好友失败：${e}`);
+      showWarning(`发送消息失败：${e}`);
     }
   };
 
@@ -268,52 +313,11 @@
   </aside>
 
   <!-- 添加好友模态框 -->
-  {#if showAddFriendModal}
-    <div
-      class="modal-overlay"
-      onclick={(e) =>
-        e.target === e.currentTarget && (showAddFriendModal = false)}
-      onkeydown={(e) => e.key === "Escape" && (showAddFriendModal = false)}
-      role="dialog"
-      aria-label="添加好友对话框"
-      tabindex="0"
-    >
-      <div class="modal-content" role="document" aria-label="添加好友表单">
-        <h3>{$_("add_friend")}</h3>
-        <div class="form-group">
-          <label for="pubkey-identity-id">Pubkey 身份 ID *</label>
-          <input
-            id="pubkey-identity-id"
-            type="text"
-            placeholder="ML-KEM公钥的hex编码 (例如: 1234abcd...)"
-            bind:value={newFriendPubkeyIdentityId}
-          />
-          <small>ML-KEM公钥的十六进制编码，作为唯一身份标识</small>
-        </div>
-        <div class="form-group">
-          <label for="friend-name">{$_("name")} (可选)</label>
-          <input
-            id="friend-name"
-            type="text"
-            placeholder="好友姓名"
-            bind:value={newFriendName}
-          />
-        </div>
-        <div class="modal-actions">
-          <button
-            type="button"
-            class="btn-cancel"
-            onclick={() => (showAddFriendModal = false)}
-          >
-            取消
-          </button>
-          <button type="button" class="btn-confirm" onclick={addFriend}>
-            添加好友
-          </button>
-        </div>
-      </div>
-    </div>
-  {/if}
+  <AddFriendModal
+    bind:show={showAddFriendModal}
+    {currentIdentityId}
+    onFriendAdded={loadContacts}
+  />
 
   <div
     class="resizer-v"
@@ -329,7 +333,7 @@
 
     <div class="chat" style="height: calc(100% - {inputH}px)">
       {#if selectedId}
-        <Messagelist bind:this={msgListRef} />
+        <Messagelist bind:this={msgListRef} contactId={selectedId} />
       {:else}
         <div class="empty">{$_("select_contact_to_chat")}</div>
       {/if}
@@ -350,7 +354,7 @@
       <Input
         onsend={send}
         disabled={!selectedId}
-        peerId={selectedId ?? ""}
+        mldsaPubkeyHex={selectedId ?? ""}
         fill
       />
     </div>
@@ -520,99 +524,5 @@
     background: var(--border-color);
     color: #3b82f6;
     border-color: #3b82f6;
-  }
-
-  /* 模态框样式 */
-  .modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
-  }
-
-  .modal-content {
-    background: var(--bg-secondary);
-    padding: 24px;
-    border-radius: 12px;
-    width: 90%;
-    max-width: 400px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--border-color);
-  }
-
-  .modal-content h3 {
-    margin-top: 0;
-    margin-bottom: 20px;
-    color: var(--text-primary);
-  }
-
-  .form-group {
-    margin-bottom: 16px;
-  }
-
-  .form-group label {
-    display: block;
-    margin-bottom: 6px;
-    color: var(--text-secondary);
-    font-size: 14px;
-  }
-
-  .form-group input {
-    width: 100%;
-    padding: 10px;
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    color: var(--text-primary);
-    font-family: inherit;
-    box-sizing: border-box;
-  }
-
-  .form-group input:focus {
-    outline: none;
-    border-color: #3b82f6;
-  }
-
-  .modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 12px;
-    margin-top: 24px;
-  }
-
-  .btn-cancel,
-  .btn-confirm {
-    padding: 8px 16px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 14px;
-    transition: all 0.2s;
-  }
-
-  .btn-cancel {
-    background: transparent;
-    border: 1px solid var(--border-color);
-    color: var(--text-secondary);
-  }
-
-  .btn-cancel:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-  }
-
-  .btn-confirm {
-    background: #3b82f6;
-    border: 1px solid #3b82f6;
-    color: white;
-  }
-
-  .btn-confirm:hover {
-    background: #2563eb;
   }
 </style>

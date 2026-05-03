@@ -6,17 +6,21 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import Toast from "../Toast.svelte";
+  import { drawQrCode } from "../../lib/qrcode";
 
   interface IdentityDto {
     id: number;
     identity_id: string;
     is_current: boolean;
+    mlkem_pubkey_hex: string | null;
   }
 
   let identities = $state<IdentityDto[]>([]);
   let currentIdentity = $state<IdentityDto | null>(null);
   let loadingIdentities = $state(false);
   let warning = $state<string>("");
+  let qrCanvas = $state<HTMLCanvasElement | undefined>(undefined);
+  let qrData = $state<string>("");
 
   // 显示 warning 的统一函数
   const showWarning = (message: string, duration: number = 5000) => {
@@ -28,6 +32,9 @@
     try {
       identities = await invoke<IdentityDto[]>("list_identities");
       currentIdentity = identities.find((id) => id.is_current) ?? null;
+      if (currentIdentity) {
+        await loadQrData();
+      }
     } catch (e) {
       showWarning(`加载身份失败：${e}`);
     } finally {
@@ -35,12 +42,39 @@
     }
   };
 
+  const loadQrData = async () => {
+    try {
+      console.log("正在加载二维码数据...");
+      // 后端返回 ML-DSA 公钥的原始字节（Vec<u8> → number[]）
+      const data: number[] = await invoke("get_identity_qr_data");
+      const binary = new Uint8Array(data);
+      console.log("二维码二进制数据加载成功，长度:", binary.length, "字节");
+      qrData = ""; // 不再需要 qrData 字符串
+      // 数据加载完成后，等待 DOM 更新再绘制二维码
+      setTimeout(() => drawQrCodeOnCanvas(binary), 100);
+    } catch (e) {
+      console.error("加载二维码数据失败:", e);
+      // 没有当前身份时不显示二维码
+      qrData = "";
+    }
+  };
+
+  // 在 canvas 上绘制二维码
+  const drawQrCodeOnCanvas = (binaryData?: Uint8Array) => {
+    if (!qrCanvas) return;
+    if (binaryData) {
+      drawQrCode(qrCanvas, binaryData, 540);
+    } else if (qrData) {
+      drawQrCode(qrCanvas, qrData, 540);
+    }
+  };
+
   const selectIdentity = async (identityId: string) => {
     if (!identityId) return;
     try {
       await invoke("select_identity", { identityId });
-      await loadIdentities();
-      showWarning("身份切换成功", 3000);
+      // 切换身份后刷新页面，重新初始化所有状态
+      window.location.reload();
     } catch (e) {
       showWarning(`切换身份失败：${e}`);
     }
@@ -50,9 +84,8 @@
     if (!identityId) return;
     try {
       await invoke("delete_identity", { identityId });
-      await loadIdentities();
-      currentIdentity = identities.find((id) => id.is_current) ?? null;
-      showWarning("身份删除成功", 3000);
+      // 删除身份后刷新页面，重新初始化所有状态
+      window.location.reload();
     } catch (e) {
       showWarning(`删除身份失败：${e}`);
     }
@@ -117,7 +150,7 @@
         <h2>{$_("current_identity")}</h2>
         <div class="current-identity-card">
           <div class="identity-field">
-            <label for="identity-id-display">身份 ID:</label>
+            <label for="identity-id-display">身份 ID (ML-DSA 公钥):</label>
             <button
               id="identity-id-display"
               class="copyable-value"
@@ -129,6 +162,31 @@
               <span class="copy-icon">📋</span>
             </button>
           </div>
+          {#if identity.mlkem_pubkey_hex}
+            <div class="identity-field">
+              <label for="mlkem-pubkey-display">ML-KEM 公钥 (当前会话):</label>
+              <button
+                id="mlkem-pubkey-display"
+                class="copyable-value"
+                onclick={() =>
+                  copyToClipboard(identity.mlkem_pubkey_hex!, "ML-KEM 公钥")}
+                title="点击复制"
+                type="button"
+              >
+                <code>{identity.mlkem_pubkey_hex}</code>
+                <span class="copy-icon">📋</span>
+              </button>
+            </div>
+          {/if}
+        </div>
+      </section>
+
+      <!-- 身份二维码 -->
+      <section class="qr-section">
+        <h2>{$_("identity_qr_code")}</h2>
+        <p class="qr-desc">{$_("identity_qr_desc")}</p>
+        <div class="qr-container">
+          <canvas bind:this={qrCanvas} class="qr-canvas"></canvas>
         </div>
       </section>
     {/if}
@@ -402,10 +460,6 @@
     margin-right: 8px;
   }
 
-  .public-key-display {
-    font-size: 11px;
-  }
-
   .copy-icon {
     font-size: 16px;
     opacity: 0.6;
@@ -414,6 +468,36 @@
 
   .copyable-value:hover .copy-icon {
     opacity: 1;
+  }
+
+  /* 二维码区域 */
+  .qr-section {
+    text-align: center;
+  }
+
+  .qr-desc {
+    font-size: 13px;
+    color: var(--text-secondary, #737373);
+    margin: -8px 0 16px 0;
+  }
+
+  .qr-container {
+    display: flex;
+    justify-content: center;
+    padding: 16px;
+    background: #ffffff;
+    border-radius: 8px;
+    border: 1px solid var(--border-color, #2a2a2a);
+    margin-bottom: 12px;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .qr-canvas {
+    border-radius: 4px;
+    image-rendering: pixelated;
+    max-width: 100%;
+    height: auto;
   }
 
   /* 操作按钮 */
@@ -511,6 +595,7 @@
     align-items: center;
     gap: 8px;
     margin-bottom: 4px;
+    min-width: 0;
   }
 
   .detail-row:last-child {
@@ -521,12 +606,15 @@
     font-size: 11px;
     color: var(--text-secondary, #737373);
     min-width: 40px;
+    flex-shrink: 0;
   }
 
-  .public-key-short {
-    font-family: "Courier New", monospace;
-    font-size: 11px;
-    color: var(--text-primary, #fafafa);
+  .identity-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+    display: block;
   }
 
   .current-badge {

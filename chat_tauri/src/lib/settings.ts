@@ -1,3 +1,4 @@
+import { writable } from 'svelte/store';
 import { Store } from '@tauri-apps/plugin-store';
 
 // 全局唯一的 Store 实例
@@ -28,7 +29,7 @@ export async function getSetting<T>(key: string): Promise<T | undefined> {
     console.warn('Settings store not initialized');
     return undefined;
   }
-  
+
   try {
     return await globalStore.get<T>(key);
   } catch (error) {
@@ -45,7 +46,7 @@ export async function setSetting<T>(key: string, value: T): Promise<void> {
     console.warn('Settings store not initialized');
     return;
   }
-  
+
   try {
     await globalStore.set(key, value);
     await globalStore.save();
@@ -53,3 +54,9 @@ export async function setSetting<T>(key: string, value: T): Promise<void> {
     console.error(`Failed to write setting '${key}':`, error);
   }
 }
+
+/**
+ * 截屏保护状态的 Svelte store
+ * 用于在组件间共享截屏保护状态（如 Background.svelte 和 settings 页面）
+ */
+export const screenshotProtectionStore = writable<boolean>(false);

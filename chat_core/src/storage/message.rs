@@ -1,31 +1,37 @@
-use sqlx::{FromRow, Pool, Sqlite, Row};
+use sqlx::{FromRow, Pool, Row, Sqlite};
 
 #[derive(Debug, Clone, FromRow)]
 pub struct Message {
     pub id: i64,
-    pub peer_id: String,
+    /// 己方身份
+    pub owner_identity_id: String,
+    /// 对方 ML-DSA 公钥 hex
+    pub peer_pubkey_hex: String,
     pub content: String,
     pub is_outgoing: i32,
-    pub ts: i64,
     pub pending: i32,
+    pub ts: i64,
+    pub message_hash: Option<String>,
 }
 
 // ========== 消息管理 ==========
 
 pub async fn add_message(
     pool: &Pool<Sqlite>,
-    peer_id: &str,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
     content: &str,
     is_outgoing: bool,
     pending: bool,
 ) -> anyhow::Result<i64> {
     let pending_val = if pending { 1 } else { 0 };
     let row = sqlx::query(
-        r#"INSERT INTO messages (peer_id, content, is_outgoing, pending, ts)
-          VALUES (?1, ?2, ?3, ?4, unixepoch()) 
+        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts)
+          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
           RETURNING id"#,
     )
-    .bind(peer_id)
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
     .bind(content)
     .bind(is_outgoing as i32)
     .bind(pending_val)
@@ -34,9 +40,51 @@ pub async fn add_message(
     Ok(row.get(0))
 }
 
+/// 添加消息并附带消息哈希（用于去重）
+///
+/// 如果相同哈希的消息已存在，则跳过插入并返回 None。
+/// 否则插入新消息并返回 Some(id)。
+pub async fn add_message_with_hash(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
+    content: &str,
+    is_outgoing: bool,
+    pending: bool,
+    message_hash: &str,
+) -> anyhow::Result<Option<i64>> {
+    // 先检查哈希是否已存在
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT message_hash FROM messages WHERE message_hash = ?1 LIMIT 1")
+            .bind(message_hash)
+            .fetch_optional(pool)
+            .await?;
+
+    if existing.is_some() {
+        // 消息已存在，跳过去重
+        return Ok(None);
+    }
+
+    let pending_val = if pending { 1 } else { 0 };
+    let row = sqlx::query(
+        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash)
+          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6)
+          RETURNING id"#,
+    )
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
+    .bind(content)
+    .bind(is_outgoing as i32)
+    .bind(pending_val)
+    .bind(message_hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(Some(row.get(0)))
+}
+
 pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<Option<Message>> {
     sqlx::query_as::<_, Message>(
-        r#"SELECT id, peer_id, content, is_outgoing, ts, pending 
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE id = ?"#,
     )
     .bind(msg_id)
@@ -47,7 +95,8 @@ pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<Opt
 
 pub async fn get_messages(
     pool: &Pool<Sqlite>,
-    peer_id: &str,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
     before: Option<i64>,
     limit: i64,
 ) -> anyhow::Result<Vec<Message>> {
@@ -55,11 +104,13 @@ pub async fn get_messages(
     let limit = limit.min(1000);
 
     sqlx::query_as::<_, Message>(
-        r#"SELECT id, peer_id, content, is_outgoing, ts, pending FROM messages 
-          WHERE peer_id = ?1 AND (?2 IS NULL OR ts < ?2)
-          ORDER BY ts DESC LIMIT ?3"#,
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
+          FROM messages
+          WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 AND (?3 IS NULL OR ts < ?3)
+          ORDER BY ts DESC LIMIT ?4"#,
     )
-    .bind(peer_id)
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
     .bind(before)
     .bind(limit)
     .fetch_all(pool)
@@ -70,13 +121,15 @@ pub async fn get_messages(
 /// 获取最后一条消息
 pub async fn get_last_message(
     pool: &Pool<Sqlite>,
-    peer_id: &str,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
 ) -> anyhow::Result<Option<Message>> {
     sqlx::query_as::<_, Message>(
-        r#"SELECT id, peer_id, content, is_outgoing, ts, pending 
-          FROM messages WHERE peer_id = ? ORDER BY ts DESC LIMIT 1"#,
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
+          FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC LIMIT 1"#,
     )
-    .bind(peer_id)
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
     .fetch_optional(pool)
     .await
     .map_err(Into::into)
@@ -90,22 +143,23 @@ pub async fn delete_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<
         .rows_affected())
 }
 
-// ========== 批量操作（新增） ==========
+// ========== 批量操作 ==========
 
 pub async fn add_messages_batch(
     pool: &Pool<Sqlite>,
-    messages: &[(String, String, bool, bool)], // (peer_id, content, is_outgoing, pending)
+    messages: &[(String, String, String, bool, bool)], // (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending)
 ) -> anyhow::Result<Vec<i64>> {
     let mut tx = pool.begin().await?;
     let mut ids = Vec::with_capacity(messages.len());
 
-    for (peer_id, content, is_outgoing, pending) in messages {
+    for (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending) in messages {
         let pending_val = if *pending { 1 } else { 0 };
         let row = sqlx::query(
-            r#"INSERT INTO messages (peer_id, content, is_outgoing, pending, ts)
-              VALUES (?1, ?2, ?3, ?4, unixepoch()) RETURNING id"#,
+            r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts)
+              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch()) RETURNING id"#,
         )
-        .bind(peer_id)
+        .bind(owner_identity_id)
+        .bind(peer_pubkey_hex)
         .bind(content)
         .bind(*is_outgoing as i32)
         .bind(pending_val)
@@ -163,11 +217,11 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> anyhow::
     Ok(query.execute(pool).await?.rows_affected())
 }
 
-// ========== 待发送消息管理 ==========
+// ========== 待发送消息管理（离线消息队列） ==========
 
 pub async fn list_pending(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
     sqlx::query_as::<_, Message>(
-        r#"SELECT id, peer_id, content, is_outgoing, ts, pending 
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE pending = 1 ORDER BY ts"#,
     )
     .fetch_all(pool)
@@ -177,7 +231,7 @@ pub async fn list_pending(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
 
 pub async fn list_failed(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
     sqlx::query_as::<_, Message>(
-        r#"SELECT id, peer_id, content, is_outgoing, ts, pending 
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE pending = 2 ORDER BY ts"#,
     )
     .fetch_all(pool)

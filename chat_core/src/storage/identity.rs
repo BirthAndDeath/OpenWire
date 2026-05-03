@@ -1,6 +1,6 @@
 use crate::CoreConfig;
 use sqlx::{
-    FromRow, Pool, Row, Sqlite,
+    FromRow, Pool, Sqlite,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{path::Path, time::Duration};
@@ -9,11 +9,11 @@ use tracing;
 static DB_POOL: std::sync::OnceLock<Pool<Sqlite>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, FromRow)]
-pub struct MlKemIdentity {
+pub struct Identity {
     pub id: i64,
-    pub identity_id: String, // ML-KEM公钥的hex编码
-    pub public_key: Vec<u8>, // 原始公钥字节
+    pub identity_id: String, // 身份ID (Hex encoded ML-DSA PubKey)
     pub is_current: i32,
+    pub created_at: i64,
 }
 
 // ========== 初始化 ==========
@@ -69,82 +69,79 @@ pub fn pool() -> Option<&'static Pool<Sqlite>> {
     DB_POOL.get()
 }
 
-// ========== 身份管理（数据库层） ==========
+// ========== 身份管理（以 ML-DSA 公钥为唯一身份标识） ==========
 
-pub async fn add_mlkem_identity(
-    pool: &Pool<Sqlite>,
-    identity_id: &str,
-    public_key: &[u8],
-) -> anyhow::Result<()> {
+/// 添加新身份（ML-DSA 公钥 hex 作为 identity_id）
+pub async fn add_identity(pool: &Pool<Sqlite>, identity_id: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO mlkem_identity (identity_id, public_key, is_current) VALUES (?, ?, 0)",
+        "INSERT INTO identities (identity_id, is_current) VALUES (?, 0) ON CONFLICT(identity_id) DO NOTHING",
     )
     .bind(identity_id)
-    .bind(public_key)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn get_current_mlkem_public_key(
-    pool: &Pool<Sqlite>,
-) -> anyhow::Result<Option<(String, Vec<u8>)>> {
-    let row = sqlx::query(
-        "SELECT identity_id, public_key FROM mlkem_identity WHERE is_current = 1 LIMIT 1",
+/// 获取当前身份的 identity_id（ML-DSA 公钥 hex）
+pub async fn get_current_identity(pool: &Pool<Sqlite>) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query_scalar::<_, String>(
+        "SELECT identity_id FROM identities WHERE is_current = 1 LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| {
-        let identity_id: String = r.get("identity_id");
-        let public_key: Vec<u8> = r.get("public_key");
-        (identity_id, public_key)
-    }))
+    Ok(row)
 }
 
-/// 获取当前 ML-KEM 身份信息
-pub async fn get_current_mlkem_identity(
-    pool: &Pool<Sqlite>,
-) -> anyhow::Result<Option<(String, Vec<u8>)>> {
-    get_current_mlkem_public_key(pool).await
-}
-
-pub async fn set_current_mlkem_identity(
-    pool: &Pool<Sqlite>,
-    identity_id: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("UPDATE mlkem_identity SET is_current = 0")
+pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE identities SET is_current = 0")
         .execute(pool)
         .await?;
-    sqlx::query("UPDATE mlkem_identity SET is_current = 1 WHERE identity_id = ?")
+    sqlx::query("UPDATE identities SET is_current = 1 WHERE identity_id = ?")
         .bind(identity_id)
         .execute(pool)
         .await?;
     Ok(())
 }
 
-pub async fn list_mlkem_identities(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<MlKemIdentity>> {
-    sqlx::query_as::<_, MlKemIdentity>(
-        r#"SELECT id, identity_id, public_key, is_current FROM mlkem_identity ORDER BY id"#,
+pub async fn list_identities(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Identity>> {
+    sqlx::query_as::<_, Identity>(
+        r#"SELECT id, identity_id, is_current, created_at FROM identities ORDER BY id"#,
     )
     .fetch_all(pool)
     .await
     .map_err(Into::into)
 }
 
-pub async fn delete_mlkem_identity(
+pub async fn delete_identity(
     pool: &Pool<Sqlite>,
     data_dir: &Path,
     identity_id: &str,
 ) -> anyhow::Result<u64> {
-    // 先删除私钥（使用rootcell的PrivateKeyHandle）
-    rootcell::identity::PrivateKeyHandle::delete_from_keyring(identity_id);
-    let _ = rootcell::identity::PrivateKeyHandle::delete_encrypted_file(data_dir, identity_id);
+    // 1. 删除 Keyring 中的私钥
+    rootcell::identity::PrivateKeyHandle::delete_from_keyring(&format!("{}_mldsa", identity_id))?;
+    rootcell::identity::PrivateKeyHandle::delete_from_keyring(&format!("{}_mlkem", identity_id))?;
 
-    // 然后删除数据库记录
-    let rows = sqlx::query("DELETE FROM mlkem_identity WHERE identity_id = ?")
+    // 2. 清理 DHT 中的记录（PUBKEY_PEERID_TABLE 和 PUBKEY_MLKEM_TABLE）
+    let dht_path = data_dir.join("dht.redb");
+    if let Ok(db) = redb::Database::create(&dht_path) {
+        use std::sync::Arc;
+        let store = crate::p2p::dht::RedbRecordStore::new(Arc::new(db));
+        let _ = store.remove_pubkey_peerid(identity_id);
+        let _ = store.remove_mlkem_pubkey(identity_id);
+    }
+
+    // 3. 删除数据库记录
+    let rows = sqlx::query("DELETE FROM identities WHERE identity_id = ?")
         .bind(identity_id)
         .execute(pool)
         .await?
         .rows_affected();
+
+    tracing::info!(
+        "Deleted identity {}: removed keys from Keyring, DHT records, and DB ({} rows affected)",
+        identity_id,
+        rows
+    );
+
     Ok(rows)
 }

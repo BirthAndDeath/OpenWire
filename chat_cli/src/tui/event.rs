@@ -1,0 +1,359 @@
+use crate::{App, Focus};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+
+/// 分发事件到对应的焦点处理器
+pub async fn handle_event(app: &mut App, event: Event) -> std::io::Result<()> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match app.current_focus {
+            Focus::Messages => handle_messages_focus(app, key.code).await,
+            Focus::Input => handle_input_focus(app, key).await,
+            Focus::SidebarArea => handle_sidebar_area_focus(app, key.code).await,
+            Focus::IdentityArea => handle_identity_area_focus(app, key.code).await,
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 处理侧边栏（联系人列表）焦点事件
+async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
+    let list_len = app.contacts.len();
+    match key_code {
+        KeyCode::Up if list_len > 0 => {
+            let i = app.contact_list_state.selected().unwrap_or(0);
+            app.contact_list_state.select(Some(i.saturating_sub(1)));
+        }
+        KeyCode::Down if list_len > 0 => {
+            let i = app.contact_list_state.selected().unwrap_or(0);
+            app.contact_list_state
+                .select(Some((i + 1).min(list_len - 1)));
+        }
+        KeyCode::Enter => {
+            if let Some(i) = app.contact_list_state.selected()
+                && i < list_len
+            {
+                app.current_focus = Focus::Input;
+            }
+        }
+        // a 添加联系人
+        KeyCode::Char('a') => {
+            app.status_message =
+                "请在输入框中输入对方 ML-DSA 公钥，然后按 Ctrl+Enter 添加".to_string();
+            app.current_focus = Focus::Input;
+            app.input.clear();
+        }
+        // r 刷新联系人列表
+        KeyCode::Char('r') => {
+            app.refresh_contacts().await;
+            app.status_message = "联系人列表已刷新".to_string();
+        }
+        _ => {}
+    }
+}
+
+/// 处理消息列表焦点事件
+async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
+    let msgs = app.current_messages();
+    let list_len = msgs.len();
+    match key_code {
+        KeyCode::Up if list_len > 0 => {
+            let i = app.message_list_state.selected().unwrap_or(0);
+            app.message_list_state.select(Some(i.saturating_sub(1)));
+        }
+        KeyCode::Down if list_len > 0 => {
+            let i = app.message_list_state.selected().unwrap_or(0);
+            app.message_list_state
+                .select(Some((i + 1).min(list_len - 1)));
+        }
+        KeyCode::Enter => {
+            if let Some(i) = app.message_list_state.selected()
+                && let Some(msg) = msgs.get(i)
+            {
+                app.input = format!("回复「{}」: ", msg);
+                app.current_focus = Focus::Input;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 处理输入框焦点事件
+async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
+    let is_ctrl = key_event
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL);
+    match key_event.code {
+        KeyCode::Enter if !app.input.trim().is_empty() => {
+            // Ctrl+Enter: 添加联系人（输入框中输入公钥后按此快捷键）
+            if is_ctrl {
+                let pubkey_hex = app.input.trim().to_string();
+                if !pubkey_hex.is_empty() {
+                    let ok = app.core_handle.add_contact(&pubkey_hex, None).await;
+                    if ok {
+                        app.push_message(format!(
+                            "已添加联系人: {}..",
+                            &pubkey_hex[..16.min(pubkey_hex.len())]
+                        ));
+                        app.refresh_contacts().await;
+                    } else {
+                        app.push_message("错误: 添加联系人失败".to_string());
+                    }
+                    app.input.clear();
+                    let msg_count = app.current_messages().len();
+                    if msg_count > 0 {
+                        app.message_list_state.select(Some(msg_count - 1));
+                    }
+                }
+                return;
+            }
+
+            // 文件发送模式：输入文件路径后按 Enter 发送文件
+            if app.file_send_mode {
+                let selected_contact_index = app.contact_list_state.selected().unwrap_or(0);
+                let contact_pubkey = app
+                    .contacts
+                    .get(selected_contact_index)
+                    .map(|c| c.mldsa_pubkey_hex.clone());
+                if let Some(ref pubkey) = contact_pubkey {
+                    let file_path = app.input.trim().to_string();
+                    if !file_path.is_empty() {
+                        app.push_message(format!("正在发送文件: {}", file_path));
+                        let sent = app
+                            .core_handle
+                            .send_file(pubkey, std::path::Path::new(&file_path))
+                            .await;
+                        if sent {
+                            app.push_message(format!("文件发送完成: {}", file_path));
+                        } else {
+                            app.push_message(format!("文件发送失败: {}", file_path));
+                        }
+                    }
+                } else {
+                    app.push_message("错误: 未选择联系人".to_string());
+                }
+                app.file_send_mode = false;
+                app.status_message.clear();
+                app.input.clear();
+                let msg_count = app.current_messages().len();
+                if msg_count > 0 {
+                    app.message_list_state.select(Some(msg_count - 1));
+                }
+                return;
+            }
+
+            // 普通 Enter：发送消息
+            // 获取当前选中的联系人（先克隆公钥避免借用冲突）
+            let selected_contact_index = app.contact_list_state.selected().unwrap_or(0);
+            let contact_pubkey = app
+                .contacts
+                .get(selected_contact_index)
+                .map(|c| c.mldsa_pubkey_hex.clone());
+            if let Some(ref pubkey) = contact_pubkey {
+                // 先显示发送中的消息
+                app.push_message(format!("[我] {}", app.input));
+                let sent = app.core_handle.send_msg(pubkey, &app.input).await;
+                if !sent {
+                    app.push_message("错误: 消息发送失败".to_string());
+                }
+            } else {
+                app.push_message("错误: 未选择联系人".to_string());
+            }
+
+            app.input.clear();
+            let msg_count = app.current_messages().len();
+            if msg_count > 0 {
+                app.message_list_state.select(Some(msg_count - 1));
+            }
+        }
+        // Ctrl+F: 发送文件（打开文件选择对话框）
+        KeyCode::Char('f') if is_ctrl => {
+            let selected_contact_index = app.contact_list_state.selected().unwrap_or(0);
+            if app.contacts.get(selected_contact_index).is_some() {
+                // 使用 dialog 选择文件（如果可用），否则提示输入路径
+                app.push_message("请输入文件路径后按 Enter 发送文件: ".to_string());
+                app.status_message = "文件发送模式：输入文件路径后按 Enter".to_string();
+                // 标记输入框处于文件路径输入模式
+                app.file_send_mode = true;
+                app.input.clear();
+            } else {
+                app.push_message("错误: 未选择联系人".to_string());
+            }
+            let msg_count = app.current_messages().len();
+            if msg_count > 0 {
+                app.message_list_state.select(Some(msg_count - 1));
+            }
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        _ => {}
+    }
+}
+
+/// 处理身份管理焦点事件
+async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
+    let list_len = app.identities.len();
+    match key_code {
+        KeyCode::Up if list_len > 0 => {
+            let i = app.identity_list_state.selected().unwrap_or(0);
+            app.identity_list_state.select(Some(i.saturating_sub(1)));
+            app.status_message.clear();
+        }
+        KeyCode::Down if list_len > 0 => {
+            let i = app.identity_list_state.selected().unwrap_or(0);
+            app.identity_list_state
+                .select(Some((i + 1).min(list_len - 1)));
+            app.status_message.clear();
+        }
+        // Enter 切换身份
+        KeyCode::Enter => {
+            if let Some(i) = app.identity_list_state.selected()
+                && let Some(identity) = app.identities.get(i)
+            {
+                if identity.is_current == 0 {
+                    let ok = app
+                        .core_handle
+                        .select_identity(identity.identity_id.clone())
+                        .await;
+                    if ok {
+                        app.status_message = format!(
+                            "已切换到身份: {}",
+                            &identity.identity_id[..16.min(identity.identity_id.len())]
+                        );
+                        // 切换身份后刷新联系人和消息列表（新身份有不同的联系人）
+                        app.refresh_contacts().await;
+                        app.refresh_identities().await;
+                        app.messages_by_contact.clear();
+                        // 重新加载历史消息
+                        if let Some(pool) = chat_core::storage::pool() {
+                            let owner = chat_core::storage::get_current_identity(pool)
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            for contact in &app.contacts.clone() {
+                                if let Ok(msgs) = chat_core::storage::get_messages(
+                                    pool,
+                                    &owner,
+                                    &contact.mldsa_pubkey_hex,
+                                    None,
+                                    50,
+                                )
+                                .await
+                                {
+                                    let entry = app
+                                        .messages_by_contact
+                                        .entry(contact.mldsa_pubkey_hex.clone())
+                                        .or_default();
+                                    let name = contact.name.as_deref().unwrap_or("(未命名)");
+                                    entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                                    for msg in msgs.iter().rev() {
+                                        let prefix = if msg.is_outgoing == 1 {
+                                            "[我]"
+                                        } else {
+                                            "[对方]"
+                                        };
+                                        entry.push(format!("{} {}", prefix, msg.content));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        app.status_message = "错误: 切换身份失败".to_string();
+                    }
+                } else {
+                    app.status_message = "已经是当前身份".to_string();
+                }
+            }
+        }
+        // g 生成新身份
+        KeyCode::Char('g') => {
+            let ok = app.core_handle.generate_identity().await;
+            if ok {
+                app.status_message = "已生成新身份，请按 r 刷新列表".to_string();
+            } else {
+                app.status_message = "错误: 生成身份失败".to_string();
+            }
+            app.refresh_identities().await;
+        }
+        // d 删除身份
+        KeyCode::Char('d') => {
+            if let Some(i) = app.identity_list_state.selected()
+                && let Some(identity) = app.identities.get(i)
+            {
+                if identity.is_current == 0 {
+                    let ok = app
+                        .core_handle
+                        .delete_identity(identity.identity_id.clone())
+                        .await;
+                    if ok {
+                        app.status_message = format!(
+                            "已删除身份: {}",
+                            &identity.identity_id[..16.min(identity.identity_id.len())]
+                        );
+                    } else {
+                        app.status_message = "错误: 删除身份失败".to_string();
+                    }
+                    app.refresh_identities().await;
+                } else {
+                    app.status_message = "不能删除当前身份".to_string();
+                }
+            }
+        }
+        // r 刷新身份列表
+        KeyCode::Char('r') => {
+            app.refresh_identities().await;
+            app.status_message = "身份列表已刷新".to_string();
+        }
+        // c 复制选中身份的 ML-DSA 公钥到剪贴板
+        KeyCode::Char('c') => {
+            if let Some(i) = app.identity_list_state.selected()
+                && let Some(identity) = app.identities.get(i)
+            {
+                let copy_text = format!("ML-DSA公钥(身份ID): {}", identity.identity_id);
+
+                // 使用复用的剪贴板实例
+                let copied = copy_to_clipboard(app, &copy_text);
+
+                if copied {
+                    app.status_message =
+                        format!("已复制身份数据到剪贴板 ({} 字符)", copy_text.len());
+                } else {
+                    // 如果剪贴板不可用，将数据写入临时文件
+                    let tmp_path = std::env::temp_dir().join("chat_identity_data.txt");
+                    if std::fs::write(&tmp_path, &copy_text).is_ok() {
+                        app.status_message =
+                            format!("剪贴板不可用，数据已保存到: {}", tmp_path.display());
+                    } else {
+                        app.status_message = "复制失败，请手动查看下方详情面板中的数据".to_string();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 使用 App 中复用的剪贴板实例复制文本
+fn copy_to_clipboard(app: &mut App, text: &str) -> bool {
+    let clipboard = app.clipboard.get_or_insert_with(|| {
+        arboard::Clipboard::new().unwrap_or_else(|_| {
+            // 如果创建失败，使用占位值，后续操作会失败
+            panic!("Failed to create clipboard");
+        })
+    });
+    clipboard.set_text(text.to_string()).is_ok()
+}
+
+impl Focus {
+    /// 切换到下一个焦点区域
+    pub fn next_focus(self) -> Self {
+        match self {
+            Focus::Input => Focus::Messages,
+            Focus::Messages => Focus::SidebarArea,
+            Focus::SidebarArea => Focus::Input,
+            Focus::IdentityArea => Focus::Input,
+        }
+    }
+}

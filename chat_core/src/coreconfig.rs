@@ -8,6 +8,8 @@ pub struct CoreConfig {
     pub path_to_log: Option<PathBuf>,
     /// 日志级别，如 "info", "debug", "warn"
     pub log_level: Option<String>,
+    /// 文件下载目录（默认: data_dir/downloads）
+    pub download_dir: Option<PathBuf>,
 }
 
 impl CoreConfig {
@@ -30,6 +32,7 @@ impl CoreConfig {
 
                 path_to_log: None,
                 log_level: None,
+                download_dir: None,
             };
         }
 
@@ -38,6 +41,7 @@ impl CoreConfig {
 
             path_to_log: Some(path_to_log.unwrap().into()),
             log_level: log_level.map(|s| s.into()),
+            download_dir: None,
         }
     }
 }

@@ -14,7 +14,7 @@
       "identifier": "store:allow-load",
       "allow": [
         {
-          "path": ".settings"
+          "path": ".settings.dat"
         }
       ]
     },
@@ -22,7 +22,7 @@
       "identifier": "store:allow-get",
       "allow": [
         {
-          "path": ".settings"
+          "path": ".settings.dat"
         }
       ]
     },
@@ -30,7 +30,7 @@
       "identifier": "store:allow-set",
       "allow": [
         {
-          "path": ".settings"
+          "path": ".settings.dat"
         }
       ]
     },
@@ -38,7 +38,7 @@
       "identifier": "store:allow-save",
       "allow": [
         {
-          "path": ".settings"
+          "path": ".settings.dat"
         }
       ]
     },

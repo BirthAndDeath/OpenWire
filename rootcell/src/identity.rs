@@ -110,7 +110,10 @@ impl PrivateKeyHandle {
 
     /// 锁定内存（mlock）
     ///
-    /// 防止私钥被swap到磁盘
+    /// 防止私钥被swap到磁盘。
+    /// 如果 mlock 失败，仅记录警告并继续运行（降级处理），
+    /// 因为 mlock 失败不代表私钥立即泄露，只是增加了被 swap 到磁盘的风险。
+    /// 完全拒绝服务比私钥可能被 swap 到磁盘更糟糕。
     #[cfg(unix)]
     fn lock_memory(&mut self) -> anyhow::Result<()> {
         if self.locked {
@@ -124,8 +127,15 @@ impl PrivateKeyHandle {
             let ret = libc::mlock(ptr as *const libc::c_void, len);
             if ret != 0 {
                 let err = std::io::Error::last_os_error();
-                tracing::warn!("Failed to mlock private key memory: {}", err);
-                anyhow::bail!("Failed to mlock private key memory: {}", err);
+                tracing::warn!(
+                    "Failed to mlock private key memory ({}): {}. \
+                     Private key may be swappable to disk. Continuing with degraded protection.",
+                    len,
+                    err
+                );
+                // 降级处理：mlock 失败不阻止程序运行
+                // 私钥仍然受到 Zeroizing 保护（drop 时自动清零）
+                return Ok(());
             }
         }
 
@@ -152,8 +162,14 @@ impl PrivateKeyHandle {
 
         if ret == 0 {
             let err = std::io::Error::last_os_error();
-            tracing::warn!("Failed to VirtualLock private key memory: {}", err);
-            anyhow::bail!("Failed to VirtualLock private key memory: {}", err);
+            tracing::warn!(
+                "Failed to VirtualLock private key memory ({}): {}. \
+                 Private key may be swappable to disk. Continuing with degraded protection.",
+                len,
+                err
+            );
+            // 降级处理：VirtualLock 失败不阻止程序运行
+            return Ok(());
         }
 
         self.locked = true;
@@ -266,9 +282,31 @@ impl PrivateKeyHandle {
     /// 从keyring删除私钥
     pub fn delete_from_keyring(identifier: &str) -> anyhow::Result<()> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, identifier)?;
-        entry.delete_credential()?;
-        tracing::debug!("Deleted keyring entry for {}", identifier);
-        Ok(())
+        // 先检查凭据是否存在，避免 delete_credential 在凭据不存在时 panic
+        match entry.get_password() {
+            Ok(_) => {
+                entry.delete_credential()?;
+                tracing::debug!("Deleted keyring entry for {}", identifier);
+                Ok(())
+            }
+            Err(keyring::Error::NoEntry) => {
+                tracing::warn!(
+                    "Keyring entry for {} does not exist, skipping deletion",
+                    identifier
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to check keyring entry for {}: {:?}, attempting deletion anyway",
+                    identifier,
+                    e
+                );
+                entry.delete_credential()?;
+                tracing::debug!("Deleted keyring entry for {}", identifier);
+                Ok(())
+            }
+        }
     }
 
     /// 诊断存储状态

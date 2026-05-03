@@ -1,3 +1,4 @@
+use anyhow::Context;
 use libp2p::Multiaddr;
 
 ///公共 bootstrap 节点
@@ -58,6 +59,6 @@ pub const BOOTSTRAP: &[(&str, &str)] = &[
 ];
 
 /// 解析 dnsaddr 为实际地址
-pub fn resolve_dnsaddr(dnsaddr: &str) -> Multiaddr {
-    dnsaddr.parse().unwrap()
+pub fn resolve_dnsaddr(dnsaddr: &str) -> anyhow::Result<Multiaddr> {
+    dnsaddr.parse().context("Failed to parse dnsaddr")
 }

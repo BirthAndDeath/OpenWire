@@ -2,7 +2,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
-use anyhow;
+use anyhow::Context;
 use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey, ML_KEM_768};
 use blake3;
 
@@ -14,32 +14,44 @@ const MLKEM768_SECRET_KEY_SIZE: usize = 2400;
 const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 
 /// 当前加密协议版本
+///
+/// 此版本号在 encrypt_message() 中写入加密载荷的第一个字节，
+/// 在 decrypt_message() 中检查并拒绝不匹配的版本。
+///
+/// 注意：此版本号仅用于加密协议（ML-KEM + AES-GCM）的兼容性管理，
+/// 不用于 ChatMessage 结构体的序列化格式版本管理。
+/// 若需支持消息序列化格式的向前兼容，应在 ChatMessage 结构体中
+/// 添加独立的 version 字段。
 const CURRENT_ENCRYPTION_VERSION: u8 = 1;
 
 /// ML-KEM/Kyber 密钥对类型别名
 pub type MlKemKeypair = (Vec<u8>, Vec<u8>); // (public_key, secret_key)
 
-/// 生成新的 ML-KEM 密钥对
+/// 生成新的 ML-KEM 密钥对（临时密钥交换）
+///
+/// # 设计说明
+/// ML-KEM 密钥对是**临时**的，每次会话重新生成。
+/// 持久化身份由 ML-DSA 公钥提供，ML-KEM 仅用于一次会话的密钥封装。
 ///
 /// # 返回
 /// - public_key: 公钥(用于加密)
 /// - secret_key: 私钥(用于解密)
-pub fn generate_mlkem_keypair() -> MlKemKeypair {
+pub fn generate_mlkem_keypair() -> anyhow::Result<MlKemKeypair> {
     let decap_key =
-        DecapsulationKey::generate(&ML_KEM_768).expect("Failed to generate ML-KEM-768 keypair");
+        DecapsulationKey::generate(&ML_KEM_768).context("Failed to generate ML-KEM-768 keypair")?;
 
     let encap_key = decap_key
         .encapsulation_key()
-        .expect("Failed to get encapsulation key");
+        .context("Failed to get encapsulation key")?;
 
     let pk_bytes = encap_key
         .key_bytes()
-        .expect("Failed to serialize public key");
+        .context("Failed to serialize public key")?;
     let sk_bytes = decap_key
         .key_bytes()
-        .expect("Failed to serialize private key");
+        .context("Failed to serialize private key")?;
 
-    (pk_bytes.as_ref().to_vec(), sk_bytes.as_ref().to_vec())
+    Ok((pk_bytes.as_ref().to_vec(), sk_bytes.as_ref().to_vec()))
 }
 
 /// 将 ML-KEM 公钥序列化为字节数组
@@ -79,7 +91,8 @@ pub fn deserialize_mlkem_private_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// 使用 ML-KEM/Kyber + AES-GCM 进行混合加密
 ///
 /// # 架构说明
-/// - **ML-KEM 公钥**：作为持久化的身份标识，用于端到端加密
+/// - **ML-DSA 公钥**：持久化的身份标识，用于签名验证，唯一标识联系人
+/// - **ML-KEM 公钥**：临时密钥交换密钥，每次会话重新生成，不持久化存储
 /// - **临时 PeerID（Ed25519）**：仅用于传输层连接和路由，每次启动可变化
 /// - **消息加密**：使用 ML-KEM 进行密钥封装，然后用 AES-GCM 加密消息
 ///
@@ -92,7 +105,7 @@ pub fn deserialize_mlkem_private_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// # 优势
 /// - **后量子安全**：ML-KEM/Kyber 是 NIST 标准化的后量子密钥封装机制
-/// - **身份一致性**：即使更换传输层 PeerID，加密身份（ML-KEM）保持不变
+/// - **身份与加密分离**：ML-DSA 提供持久身份，ML-KEM 提供临时会话加密
 /// - **前向保密**：每次加密使用随机性，相同的明文产生不同的密文
 pub fn encrypt_message(data: &[u8], recipient_mlkem_public_key: &[u8]) -> anyhow::Result<Vec<u8>> {
     // 1. 验证公钥长度并反序列化

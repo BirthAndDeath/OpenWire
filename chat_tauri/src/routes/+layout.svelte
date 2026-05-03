@@ -14,7 +14,7 @@
       await Promise.all([initTheme(), initLanguage()]);
     }
 
-    initializeSettings();
+    initializeSettings().catch(console.error);
   });
 </script>
 

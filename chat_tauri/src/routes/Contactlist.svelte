@@ -147,7 +147,7 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: rgba(15, 15, 15, 0.7);
+        background: color-mix(in srgb, var(--bg-primary) 70%, transparent);
         backdrop-filter: blur(10px);
     }
 

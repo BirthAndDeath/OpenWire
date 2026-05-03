@@ -1,20 +1,23 @@
 // 定义应用状态（Model）
 #![doc = include_str!("../../README.md")]
-use chat_core::{ChatCommand, ChatCore};
+use std::collections::HashMap;
+
+use anyhow::Context;
+use chat_core::ChatCore;
+use chat_core::storage::{self, Contact, Identity, list_contacts, list_identities, pool};
+use etcetera::BaseStrategy;
 use ratatui::widgets::ListState;
-use tokio::sync::mpsc;
 pub mod notui;
 pub mod tui;
-use chat_core::storage::*;
-pub struct AppData {
-    pub cmd_tx: mpsc::Sender<ChatCommand>,
-}
+pub mod use_json;
 pub struct App {
     // --- 焦点系统 ---
     current_focus: Focus,
 
     // --- 消息列表组件及其状态 ---
-    messages: Vec<String>, // 所有消息
+    /// 按联系人公钥分组的消息列表
+    /// key: 联系人 ML-DSA 公钥 hex, value: 该联系人的消息列表
+    messages_by_contact: HashMap<String, Vec<String>>,
     message_list_state: ListState,
 
     //contacts:HashMap<id,Socket>;
@@ -26,6 +29,70 @@ pub struct App {
     core: Option<ChatCore>,
     core_handle: chat_core::corehandle::CoreHandle,
     contacts: Vec<Contact>, // 联系人列表
+    // --- 身份管理 ---
+    identities: Vec<Identity>,
+    identity_list_state: ListState,
+    status_message: String, // 状态提示信息
+    /// 当前选中的联系人 ML-DSA 公钥 hex（用于过滤消息显示）
+    selected_contact: Option<String>,
+    /// 在线联系人数量（通过 libp2p 连接事件更新）
+    online_peers: usize,
+    /// 文件发送模式：为 true 时，按 Enter 将输入框内容作为文件路径发送
+    file_send_mode: bool,
+    /// 剪贴板实例（复用避免每次创建）
+    clipboard: Option<arboard::Clipboard>,
+}
+
+impl App {
+    /// 获取当前选中联系人的消息列表
+    pub fn current_messages(&self) -> &[String] {
+        let contact_key = self
+            .contact_list_state
+            .selected()
+            .and_then(|i| self.contacts.get(i))
+            .map(|c| &c.mldsa_pubkey_hex);
+        match contact_key {
+            Some(key) => self
+                .messages_by_contact
+                .get(key)
+                .map(|v| v.as_slice())
+                .unwrap_or_default(),
+            None => &[],
+        }
+    }
+
+    /// 消息列表最大条数（防止无限增长）
+    const MAX_MESSAGES_PER_CONTACT: usize = 1000;
+
+    /// 向当前选中联系人的消息列表添加消息
+    pub fn push_message(&mut self, text: String) {
+        let contact_key = self
+            .contact_list_state
+            .selected()
+            .and_then(|i| self.contacts.get(i))
+            .map(|c| c.mldsa_pubkey_hex.clone());
+        if let Some(key) = contact_key {
+            let msgs = self.messages_by_contact.entry(key).or_default();
+            msgs.push(text);
+            // 限制消息列表大小，防止内存无限增长
+            if msgs.len() > Self::MAX_MESSAGES_PER_CONTACT {
+                msgs.remove(0);
+            }
+        }
+    }
+
+    /// 向指定联系人的消息列表添加消息
+    pub fn push_message_to(&mut self, contact_pubkey: &str, text: String) {
+        let msgs = self
+            .messages_by_contact
+            .entry(contact_pubkey.to_string())
+            .or_default();
+        msgs.push(text);
+        // 限制消息列表大小，防止内存无限增长
+        if msgs.len() > Self::MAX_MESSAGES_PER_CONTACT {
+            msgs.remove(0);
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 // 定义焦点枚举
@@ -33,6 +100,7 @@ enum Focus {
     Messages,
     Input,
     SidebarArea,
+    IdentityArea,
 }
 
 impl App {
@@ -40,8 +108,10 @@ impl App {
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // 默认选中第一条消息
 
-        let home_dir = std::env::home_dir().expect("failedto get home dir");
-        let data_dir = home_dir.join(".chat");
+        let data_dir = etcetera::choose_base_strategy()
+            .context("Failed to get base strategy")?
+            .config_dir()
+            .join("myapp");
         let log_path = data_dir.join("log");
         #[cfg(debug_assertions)]
         let log_level = "debug";
@@ -51,22 +121,83 @@ impl App {
         let cfg = chat_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
         let core = chat_core::ChatCore::try_init(cfg).await?;
         let core_handle = core.core_handle.clone();
-        let contacts = list_contacts(pool().unwrap()).await?;
+        let pool = pool().context("Database pool not initialized")?;
+        let owner = storage::get_current_identity(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let contacts = list_contacts(pool, &owner).await?;
+        let identities = list_identities(pool).await?;
+
+        // 加载历史消息（按联系人分组）
+        let mut messages_by_contact: HashMap<String, Vec<String>> = HashMap::new();
+        for contact in &contacts {
+            if let Ok(msgs) =
+                chat_core::storage::get_messages(pool, &owner, &contact.mldsa_pubkey_hex, None, 50)
+                    .await
+            {
+                let entry = messages_by_contact
+                    .entry(contact.mldsa_pubkey_hex.clone())
+                    .or_default();
+                let name = contact.name.as_deref().unwrap_or("(未命名)");
+                entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                for msg in msgs.iter().rev() {
+                    let prefix = if msg.is_outgoing == 1 {
+                        "[我]"
+                    } else {
+                        "[对方]"
+                    };
+                    entry.push(format!("{} {}", prefix, msg.content));
+                }
+            }
+        }
 
         Ok(App {
             current_focus: Focus::Input,
-            messages: vec![
-                "欢迎使用 chat cli".to_string(),
-                "按 Ctrl+Tab 切换焦点，↑↓ 选择消息".to_string(),
-                "按 Esc或Ctrl+C 退出应用，在输入框中Ctrl+Enter 发送".to_string(),
-            ],
+            messages_by_contact,
             message_list_state: list_state,
-            contact_list_state: list_state,
+            contact_list_state: ListState::default(),
             input: String::new(),
             should_quit: false,
             core: Some(core),
             core_handle,
             contacts,
+            identities,
+            identity_list_state: ListState::default(),
+            status_message: String::new(),
+            selected_contact: None,
+            online_peers: 0,
+            file_send_mode: false,
+            clipboard: None,
         })
+    }
+
+    /// 刷新联系人列表
+    pub async fn refresh_contacts(&mut self) {
+        if let Some(pool) = pool() {
+            let owner = storage::get_current_identity(pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if let Ok(contacts) = list_contacts(pool, &owner).await {
+                self.contacts = contacts;
+            }
+        }
+    }
+
+    /// 刷新身份列表
+    pub async fn refresh_identities(&mut self) {
+        if let Some(pool) = pool()
+            && let Ok(identities) = list_identities(pool).await
+        {
+            self.identities = identities;
+        }
+    }
+
+    /// 获取当前身份信息
+    pub fn current_identity(&self) -> Option<&Identity> {
+        self.identities.iter().find(|id| id.is_current == 1)
     }
 }
