@@ -20,6 +20,7 @@ tauri-build = { version = "2.5.6", features = ["isolation"] }
 [dependencies]
 tokio = { workspace = true }
 chat_core = { workspace = true }
+rootcell = { workspace = true }
 tracing = { workspace = true }
 tauri = { version = "2.10.1", features = ["isolation"] }
 tauri-plugin-opener = "2.5.3"

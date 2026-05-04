@@ -16,7 +16,9 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3.32"
 ratatui = "0.30.0"
 arboard = "3.4"
-etcetera = "0.8"
+etcetera = "0.11.0"
+rpassword = "7.3"
+rootcell = { workspace = true }
 [package.metadata.docs.rs]
 # docs.rs 构建时使用
 no-deps = true
