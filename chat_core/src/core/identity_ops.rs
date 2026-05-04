@@ -26,9 +26,13 @@ impl ChatCore {
                 self.mldsa_identity_id = Some(mldsa_id.clone());
                 self.mlkem_pubkey_hex = Some(mlkem_id.clone());
 
-                // 从 Keyring 加载新身份的 ML-DSA 私钥并缓存到内存
+                // 从存储加载新身份的 ML-DSA 私钥并缓存到内存
                 // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
-                match rootcell::identity::PrivateKeyHandle::load(&format!("{}_mldsa", mldsa_id)) {
+                match rootcell::identity::PrivateKeyHandle::load(
+                    &self.data_dir.to_string_lossy(),
+                    &format!("{}_mldsa", mldsa_id),
+                    None,
+                ) {
                     Ok(handle) => {
                         self.mldsa_private_key =
                             Some(Zeroizing::new(handle.get_private_key().to_vec()));
@@ -107,16 +111,19 @@ impl ChatCore {
         }
 
         // 2. 加载新身份的 ML-DSA 私钥并提取公钥
-        let mldsa_handle =
-            match rootcell::identity::PrivateKeyHandle::load(&format!("{}_mldsa", identity_id)) {
-                Ok(handle) => handle,
-                Err(e) => {
-                    tracing::error!("Failed to load ML-DSA private key for {}: {e}", identity_id);
-                    let msg = format!("切换身份失败：无法加载私钥: {}", e);
-                    self.send_warning_mpsc(msg).await;
-                    return;
-                }
-            };
+        let mldsa_handle = match rootcell::identity::PrivateKeyHandle::load(
+            &self.data_dir.to_string_lossy(),
+            &format!("{}_mldsa", identity_id),
+            None,
+        ) {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::error!("Failed to load ML-DSA private key for {}: {e}", identity_id);
+                let msg = format!("切换身份失败：无法加载私钥: {}", e);
+                self.send_warning_mpsc(msg).await;
+                return;
+            }
+        };
         let mldsa_public_key = match crate::identity::extract_public_key_from_private(
             mldsa_handle.get_private_key(),
             true,
@@ -149,6 +156,7 @@ impl ChatCore {
         // 使用 Zeroizing 包装临时副本，确保保存后 drop 时自动清零内存
         let mlkem_secret_key = Zeroizing::new(mlkem_secret_key);
         if let Err(e) = rootcell::identity::PrivateKeyHandle::save(
+            &self.data_dir.to_string_lossy(),
             &format!("{}_mlkem", identity_id),
             &mlkem_secret_key,
         ) {

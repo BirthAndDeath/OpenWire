@@ -117,9 +117,17 @@ pub async fn delete_identity(
     data_dir: &Path,
     identity_id: &str,
 ) -> anyhow::Result<u64> {
-    // 1. 删除 Keyring 中的私钥
-    rootcell::identity::PrivateKeyHandle::delete_from_keyring(&format!("{}_mldsa", identity_id))?;
-    rootcell::identity::PrivateKeyHandle::delete_from_keyring(&format!("{}_mlkem", identity_id))?;
+    let data_dir_str = data_dir.to_string_lossy();
+
+    // 1. 删除加密的私钥文件
+    rootcell::identity::PrivateKeyHandle::delete_encrypted_private_key(
+        &data_dir_str,
+        &format!("{}_mldsa", identity_id),
+    );
+    rootcell::identity::PrivateKeyHandle::delete_encrypted_private_key(
+        &data_dir_str,
+        &format!("{}_mlkem", identity_id),
+    );
 
     // 2. 清理 DHT 中的记录（PUBKEY_PEERID_TABLE 和 PUBKEY_MLKEM_TABLE）
     let dht_path = data_dir.join("dht.redb");
@@ -138,7 +146,7 @@ pub async fn delete_identity(
         .rows_affected();
 
     tracing::info!(
-        "Deleted identity {}: removed keys from Keyring, DHT records, and DB ({} rows affected)",
+        "Deleted identity {}: removed encrypted key files, DHT records, and DB ({} rows affected)",
         identity_id,
         rows
     );

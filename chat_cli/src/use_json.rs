@@ -1,7 +1,7 @@
 use crate::App;
 use anyhow::Context;
 use chat_core::storage;
-use chat_core::{ChatCommand, MessageEvent, validate_mldsa_pubkey_hex};
+use chat_core::{IncomingMessage, MessageEvent, validate_mldsa_pubkey_hex};
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
@@ -26,13 +26,63 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
         let mut rx = rx;
         while let Some(msg) = rx.recv().await {
             let json_output = match msg {
-                MessageEvent::ReceiveMessage(data) => {
-                    json!({
-                        "type": "message",
-                        "data": data,
-                        "timestamp": chrono::Utc::now().to_rfc3339()
-                    })
-                }
+                MessageEvent::ReceiveMessage(incoming) => match incoming {
+                    IncomingMessage::Text { text, sender } => {
+                        json!({
+                            "type": "message",
+                            "subtype": "text",
+                            "data": {
+                                "text": text,
+                                "sender": sender,
+                            },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })
+                    }
+                    IncomingMessage::FileShare {
+                        filename,
+                        file_id,
+                        file_hash,
+                        total_size,
+                        sender,
+                    } => {
+                        json!({
+                            "type": "message",
+                            "subtype": "file_share",
+                            "data": {
+                                "filename": filename,
+                                "file_id": file_id,
+                                "file_hash": file_hash,
+                                "total_size": total_size,
+                                "sender": sender,
+                            },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })
+                    }
+                    IncomingMessage::DeliveryReceipt {
+                        message_hash,
+                        peer_id,
+                    } => {
+                        json!({
+                            "type": "message",
+                            "subtype": "delivery_receipt",
+                            "data": {
+                                "message_hash": message_hash,
+                                "peer_id": peer_id,
+                            },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })
+                    }
+                    IncomingMessage::OnlineStatus { count } => {
+                        json!({
+                            "type": "message",
+                            "subtype": "online_status",
+                            "data": {
+                                "count": count,
+                            },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })
+                    }
+                },
                 MessageEvent::Log(data) => {
                     json!({
                         "type": "log",

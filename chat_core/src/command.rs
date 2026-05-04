@@ -102,14 +102,54 @@ pub enum ChatCommand {
     Shutdown,
 }
 
+/// 收到的消息类型：chat_core 向上层传递的结构化数据
+///
+/// 上层（chat_cli/chat_tauri）负责序列化为 JSON 供前端消费。
+/// chat_core 自身不依赖 serde_json，仅使用 serde derive。
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum IncomingMessage {
+    /// 文本消息
+    Text {
+        /// 消息文本内容
+        text: String,
+        /// 发送方的 ML-DSA 公钥 hex
+        sender: String,
+    },
+    /// 文件分享消息
+    FileShare {
+        /// 文件名
+        filename: String,
+        /// 文件唯一标识（hex）
+        file_id: String,
+        /// 文件哈希（hex）
+        file_hash: String,
+        /// 文件总大小
+        total_size: u64,
+        /// 发送方的 ML-DSA 公钥 hex
+        sender: String,
+    },
+    /// 消息送达回执
+    DeliveryReceipt {
+        /// 已送达消息的哈希
+        message_hash: String,
+        /// 发送方的 ML-DSA 公钥 hex
+        peer_id: String,
+    },
+    /// 在线状态更新
+    OnlineStatus {
+        /// 当前在线连接数
+        count: usize,
+    },
+}
+
 /// 消息事件类型：用于向外部（UI）通知状态
 ///
 /// chat_core 通过此枚举向上层传递结构化数据，
 /// 上层（chat_cli/chat_tauri）负责序列化为 JSON 供前端消费。
 #[derive(Debug)]
 pub enum MessageEvent {
-    /// 收到新消息
-    ReceiveMessage(String),
+    /// 收到新消息（结构化数据，上层负责序列化）
+    ReceiveMessage(IncomingMessage),
     /// 发生错误
     Error(String),
     /// 日志信息（连接状态等）

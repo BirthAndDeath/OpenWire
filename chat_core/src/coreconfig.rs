@@ -10,6 +10,9 @@ pub struct CoreConfig {
     pub log_level: Option<String>,
     /// 文件下载目录（默认: data_dir/downloads）
     pub download_dir: Option<PathBuf>,
+    /// 用户密码派生密钥 hex（前端用 Argon2id 处理后的 256 位密钥）
+    /// 用于 Keyring 不可用时的降级加密文件存储
+    pub passwd: Option<String>,
 }
 
 impl CoreConfig {
@@ -33,6 +36,7 @@ impl CoreConfig {
                 path_to_log: None,
                 log_level: None,
                 download_dir: None,
+                passwd: None,
             };
         }
 
@@ -42,6 +46,7 @@ impl CoreConfig {
             path_to_log: Some(path_to_log.unwrap().into()),
             log_level: log_level.map(|s| s.into()),
             download_dir: None,
+            passwd: None,
         }
     }
 }

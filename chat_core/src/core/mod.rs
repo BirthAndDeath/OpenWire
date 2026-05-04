@@ -104,10 +104,21 @@ impl ChatCore {
         // 加载 ML-DSA 私钥并缓存到内存（避免每次发送消息都访问 Keyring）
         // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
         let mldsa_private_key = {
-            let handle = rootcell::identity::PrivateKeyHandle::load(&format!(
-                "{}_mldsa",
-                mldsa_identity_id
-            ))?;
+            let mut handle = rootcell::identity::PrivateKeyHandle::load(
+                &cfg.data_dir.to_string_lossy(),
+                &format!("{}_mldsa", mldsa_identity_id),
+                cfg.passwd.as_deref(),
+            )?;
+
+            // 如果当前是密码派生模式但 Keyring 可用，自动升级到 Keyring 存储
+            if let Err(e) = handle.try_upgrade_to_keyring() {
+                tracing::warn!(
+                    "Failed to upgrade private key for {} to Keyring: {}",
+                    &mldsa_identity_id[..16],
+                    e
+                );
+            }
+
             Zeroizing::new(handle.get_private_key().to_vec())
         };
 
@@ -244,10 +255,10 @@ impl ChatCore {
     }
 
     /// 发送新消息事件到外部通道
-    pub async fn send_message_mpsc(&mut self, data: String) {
+    pub async fn send_message_mpsc(&mut self, msg: crate::command::IncomingMessage) {
         if let Err(e) = self
             .tx_message
-            .send(MessageEvent::ReceiveMessage(data))
+            .send(MessageEvent::ReceiveMessage(msg))
             .await
         {
             tracing::error!("Failed to send message event: {e}");

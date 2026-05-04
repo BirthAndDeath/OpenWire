@@ -11,7 +11,7 @@ pub mod p2p;
 pub mod signature;
 pub mod storage;
 pub mod transfer;
-pub use command::{ChatCommand, ChatcoreEvent, MessageEvent};
+pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{

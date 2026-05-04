@@ -27,6 +27,26 @@ async fn send(
     let _public_key_bytes =
         hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
 
+    // 验证联系人是否存在
+    if let Some(pool) = storage::pool() {
+        let owner_identity_id = storage::get_current_identity(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if !owner_identity_id.is_empty() {
+            match storage::is_contact_exists(pool, &owner_identity_id, mldsa_pubkey_hex).await {
+                Ok(false) => {
+                    return Err("该联系人不存在，请先添加联系人".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!("检查联系人存在性失败: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
+
     // 让核心全权处理消息持久化和发送，不再在此处保存消息到数据库
     // 核心的 send_text() 会在发送成功/失败时通过 MessageEvent 通知前端
     let inner = state.inner.read().await;
@@ -65,6 +85,26 @@ async fn send_file(
     }
     let _public_key_bytes =
         hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
+
+    // 验证联系人是否存在
+    if let Some(pool) = storage::pool() {
+        let owner_identity_id = storage::get_current_identity(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if !owner_identity_id.is_empty() {
+            match storage::is_contact_exists(pool, &owner_identity_id, mldsa_pubkey_hex).await {
+                Ok(false) => {
+                    return Err("该联系人不存在，请先添加联系人".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!("检查联系人存在性失败: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
 
     // 检查文件是否存在
     let path = std::path::PathBuf::from(file_path);
@@ -488,17 +528,24 @@ async fn request_file_download(
 #[tauri::command]
 async fn set_download_dir(state: tauri::State<'_, AppData>, path: &str) -> Result<bool, String> {
     let download_path = PathBuf::from(path);
+    // 先发送命令到核心
     let inner = state.inner.read().await;
     let result = inner
         .cmd_tx
         .as_ref()
         .ok_or_else(|| "核心尚未初始化".to_string())?
         .send(ChatCommand::SetDownloadDir {
-            path: download_path,
+            path: download_path.clone(),
         })
         .await;
     match result {
-        Ok(_) => Ok(true),
+        Ok(_) => {
+            // 同步更新 AppDataInner 中的 download_dir，确保 get_download_dir 能返回正确值
+            drop(inner);
+            let mut inner = state.inner.write().await;
+            inner.download_dir = Some(download_path);
+            Ok(true)
+        }
         Err(e) => Err(format!("设置下载目录失败: {}", e)),
     }
 }
@@ -507,13 +554,142 @@ async fn set_download_dir(state: tauri::State<'_, AppData>, path: &str) -> Resul
 #[tauri::command]
 async fn get_download_dir(state: tauri::State<'_, AppData>) -> Result<String, String> {
     let inner = state.inner.read().await;
-    // 从 AppDataInner 获取 data_dir，然后构造默认下载目录
-    let data_dir = inner.data_dir.clone();
-    drop(inner);
+    // 优先返回用户设置的下载目录，否则使用默认值
+    if let Some(ref download_dir) = inner.download_dir {
+        Ok(download_dir.to_string_lossy().to_string())
+    } else {
+        let data_dir = inner.data_dir.clone();
+        drop(inner);
+        // 默认下载目录为 data_dir/downloads
+        let default_download_dir = data_dir.join("downloads");
+        Ok(default_download_dir.to_string_lossy().to_string())
+    }
+}
 
-    // 默认下载目录为 data_dir/downloads
-    let default_download_dir = data_dir.join("downloads");
-    Ok(default_download_dir.to_string_lossy().to_string())
+/// 检查 Keyring 是否可用（隔离层检查）。
+///
+/// 如果 Keyring 可用，前端应隐藏密码相关 UI。
+/// 通过 `rootcell::identity::PrivateKeyHandle::load_master_key()` 判断：
+/// - `Ok(Some(_))` → Keyring 可用且已有主密钥 → 返回 `true`
+/// - `Ok(None)` → Keyring 可能不可用或没有主密钥 → 保守返回 `false`
+/// - `Err(_)` → Keyring 不可用 → 返回 `false`
+#[tauri::command]
+async fn is_keyring_available() -> Result<bool, String> {
+    match rootcell::identity::PrivateKeyHandle::load_master_key() {
+        Ok(Some(_)) => {
+            tracing::debug!("Keyring is available (master key found)");
+            Ok(true)
+        }
+        Ok(None) => {
+            // load_master_key() 返回 Ok(None) 可能是 Keyring 不可用，
+            // 也可能是 Keyring 可用但还没有主密钥。
+            // 保守处理：返回 false，让前端显示密码设置选项。
+            tracing::debug!("Keyring status: no master key found, treating as unavailable");
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::debug!("Keyring error: {}", e);
+            Ok(false)
+        }
+    }
+}
+
+/// 设置用户密码（Keyring 降级模式）。
+///
+/// 在 Keyring 不可用时，使用此密码派生密钥加密私钥文件。
+/// 密码由 rootcell 内部使用 Argon2id 派生为 256 位 hex 密钥。
+#[tauri::command]
+async fn set_password(state: tauri::State<'_, AppData>, password: &str) -> Result<bool, String> {
+    // 使用统一的 Argon2id KDF 派生密钥（rootcell 内部完成 hex 编码）
+    let key_hex = rootcell::identity::PrivateKeyHandle::derive_key_from_password(password);
+    let mut inner = state.inner.write().await;
+    inner.passwd = Some(key_hex);
+    tracing::info!("用户密码已设置（Keyring 降级模式，Argon2id KDF）");
+    Ok(true)
+}
+
+/// 重试 Core 初始化（在用户通过前端设置密码后调用）。
+///
+/// 当 Keyring 不可用且无密码时，前端会收到 `need-password` 事件。
+/// 用户输入密码后，前端调用 `set_password` 设置密码，然后调用此命令重试初始化。
+#[tauri::command]
+async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let (data_dir, passwd) = {
+        let app_data = app_handle.state::<AppData>();
+        let inner = app_data.inner.read().await;
+        let data_dir = inner.data_dir.clone();
+        let passwd = inner.passwd.clone();
+        drop(inner);
+        (data_dir, passwd)
+    };
+
+    let cfg = chat_core::CoreConfig {
+        data_dir,
+        path_to_log: None,
+        log_level: Some("info".to_string()),
+        download_dir: None,
+        passwd,
+    };
+
+    match chat_core::ChatCore::try_init(cfg.clone()).await {
+        Ok(mut chat_core_instance) => {
+            // 更新 AppData
+            {
+                let app_data = app_handle.state::<AppData>();
+                let mut inner = app_data.inner.write().await;
+                inner.cmd_tx = Some(chat_core_instance.core_handle.cmd_tx.clone());
+                inner.data_dir = cfg.data_dir.clone();
+                inner.mlkem_pubkey_hex = chat_core_instance.mlkem_pubkey_hex.clone();
+                inner.need_password = false;
+            }
+
+            let mut rx = match chat_core_instance.take_rx_message() {
+                Some(rx) => rx,
+                None => {
+                    tracing::error!("重试初始化失败：无法获取消息接收器");
+                    return Err("内部错误：无法获取消息接收器".to_string());
+                }
+            };
+
+            let app_handle_for_events = app_handle.clone();
+            chat_core_instance.run();
+
+            // 启动事件循环
+            tauri::async_runtime::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        MessageEvent::Log(data) => {
+                            app_handle_for_events.emit("log", data).ok();
+                        }
+                        MessageEvent::ReceiveMessage(msg) => {
+                            // 将 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
+                            let json = serde_json::to_string(&msg).unwrap_or_default();
+                            app_handle_for_events.emit("chat-message", json).ok();
+                        }
+                        MessageEvent::Warning(data) => {
+                            app_handle_for_events.emit("warning", data).ok();
+                        }
+                        MessageEvent::Error(data) => {
+                            app_handle_for_events.emit("error", data).ok();
+                        }
+                        MessageEvent::FileTransferProgress(progress) => {
+                            app_handle_for_events
+                                .emit("file-transfer-progress", progress)
+                                .ok();
+                        }
+                    }
+                }
+            });
+
+            tracing::info!("✅ Core 重试初始化成功");
+            Ok(true)
+        }
+        Err(e) => {
+            let err_msg = format!("Core 初始化失败: {}", e);
+            tracing::error!("{}", err_msg);
+            Err(err_msg)
+        }
+    }
 }
 
 pub struct AppData {
@@ -525,6 +701,12 @@ pub struct AppDataInner {
     pub data_dir: PathBuf,
     /// 当前会话的 ML-KEM 公钥 hex（用于前端显示）
     pub mlkem_pubkey_hex: Option<String>,
+    /// 用户密码派生密钥 hex（由 rootcell::derive_key_from_password 派生）
+    pub passwd: Option<String>,
+    /// 是否需要密码（Keyring 不可用标志），前端据此弹出密码输入框
+    pub need_password: bool,
+    /// 当前下载目录（由 set_download_dir 设置，get_download_dir 读取）
+    pub download_dir: Option<PathBuf>,
 }
 
 /// 用于在核心初始化完成前占位的初始状态
@@ -534,10 +716,68 @@ fn create_placeholder_appdata() -> AppData {
             cmd_tx: None,
             data_dir: PathBuf::new(),
             mlkem_pubkey_hex: None,
+            passwd: None,
+            need_password: false,
+            download_dir: None,
         })),
     }
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 初始化成功后设置 AppData、启动事件循环。
+///
+/// 此函数被 `run()` 中的初始化闭包调用，避免代码重复。
+async fn setup_core_and_event_loop(
+    mut chat_core_instance: chat_core::ChatCore,
+    cfg: chat_core::CoreConfig,
+    apphandle: tauri::AppHandle,
+) {
+    // 用真实的 AppData 替换占位状态
+    let app_data = apphandle.state::<AppData>();
+    let mut inner = app_data.inner.write().await;
+    inner.cmd_tx = Some(chat_core_instance.core_handle.cmd_tx.clone());
+    inner.data_dir = cfg.data_dir.clone();
+    inner.mlkem_pubkey_hex = chat_core_instance.mlkem_pubkey_hex.clone();
+    inner.need_password = false;
+    // passwd 保持之前设置的值，不需要覆盖
+    drop(inner);
+
+    let mut rx = match chat_core_instance.take_rx_message() {
+        Some(rx) => rx,
+        None => {
+            tracing::error!("Failed to take message receiver");
+            return;
+        }
+    };
+    // 启动核心服务（在独立线程中运行）
+    let app_handle_for_events = apphandle.clone();
+    chat_core_instance.run();
+
+    // 主事件循环 — 直接等待消息，无需心跳
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            MessageEvent::Log(data) => {
+                app_handle_for_events.emit("log", data).ok();
+            }
+            MessageEvent::ReceiveMessage(msg) => {
+                // 将 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
+                let json = serde_json::to_string(&msg).unwrap_or_default();
+                app_handle_for_events.emit("chat-message", json).ok();
+            }
+            MessageEvent::Warning(data) => {
+                app_handle_for_events.emit("warning", data).ok();
+            }
+            MessageEvent::Error(data) => {
+                app_handle_for_events.emit("error", data).ok();
+            }
+            MessageEvent::FileTransferProgress(progress) => {
+                app_handle_for_events
+                    .emit("file-transfer-progress", progress)
+                    .ok();
+            }
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -574,56 +814,86 @@ pub fn run() {
                 #[cfg(not(debug_assertions))]
                 let log_level = "info";
 
-                let cfg = chat_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
+                // 从 AppData 获取密码（由前端通过 set_password 命令设置）
+                let app_data_state = apphandle.state::<AppData>();
+                let passwd = app_data_state.inner.read().await.passwd.clone();
+                drop(app_data_state);
 
-                let mut core = match chat_core::ChatCore::try_init(cfg.clone()).await {
-                    Ok(c) => c,
+                let mut cfg = chat_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
+                cfg.passwd = passwd;
+
+                match chat_core::ChatCore::try_init(cfg.clone()).await {
+                    Ok(chat_core_instance) => {
+                        setup_core_and_event_loop(chat_core_instance, cfg, apphandle).await;
+                    }
                     Err(e) => {
-                        tracing::error!("Core 初始化失败: {}", e);
-                        return;
-                    }
-                };
+                        let err_msg = format!("Core 初始化失败: {}", e);
+                        tracing::error!("{}", err_msg);
 
-                // 用真实的 AppData 替换占位状态
-                let app_data = apphandle.state::<AppData>();
-                let mut inner = app_data.inner.write().await;
-                inner.cmd_tx = Some(core.core_handle.cmd_tx.clone());
-                inner.data_dir = cfg.data_dir.clone();
-                inner.mlkem_pubkey_hex = core.mlkem_pubkey_hex.clone();
-                drop(inner);
+                        // 判断是否是 Keyring 不可用导致的失败（无密码）
+                        let needs_password = err_msg.contains("Keyring unavailable")
+                            || err_msg.contains("Private key not found");
 
-                let mut rx = match core.take_rx_message() {
-                    Some(rx) => rx,
-                    None => {
-                        tracing::error!("Failed to take message receiver");
-                        return;
-                    }
-                };
-                // 启动核心服务（在独立线程中运行）
-                let app_handle_for_events = apphandle.clone();
-                core.run();
+                        if needs_password {
+                            // 更新 AppData 标记需要密码
+                            {
+                                let app_data = apphandle.state::<AppData>();
+                                let mut inner = app_data.inner.write().await;
+                                inner.need_password = true;
+                                inner.data_dir = cfg.data_dir.clone();
+                                // app_data 在此处 drop，释放对 apphandle 的借用
+                            }
 
-                // 主事件循环 — 直接等待消息，无需心跳
-                while let Some(msg) = rx.recv().await {
-                    match msg {
-                        MessageEvent::Log(data) => {
-                            app_handle_for_events.emit("log", data).ok();
-                        }
-                        MessageEvent::ReceiveMessage(data) => {
-                            app_handle_for_events.emit("chat-message", data).ok();
-                        }
-                        MessageEvent::Warning(data) => {
-                            app_handle_for_events.emit("warning", data).ok();
-                        }
-                        MessageEvent::Error(data) => {
-                            app_handle_for_events.emit("error", data).ok();
-                        }
-                        MessageEvent::FileTransferProgress(progress) => {
-                            // 文件传输进度事件，data 是 FileTransferProgress 结构体
-                            // Tauri 自动序列化为 JSON 发送到前端
-                            app_handle_for_events
-                                .emit("file-transfer-progress", progress)
-                                .ok();
+                            // 发送 need-password 事件给前端
+                            apphandle.emit("need-password", true).ok();
+                            tracing::info!("已发送 need-password 事件，等待前端输入密码...");
+
+                            // 轮询等待密码被设置（最多等待 5 分钟）
+                            let poll_interval = std::time::Duration::from_millis(500);
+                            let max_attempts = 600;
+                            for _ in 0..max_attempts {
+                                tokio::time::sleep(poll_interval).await;
+                                let (passwd, still_needed) = {
+                                    let app_data = apphandle.state::<AppData>();
+                                    let inner = app_data.inner.read().await;
+                                    let passwd = inner.passwd.clone();
+                                    let still_needed = inner.need_password;
+                                    drop(inner);
+                                    drop(app_data);
+                                    (passwd, still_needed)
+                                };
+
+                                if !still_needed && passwd.is_some() {
+                                    tracing::info!("密码已设置，重试 Core 初始化...");
+                                    cfg.passwd = passwd;
+                                    match chat_core::ChatCore::try_init(cfg.clone()).await {
+                                        Ok(chat_core_instance) => {
+                                            setup_core_and_event_loop(
+                                                chat_core_instance,
+                                                cfg,
+                                                apphandle,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        Err(e2) => {
+                                            tracing::error!("重试 Core 初始化仍然失败: {}", e2);
+                                            apphandle
+                                                .emit("warning", format!("密码验证失败: {}", e2))
+                                                .ok();
+                                            // 重置 need_password 让前端可以再次输入
+                                            {
+                                                let app_data = apphandle.state::<AppData>();
+                                                let mut inner = app_data.inner.write().await;
+                                                inner.need_password = true;
+                                            }
+                                            apphandle.emit("need-password", true).ok();
+                                        }
+                                    }
+                                }
+                            }
+
+                            tracing::error!("等待密码超时，Core 初始化失败");
                         }
                     }
                 }
@@ -645,7 +915,10 @@ pub fn run() {
             set_download_dir,
             get_download_dir,
             load_messages,
-            get_identity_qr_data
+            get_identity_qr_data,
+            set_password,
+            retry_init,
+            is_keyring_available
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

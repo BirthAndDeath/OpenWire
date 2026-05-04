@@ -17,7 +17,7 @@ pub fn generate_temporary_peerid() -> anyhow::Result<identity::Keypair> {
 /// - **ML-KEM 公钥**：临时密钥交换，每次会话重新生成，不持久化存储
 /// - **PeerID（Ed25519）**：临时传输层标识，每次启动重新生成
 pub async fn generate_complete_identity(
-    _cfg: &CoreConfig,
+    cfg: &CoreConfig,
 ) -> anyhow::Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     let pool = storage::pool().ok_or_else(|| anyhow::anyhow!("Database not initialized"))?;
 
@@ -31,21 +31,17 @@ pub async fn generate_complete_identity(
         identity_id
     );
 
-    // 2. 保存 ML-DSA 私钥到安全存储 (强制要求 Keyring)
+    // 2. 保存 ML-DSA 私钥到安全存储
     // 使用 Zeroizing 包装临时副本，确保保存后 drop 时自动清零内存
     let mldsa_secret_key = Zeroizing::new(mldsa_secret_key);
-    let (_handle, backend) = rootcell::identity::PrivateKeyHandle::save(
+    let data_dir = cfg.data_dir.to_string_lossy().to_string();
+    let (_handle, _backend) = rootcell::identity::PrivateKeyHandle::save(
+        &data_dir,
         &format!("{}_mldsa", identity_id),
         &mldsa_secret_key,
     )?;
 
-    if backend != rootcell::identity::StorageBackend::Keyring {
-        return Err(anyhow::anyhow!(
-            "Failed to save ML-DSA private key to Keyring. Please ensure a system keyring service is available."
-        ));
-    }
-
-    tracing::info!("ML-DSA private key saved to keyring for {}", identity_id);
+    tracing::info!("ML-DSA private key saved for {}", identity_id);
 
     // Zeroizing 的 drop 会自动清零内存，无需手动 drop
 
@@ -55,18 +51,13 @@ pub async fn generate_complete_identity(
     // 4. 保存 ML-KEM 私钥到安全存储（临时会话密钥，仍需要安全存储但生命周期短）
     // 使用 Zeroizing 包装临时副本，确保保存后 drop 时自动清零内存
     let mlkem_secret_key = Zeroizing::new(mlkem_secret_key);
-    let (_handle, backend) = rootcell::identity::PrivateKeyHandle::save(
+    let (_handle, _backend) = rootcell::identity::PrivateKeyHandle::save(
+        &data_dir,
         &format!("{}_mlkem", identity_id),
         &mlkem_secret_key,
     )?;
 
-    if backend != rootcell::identity::StorageBackend::Keyring {
-        return Err(anyhow::anyhow!(
-            "Failed to save ML-KEM private key to Keyring. Please ensure a system keyring service is available."
-        ));
-    }
-
-    tracing::info!("ML-KEM private key saved to keyring for {}", identity_id);
+    tracing::info!("ML-KEM private key saved for {}", identity_id);
 
     // Zeroizing 的 drop 会自动清零内存，无需手动 drop
 
@@ -102,7 +93,12 @@ pub async fn load_or_generate_complete_identity(
         tracing::debug!("ML-DSA private key storage diagnosis:\n{}", mldsa_diagnosis);
 
         // 尝试从存储加载 ML-DSA 私钥（只调用一次 Keyring，避免重复 Keyring 访问）
-        match rootcell::identity::PrivateKeyHandle::load(&format!("{}_mldsa", identity_id)) {
+        let data_dir = cfg.data_dir.to_string_lossy().to_string();
+        match rootcell::identity::PrivateKeyHandle::load(
+            &data_dir,
+            &format!("{}_mldsa", identity_id),
+            cfg.passwd.as_deref(),
+        ) {
             Ok(mldsa_handle) => {
                 tracing::info!("Successfully loaded ML-DSA private key for {}", identity_id);
 
@@ -117,6 +113,7 @@ pub async fn load_or_generate_complete_identity(
                 // 使用 Zeroizing 包装临时副本，确保保存后 drop 时自动清零内存
                 let mlkem_secret_key = Zeroizing::new(mlkem_secret_key);
                 rootcell::identity::PrivateKeyHandle::save(
+                    &data_dir,
                     &format!("{}_mlkem", identity_id),
                     &mlkem_secret_key,
                 )?;

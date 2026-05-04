@@ -332,12 +332,24 @@ impl ChatCore {
 
         for msg in &pending_msgs {
             // 根据消息内容检测类型
-            // 注意：chat_core 不依赖 serde_json，使用简单字符串匹配判断
-            // file_hash 消息格式为 {"type":"file_hash","file_hash":"...","filename":"...",...}
-            let msgtype = if msg.content.contains(r#""type":"file_hash""#)
-                || msg.content.contains(r#""file_hash":"#)
-            {
-                ChatMessageType::FileHash
+            // 存储格式（见 save_pending_message）：
+            //   Text 类型：直接存文本内容
+            //   其他类型：[msgtype] hex(data)
+            let msgtype = if let Some(stripped) = msg.content.strip_prefix('[') {
+                if let Some(rest) = stripped.split(']').next() {
+                    match rest.parse::<u8>() {
+                        Ok(n) if n == ChatMessageType::FileHash as u8 => ChatMessageType::FileHash,
+                        Ok(n) if n == ChatMessageType::FileDownloadRequest as u8 => {
+                            ChatMessageType::FileDownloadRequest
+                        }
+                        Ok(n) if n == ChatMessageType::FileStream as u8 => {
+                            ChatMessageType::FileStream
+                        }
+                        _ => ChatMessageType::Text,
+                    }
+                } else {
+                    ChatMessageType::Text
+                }
             } else {
                 ChatMessageType::Text
             };

@@ -12,6 +12,8 @@
   } from "../../lib/settings";
   import { open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { invoke } from "@tauri-apps/api/core";
+  import PasswordInput from "../../lib/PasswordInput.svelte";
 
   // 语言选项
   const languages = [
@@ -41,6 +43,10 @@
   // 截屏保护
   let screenshotProtection = $state(false);
 
+  // Keyring 可用性（隔离层检查）
+  let keyringAvailable = $state(false);
+  let keyringCheckDone = $state(false);
+
   // 等待全局状态初始化完成
   $effect(() => {
     // 订阅 theme store，当它有值时说明已初始化
@@ -60,6 +66,16 @@
     async function loadSettings() {
       // 确保 settings store 已初始化，否则 getSetting 会返回 undefined
       await initSettingsStore();
+
+      // 检查 Keyring 可用性（隔离层）
+      try {
+        keyringAvailable = await invoke<boolean>("is_keyring_available");
+        keyringCheckDone = true;
+        console.log("Keyring available:", keyringAvailable);
+      } catch (e) {
+        console.error("检查 Keyring 可用性失败:", e);
+        keyringCheckDone = true;
+      }
 
       // 获取下载目录（前端持久化存储）
       try {
@@ -264,6 +280,29 @@
           </button>
         </div>
       </section>
+
+      <!-- 密码设置（仅 Keyring 不可用时显示） -->
+      {#if keyringCheckDone && !keyringAvailable}
+        <section class="settings-section">
+          <h2>{$_("password_settings")}</h2>
+          <p class="section-desc">
+            {$_("password_settings_desc")}
+          </p>
+          <PasswordInput />
+        </section>
+      {:else if keyringCheckDone && keyringAvailable}
+        <!-- Keyring 可用时显示提示信息 -->
+        <section class="settings-section">
+          <h2>{$_("password_settings")}</h2>
+          <p class="section-desc">
+            {$_("password_settings_desc")}
+          </p>
+          <div class="keyring-available-note">
+            <span class="keyring-icon">🔑</span>
+            <span>{$_("keyring_available_note")}</span>
+          </div>
+        </section>
+      {/if}
     </main>
   </div>
 {/if}
@@ -334,6 +373,13 @@
     color: var(--text-primary, #fafafa);
     border-bottom: 1px solid var(--border-color, #2a2a2a);
     padding-bottom: 8px;
+  }
+
+  .section-desc {
+    font-size: 13px;
+    color: var(--text-secondary, #737373);
+    margin: -8px 0 16px 0;
+    line-height: 1.5;
   }
 
   .language-selector,
@@ -511,5 +557,24 @@
 
   .toggle-button.active .toggle-knob {
     transform: translateX(22px);
+  }
+
+  /* Keyring 可用提示 */
+  .keyring-available-note {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.2);
+    border-radius: 8px;
+    font-size: 13px;
+    color: #10b981;
+    line-height: 1.5;
+  }
+
+  .keyring-icon {
+    font-size: 20px;
+    flex-shrink: 0;
   }
 </style>

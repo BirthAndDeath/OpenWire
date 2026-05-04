@@ -149,8 +149,8 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
             // 更新在线连接计数
             core.connected_peers.insert(peer_id);
             let count = core.connected_peers.len();
-            let status_msg = format!(r#"{{"type":"online_status","count":{}}}"#, count,);
-            core.send_message_mpsc(status_msg).await;
+            core.send_message_mpsc(crate::command::IncomingMessage::OnlineStatus { count })
+                .await;
             // 有新连接建立时，尝试重发待发送消息
             let cmd_tx = core.core_handle.cmd_tx.clone();
             let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
@@ -161,8 +161,8 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
             tracing::info!("Connection closed with {}", peer_id);
             core.connected_peers.remove(&peer_id);
             let count = core.connected_peers.len();
-            let status_msg = format!(r#"{{"type":"online_status","count":{}}}"#, count,);
-            core.send_message_mpsc(status_msg).await;
+            core.send_message_mpsc(crate::command::IncomingMessage::OnlineStatus { count })
+                .await;
 
             // === Re-dial on connection closed ===
             // Look up known multiaddrs from DHT and attempt to re-establish the connection.
@@ -717,14 +717,17 @@ async fn handle_decrypted_message(
     };
 
     // 从安全存储中获取 ML-KEM 私钥
-    let private_key_handle =
-        match rootcell::identity::PrivateKeyHandle::load(&format!("{}_mlkem", identity_id)) {
-            Ok(handle) => handle,
-            Err(e) => {
-                tracing::warn!("获取 ML-KEM 私钥失败: {}", e);
-                return;
-            }
-        };
+    let private_key_handle = match rootcell::identity::PrivateKeyHandle::load(
+        &core.data_dir.to_string_lossy(),
+        &format!("{}_mlkem", identity_id),
+        None,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!("获取 ML-KEM 私钥失败: {}", e);
+            return;
+        }
+    };
 
     let private_key_bytes = private_key_handle.get_private_key();
 
@@ -814,13 +817,12 @@ async fn handle_text_message(
                 }
             }
 
-            // 发送结构化 JSON 消息，包含发送方信息供前端按联系人过滤
-            let json_msg = format!(
-                r#"{{"type":"text","text":"{}","sender":"{}"}}"#,
-                text.replace('\\', "\\\\").replace('"', "\\\""),
-                sender_mldsa_pubkey_hex,
-            );
-            core.send_message_mpsc(json_msg).await;
+            // 发送结构化消息（枚举），上层负责序列化为 JSON
+            core.send_message_mpsc(crate::command::IncomingMessage::Text {
+                text,
+                sender: sender_mldsa_pubkey_hex.to_string(),
+            })
+            .await;
         }
         Err(e) => {
             tracing::warn!("解密后的消息不是合法 UTF-8: {}", e);
@@ -844,19 +846,17 @@ async fn handle_file_hash_message(
                 file_info.file_hash,
             );
 
-            // 传递结构化文本（非 JSON），上层负责解析并构建 JSON 供前端渲染
-            // 格式: [FileShare] filename|file_id|file_hash|total_size|sender
+            // 发送结构化消息（枚举），上层负责序列化为 JSON
             let file_id_hex = hex::encode(file_info.file_id);
             let file_hash_hex = hex::encode(file_info.file_hash);
-            let structured_msg = format!(
-                "[FileShare] {}|{}|{}|{}|{}",
-                file_info.filename,
-                file_id_hex,
-                file_hash_hex,
-                file_info.total_size,
-                sender_mldsa_pubkey_hex,
-            );
-            core.send_message_mpsc(structured_msg).await;
+            core.send_message_mpsc(crate::command::IncomingMessage::FileShare {
+                filename: file_info.filename,
+                file_id: file_id_hex,
+                file_hash: file_hash_hex,
+                total_size: file_info.total_size,
+                sender: sender_mldsa_pubkey_hex.to_string(),
+            })
+            .await;
         }
         Err(e) => {
             tracing::warn!("解析 FileHashInfo 失败: {}", e);
@@ -1180,11 +1180,13 @@ async fn handle_delivery_receipt(
                             } else {
                                 tracing::info!("消息 {} 已通过送达回执标记为已发送", msg.id);
                                 // 通知 UI 消息已送达
-                                let delivery_notice = format!(
-                                    r#"{{"type":"delivery_receipt","message_hash":"{}","peer_id":"{}"}}"#,
-                                    receipt_msg_hash, msg.peer_pubkey_hex,
-                                );
-                                core.send_message_mpsc(delivery_notice).await;
+                                core.send_message_mpsc(
+                                    crate::command::IncomingMessage::DeliveryReceipt {
+                                        message_hash: receipt_msg_hash.clone(),
+                                        peer_id: msg.peer_pubkey_hex.clone(),
+                                    },
+                                )
+                                .await;
                             }
                             break;
                         }

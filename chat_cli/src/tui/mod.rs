@@ -1,5 +1,5 @@
 use anyhow::Context;
-use chat_core::{ChatCommand, MessageEvent};
+use chat_core::{IncomingMessage, MessageEvent};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
@@ -33,45 +33,23 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
             msg = rx.recv() => {
                 if let Some(msg) = msg {
                     match msg {
-                        MessageEvent::ReceiveMessage(text) => {
-                            // 尝试解析 JSON 消息（新格式包含 sender 信息），失败则作为纯文本显示
-                            if text.starts_with('{') {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("text");
-                                    match msg_type {
-                                        "delivery_receipt" => {
-                                            // 送达回执：在对应联系人的消息列表中添加送达通知
-                                            if let Some(peer_id) = parsed.get("peer_id").and_then(|v| v.as_str()) {
-                                                app.push_message_to(peer_id, "[系统] 消息已送达 ✓".to_string());
-                                            }
-                                            should_render = true;
-                                            continue;
-                                        }
-                                        "online_status" => {
-                                            // 在线状态更新
-                                            if let Some(count) = parsed.get("count").and_then(|v| v.as_u64()) {
-                                                app.online_peers = count as usize;
-                                            }
-                                            should_render = true;
-                                            continue;
-                                        }
-                                        _ => {
-                                            // 普通消息
-                                            let txt = parsed.get("text").and_then(|v| v.as_str()).unwrap_or(&text).to_string();
-                                            let sender = parsed.get("sender").and_then(|v| v.as_str()).map(|s| s.to_string());
-                                            if let Some(sender) = sender {
-                                                app.push_message_to(&sender, format!("[对方] {}", txt));
-                                            } else {
-                                                app.push_message(format!("[网络] {}", txt));
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    app.push_message(format!("[网络] {}", text));
+                        MessageEvent::ReceiveMessage(msg) => {
+                            match msg {
+                                IncomingMessage::Text { text, sender } => {
+                                    app.push_message_to(&sender, format!("[对方] {}", text));
                                 }
-                            } else {
-                                app.push_message(format!("[网络] {}", text));
+                                IncomingMessage::FileShare { filename, file_id, total_size, sender, .. } => {
+                                    app.push_message_to(&sender, format!("[文件] {} ({} bytes, id={})", filename, total_size, &file_id[..16]));
+                                }
+                                IncomingMessage::DeliveryReceipt { peer_id, .. } => {
+                                    app.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
+                                }
+                                IncomingMessage::OnlineStatus { count } => {
+                                    app.online_peers = count;
+                                }
                             }
+                            should_render = true;
+                            continue;
                         }
                         MessageEvent::FileTransferProgress(progress) => {
                             app.push_message(format!(

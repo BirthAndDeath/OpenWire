@@ -1,5 +1,5 @@
 use crate::App;
-use chat_core::ChatCommand;
+use chat_core::IncomingMessage;
 use chat_core::MessageEvent;
 use chat_core::storage;
 use chat_core::validate_mldsa_pubkey_hex;
@@ -27,29 +27,39 @@ pub async fn no_tui_run(app: &mut App) -> anyhow::Result<()> {
         let mut rx = rx;
         while let Some(msg) = rx.recv().await {
             match msg {
-                MessageEvent::ReceiveMessage(data) => {
-                    // 尝试解析 JSON 消息（新格式包含 sender 信息），失败则作为纯文本显示
-                    if data.starts_with('{') {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let msg_type = parsed
-                                .get("type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("text");
-                            if msg_type == "delivery_receipt" {
-                                // 送达回执
-                                println!("[系统] 消息已送达 ✓");
-                                continue;
-                            }
-                            let display_text =
-                                parsed.get("text").and_then(|v| v.as_str()).unwrap_or(&data);
-                            println!("[网络] {display_text}");
+                MessageEvent::ReceiveMessage(incoming) => match incoming {
+                    IncomingMessage::Text { text, sender } => {
+                        let short_sender = if sender.len() > 16 {
+                            format!("{}...", &sender[..16])
                         } else {
-                            println!("[网络] {data}");
-                        }
-                    } else {
-                        println!("[网络] {data}");
+                            sender.clone()
+                        };
+                        println!("[{}] {}", short_sender, text);
                     }
-                }
+                    IncomingMessage::FileShare {
+                        filename,
+                        file_id,
+                        total_size,
+                        sender,
+                        ..
+                    } => {
+                        let short_sender = if sender.len() > 16 {
+                            format!("{}...", &sender[..16])
+                        } else {
+                            sender.clone()
+                        };
+                        println!(
+                            "[文件] {} 向你分享文件: {} ({} bytes, id: {})",
+                            short_sender, filename, total_size, file_id
+                        );
+                    }
+                    IncomingMessage::DeliveryReceipt { peer_id, .. } => {
+                        println!("[系统] 消息已送达 ✓ (from: {})", peer_id);
+                    }
+                    IncomingMessage::OnlineStatus { count } => {
+                        println!("[系统] 当前在线: {} 个连接", count);
+                    }
+                },
                 MessageEvent::Log(data) => {
                     println!("[日志] {data}");
                 }
