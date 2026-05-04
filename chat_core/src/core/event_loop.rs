@@ -1,7 +1,7 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt;
+use redb::Database;
 use tokio::sync::mpsc;
 
 use crate::{command::ChatCommand, core::ChatCore, p2p};
@@ -91,12 +91,19 @@ impl ChatCore {
     /// 启动 DHT 定期注册后台任务
     fn spawn_dht_registration(&self, rt_handle: &tokio::runtime::Handle) {
         let cmd_tx = self.core_handle.cmd_tx.clone();
-        let data_dir = self.data_dir.clone();
+        // 使用 ChatCore 中已打开的 DHT 数据库连接，避免重复打开导致文件锁冲突
+        let db = match self.dht_db.clone() {
+            Some(db) => db,
+            None => {
+                tracing::error!("DHT database not initialized, DHT registration disabled");
+                return;
+            }
+        };
 
         let handle = rt_handle.clone();
         tokio::task::spawn_blocking(move || {
             handle.block_on(async move {
-                Self::dht_registration_loop(cmd_tx, data_dir).await;
+                Self::dht_registration_loop(cmd_tx, db).await;
             });
         });
     }
@@ -105,20 +112,12 @@ impl ChatCore {
     ///
     /// 每次 tick 从 DHT 数据库读取最新的身份信息，确保身份切换后能立即使用新身份。
     /// 不再通过闭包捕获身份字段，避免 select_identity 后使用旧值。
+    /// 使用传入的 `Arc<Database>` 而非重新打开文件，避免 `redb` 文件锁冲突。
     pub(crate) async fn dht_registration_loop(
         cmd_tx: mpsc::Sender<ChatCommand>,
-        data_dir: PathBuf,
+        db: Arc<Database>,
     ) {
         use crate::core::DHT_REGISTRATION_INTERVAL_SECS;
-
-        let dht_path = data_dir.join("dht.redb");
-        let db = match redb::Database::create(&dht_path) {
-            Ok(db) => Arc::new(db),
-            Err(e) => {
-                tracing::error!("Failed to open DHT database: {}", e);
-                return;
-            }
-        };
 
         const CACHE_CLEANUP_INTERVAL: u64 = 6;
         let mut tick_count = 0u64;
@@ -162,9 +161,10 @@ impl ChatCore {
 
                 // 4. 发布 ML-KEM 公钥
                 if let Some(ref mlkem) = mlkem_hex
-                    && let Err(e) = store.set_mlkem_pubkey(pubkey, mlkem) {
-                        tracing::warn!("Failed to publish ML-KEM pubkey: {}", e);
-                    }
+                    && let Err(e) = store.set_mlkem_pubkey(pubkey, mlkem)
+                {
+                    tracing::warn!("Failed to publish ML-KEM pubkey: {}", e);
+                }
 
                 // 5. 通过命令通道请求发布到 Kademlia 网络
                 if let Err(e) = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {

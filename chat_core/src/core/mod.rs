@@ -157,15 +157,12 @@ impl ChatCore {
         }
 
         // 初始化 DHT 数据库连接（缓存，避免每次发送消息都打开/关闭）
+        // 注意：必须成功创建，否则后续 send_text 等操作会失败
         let dht_db = {
             let dht_path = cfg.data_dir.join("dht.redb");
-            match redb::Database::create(&dht_path) {
-                Ok(db) => Some(Arc::new(db)),
-                Err(e) => {
-                    tracing::warn!("Failed to open DHT database for caching: {}", e);
-                    None
-                }
-            }
+            let db = redb::Database::create(&dht_path)
+                .map_err(|e| anyhow::anyhow!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))?;
+            Some(Arc::new(db))
         };
 
         Ok(ChatCore {
