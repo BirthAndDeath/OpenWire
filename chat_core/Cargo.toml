@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+thiserror = "2"
 libp2p = { workspace = true }
 anyhow = "1.0.102"
 futures = "0.3.32"
@@ -22,11 +23,6 @@ aes-gcm = "0.10.3"
 aws-lc-rs = { version = "1.16", features = ["unstable"] }
 
 
-keyring = { version = "3.6.3", features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-] }
 hex = "0.4.3"
 blake3 = "1.8.4"
 rand = "0.10.1"
@@ -35,7 +31,7 @@ lru = "0.18.0"
 redb = "4.0.0"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 async-compression = { version = "0.4.42", features = ["futures-io", "zstd"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+keyring = { version = "4.0.0" }
 [package.metadata.docs.rs]
 #no-deps = true

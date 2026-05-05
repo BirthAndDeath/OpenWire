@@ -183,6 +183,19 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
                 app.message_list_state.select(Some(msg_count - 1));
             }
         }
+        // Esc: 取消添加联系人/文件发送模式，或退出输入框
+        KeyCode::Esc => {
+            if app.add_contact_mode {
+                app.add_contact_mode = false;
+                app.status_message = "已取消添加联系人".to_string();
+            } else if app.file_send_mode {
+                app.file_send_mode = false;
+                app.status_message = "已取消文件发送".to_string();
+            } else {
+                app.current_focus = Focus::SidebarArea;
+            }
+            app.input.clear();
+        }
         KeyCode::Char(c) => app.input.push(c),
         KeyCode::Backspace => {
             app.input.pop();
@@ -311,7 +324,7 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
             if let Some(i) = app.identity_list_state.selected()
                 && let Some(identity) = app.identities.get(i)
             {
-                let copy_text = format!("ML-DSA公钥(身份ID): {}", identity.identity_id);
+                let copy_text = identity.identity_id.clone();
 
                 // 使用复用的剪贴板实例
                 let copied = copy_to_clipboard(app, &copy_text);

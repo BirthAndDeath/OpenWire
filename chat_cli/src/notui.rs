@@ -56,10 +56,10 @@ pub async fn no_tui_run(app: &mut App) -> anyhow::Result<()> {
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
                         println!("[系统] 消息已送达 ✓ (from: {})", peer_id);
                     }
-                    IncomingMessage::OnlineStatus { count } => {
-                        println!("[系统] 当前在线: {} 个连接", count);
-                    }
                 },
+                MessageEvent::OnlineStatus { count } => {
+                    println!("[系统] 当前在线: {} 个连接", count);
+                }
                 MessageEvent::Log(data) => {
                     println!("[日志] {data}");
                 }

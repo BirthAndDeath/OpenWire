@@ -14,12 +14,6 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # 错误处理
 anyhow = "1.0"
 
-# Keyring支持
-keyring = { version = "3.6.3", features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-] }
 
 # Hex编码
 hex = "0.4.3"
@@ -35,6 +29,8 @@ rand = "0.10.1"
 # 密码 KDF（Argon2id）
 argon2 = "0.5.3"
 
+keyring = { version = "4.0.0" }
+keyring-core = "1.0.0"
 # Unix mlock支持
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
@@ -42,13 +38,3 @@ libc = "0.2.186"
 # Windows VirtualLock支持
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
-
-
-# 异步运行时（测试用）
-tokio = { version = "1.52", features = [
-    "rt-multi-thread",
-    "macros",
-], optional = true }
-
-[dev-dependencies]
-# tokio = { version = "1.52", features = ["rt-multi-thread", "macros"] }  # 未使用，删除

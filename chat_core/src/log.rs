@@ -5,7 +5,7 @@ use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt};
-//✅稳定中
+//✅稳定中，已复查 注意:用户应当保护好自己的日志文件，避免泄露敏感信息。日志路径应当设置在安全的位置，并且权限应当正确配置以防止未授权访问。
 // 标记是否已初始化
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 // 文件日志 guard（仅在文件日志模式下持有）
@@ -85,11 +85,8 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGua
     std::fs::create_dir_all(path).expect("Failed to create log directory");
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
 
-    // 使用 tracing_appender 的滚动文件写入器，按日期轮转，保留 7 天日志
-    // 日志文件格式: chat.log.YYYY-MM-DD
-    // 当日志文件达到指定日期时自动创建新文件
     let file_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY) // 按天轮转
+        .rotation(Rotation::HOURLY) // 按小时轮转
         .filename_prefix("chat") // 文件名前缀
         .max_log_files(MAX_LOG_FILES)
         .build(&safe_path)

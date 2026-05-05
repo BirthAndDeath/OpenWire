@@ -5,6 +5,7 @@ edition = "2024"
 
 
 [dependencies]
+thiserror = "2"
 chat_core = { workspace = true }
 tokio = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
