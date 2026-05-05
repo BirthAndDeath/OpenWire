@@ -1,5 +1,6 @@
 <script lang="ts">
     import { VList } from "virtua/svelte";
+    import { invoke } from "@tauri-apps/api/core";
 
     interface Contact {
         order: number;
@@ -17,15 +18,24 @@
         selectedId = null,
         onselect,
         onctx,
+        ondelete,
     }: {
         contacts: Contact[];
         selectedId: string | null;
         onselect?: (id: string) => void;
         onctx?: (e: MouseEvent, id: string) => void;
+        ondelete?: (id: string) => void;
     } = $props();
 
     let q = $state("");
     let list = $state<any>(undefined);
+
+    // 右键菜单状态
+    let contextMenu = $state<{
+        x: number;
+        y: number;
+        contactId: string;
+    } | null>(null);
 
     let filtered = $derived(
         contacts
@@ -47,7 +57,43 @@
             ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
             : d.toLocaleDateString([], { month: "short", day: "numeric" });
     };
+
+    // 右键点击处理
+    const handleContextMenu = (e: MouseEvent, id: string) => {
+        e.preventDefault();
+        contextMenu = { x: e.clientX, y: e.clientY, contactId: id };
+        onctx?.(e, id);
+    };
+
+    // 关闭右键菜单
+    const closeContextMenu = () => {
+        contextMenu = null;
+    };
+
+    // 删除联系人
+    const handleDeleteContact = async (id: string) => {
+        closeContextMenu();
+        try {
+            await invoke("delete_contact", { mldsaPubkeyHex: id });
+            ondelete?.(id);
+        } catch (e) {
+            console.warn("删除联系人失败:", e);
+        }
+    };
+
+    // 删除按钮点击（阻止事件冒泡，避免触发联系人选择）
+    const handleDeleteBtnClick = (e: MouseEvent, id: string) => {
+        e.stopPropagation();
+        handleDeleteContact(id);
+    };
+
+    // 点击其他地方关闭右键菜单
+    const handleWindowClick = () => {
+        if (contextMenu) closeContextMenu();
+    };
 </script>
+
+<svelte:window onclick={handleWindowClick} />
 
 <div class="list">
     <div class="search">
@@ -92,48 +138,76 @@
                 getKey={(c) => c.pubkey_hex}
             >
                 {#snippet children(c)}
-                    <button
-                        type="button"
-                        class="item"
+                    <div
+                        class="item-wrap"
                         class:sel={selectedId === c.pubkey_hex}
-                        class:online={c.online}
-                        onclick={() => select(c.pubkey_hex)}
-                        oncontextmenu={(e) => (
-                            e.preventDefault(), onctx?.(e, c.pubkey_hex)
-                        )}
-                        aria-label={`选择联系人 ${c.name}`}
                     >
-                        <div class="avatar">
-                            {#if c.avatar}<img
-                                    src={c.avatar}
-                                    alt={c.name}
-                                />{:else}
-                                <div class="fallback">
-                                    {c.name.slice(0, 2).toUpperCase()}
-                                </div>
-                            {/if}
-                            {#if c.online}<span class="dot"></span>{/if}
-                        </div>
-
-                        <div class="info">
-                            <div class="row">
-                                <span class="name">{c.name}</span>
-                                {#if c.lastTime}<span class="time"
-                                        >{fmtTime(c.lastTime)}</span
-                                    >{/if}
+                        <button
+                            type="button"
+                            class="item"
+                            class:sel={selectedId === c.pubkey_hex}
+                            class:online={c.online}
+                            onclick={() => select(c.pubkey_hex)}
+                            oncontextmenu={(e) =>
+                                handleContextMenu(e, c.pubkey_hex)}
+                            aria-label={`选择联系人 ${c.name}`}
+                        >
+                            <div class="avatar">
+                                {#if c.avatar}<img
+                                        src={c.avatar}
+                                        alt={c.name}
+                                    />{:else}
+                                    <div class="fallback">
+                                        {c.name.slice(0, 2).toUpperCase()}
+                                    </div>
+                                {/if}
+                                {#if c.online}<span class="dot"></span>{/if}
                             </div>
-                            {#if c.lastMsg}<p
-                                    class="msg"
-                                    class:unread={c.unread > 0}
-                                >
-                                    {c.lastMsg}
-                                </p>{/if}
-                        </div>
 
-                        {#if c.unread > 0}<span class="badge"
-                                >{c.unread > 99 ? "99+" : c.unread}</span
-                            >{/if}
-                    </button>
+                            <div class="info">
+                                <div class="row">
+                                    <span class="name">{c.name}</span>
+                                    {#if c.lastTime}<span class="time"
+                                            >{fmtTime(c.lastTime)}</span
+                                        >{/if}
+                                </div>
+                                {#if c.lastMsg}<p
+                                        class="msg"
+                                        class:unread={c.unread > 0}
+                                    >
+                                        {c.lastMsg}
+                                    </p>{/if}
+                            </div>
+
+                            {#if c.unread > 0}<span class="badge"
+                                    >{c.unread > 99 ? "99+" : c.unread}</span
+                                >{/if}
+                        </button>
+                        <button
+                            type="button"
+                            class="delete-btn"
+                            onclick={(e) =>
+                                handleDeleteBtnClick(e, c.pubkey_hex)}
+                            aria-label={`删除联系人 ${c.name}`}
+                            title="删除联系人"
+                        >
+                            <svg
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="2"
+                            >
+                                <polyline points="3 6 5 6 21 6" />
+                                <path
+                                    d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+                                />
+                                <line x1="10" y1="11" x2="10" y2="17" />
+                                <line x1="14" y1="11" x2="14" y2="17" />
+                            </svg>
+                        </button>
+                    </div>
                 {/snippet}
             </VList>
         {/if}
@@ -141,6 +215,40 @@
 
     <div class="foot">{filtered.length} 位联系人</div>
 </div>
+
+<!-- 右键菜单 -->
+{#if contextMenu}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+        class="context-menu"
+        style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
+        onclick={() => {}}
+        onkeydown={() => {}}
+    >
+        <button
+            class="context-menu-item danger"
+            onclick={() =>
+                contextMenu && handleDeleteContact(contextMenu.contactId)}
+        >
+            <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+            >
+                <polyline points="3 6 5 6 21 6" />
+                <path
+                    d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+                />
+                <line x1="10" y1="11" x2="10" y2="17" />
+                <line x1="14" y1="11" x2="14" y2="17" />
+            </svg>
+            删除联系人
+        </button>
+    </div>
+{/if}
 
 <style>
     .list {
@@ -207,6 +315,21 @@
         font-size: 14px;
     }
 
+    .item-wrap {
+        position: relative;
+        display: flex;
+        align-items: center;
+        border-radius: 10px;
+        transition: background 0.15s;
+    }
+    .item-wrap:hover {
+        background: var(--bg-tertiary, #1a1a1a);
+    }
+    .item-wrap:hover .delete-btn {
+        opacity: 1;
+        visibility: visible;
+    }
+
     .item {
         display: flex;
         align-items: center;
@@ -219,15 +342,44 @@
         border: none;
         width: 100%;
         text-align: left;
+        flex: 1;
+        min-width: 0;
     }
     .item:hover {
-        background: var(--bg-tertiary, #1a1a1a);
+        background: transparent;
     }
+    .item-wrap.sel,
     .item.sel {
         background: #1e3a5f;
     }
     .item.sel .name {
         color: #3b82f6;
+    }
+
+    .delete-btn {
+        opacity: 0;
+        visibility: hidden;
+        position: absolute;
+        right: 8px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 32px;
+        height: 32px;
+        display: grid;
+        place-items: center;
+        background: var(--bg-secondary, #1a1a2e);
+        border: 1px solid var(--border-color, #2a2a2a);
+        border-radius: 8px;
+        color: var(--text-secondary, #737373);
+        cursor: pointer;
+        transition: all 0.15s;
+        z-index: 2;
+        padding: 0;
+    }
+    .delete-btn:hover {
+        color: #ef4444;
+        background: rgba(239, 68, 68, 0.1);
+        border-color: rgba(239, 68, 68, 0.3);
     }
 
     .avatar {
@@ -313,5 +465,45 @@
         border-top: 1px solid var(--border-color, #2a2a2a);
         font-size: 12px;
         color: var(--text-secondary, #525252);
+    }
+
+    /* 右键菜单样式 */
+    .context-menu {
+        position: fixed;
+        z-index: 1000;
+        background: var(--bg-secondary, #1a1a2e);
+        border: 1px solid var(--border-color, #2a2a2a);
+        border-radius: 8px;
+        padding: 4px;
+        min-width: 160px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+        backdrop-filter: blur(10px);
+    }
+    .context-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 8px 12px;
+        border: none;
+        background: transparent;
+        color: var(--text-primary, #fafafa);
+        font-size: 13px;
+        cursor: pointer;
+        border-radius: 6px;
+        text-align: left;
+        transition: background 0.15s;
+    }
+    .context-menu-item:hover {
+        background: var(--bg-tertiary, #2a2a2a);
+    }
+    .context-menu-item.danger {
+        color: #ef4444;
+    }
+    .context-menu-item.danger:hover {
+        background: rgba(239, 68, 68, 0.1);
+    }
+    .context-menu-item svg {
+        flex-shrink: 0;
     }
 </style>

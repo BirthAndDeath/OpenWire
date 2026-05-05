@@ -1,4 +1,5 @@
 use chat_cli::App;
+use chat_cli::error::CliResult;
 use chat_cli::notui::no_tui_run;
 use chat_cli::tui::tui_run;
 use chat_cli::use_json::json_run;
@@ -20,7 +21,7 @@ pub struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> CliResult<()> {
     let args = Cli::parse();
 
     let mut app: App = App::try_init(args.password.as_deref()).await?;

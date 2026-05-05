@@ -25,7 +25,7 @@ const MAX_LOG_FILES: usize = 7; // 保留最近7个日志文件
 /// # 返回值
 /// * `Ok(())` - 初始化成功或已经初始化
 /// * `Err(anyhow::Error)` - 初始化失败（仅在第一次调用时可能失败）
-pub fn init_logger(cfg: &CoreConfig) -> anyhow::Result<()> {
+pub fn init_logger(cfg: &CoreConfig) -> crate::error::LogResult<()> {
     // 防止重复初始化
     if LOGGER_INIT.set(()).is_err() {
         tracing::debug!("Logger already initialized, skipping");
@@ -55,7 +55,7 @@ pub fn init_logger(cfg: &CoreConfig) -> anyhow::Result<()> {
 /// # 返回值
 /// * `Ok(EnvFilter)` - 成功构建的环境过滤器
 /// * `Err(anyhow::Error)` - 过滤器构建失败
-fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
+fn build_filter(level: Option<&str>) -> crate::error::LogResult<EnvFilter> {
     EnvFilter::try_from_default_env()
         .or_else(|_| {
             let default = level.unwrap_or({
@@ -67,7 +67,7 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
             });
             EnvFilter::try_new(default)
         })
-        .map_err(|e| anyhow::anyhow!("Invalid log filter: {}", e))
+        .map_err(crate::error::LogError::InvalidLogFilter)
 }
 
 /// 初始化文件日志记录器
@@ -81,7 +81,7 @@ fn build_filter(level: Option<&str>) -> anyhow::Result<EnvFilter> {
 /// # 返回值
 /// * `Ok(WorkerGuard)` - 工作线程守卫，确保日志写入完成
 /// * `Err(anyhow::Error)` - 初始化失败
-fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGuard> {
+fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<WorkerGuard> {
     std::fs::create_dir_all(path).expect("Failed to create log directory");
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
 
@@ -90,7 +90,7 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGua
         .filename_prefix("chat") // 文件名前缀
         .max_log_files(MAX_LOG_FILES)
         .build(&safe_path)
-        .map_err(|e| anyhow::anyhow!("Failed to create rolling file appender: {}", e))?;
+        .map_err(|e| crate::error::LogError::CreateRollingFileAppenderFailed(e.into()))?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     fmt()
         .with_ansi(false)
@@ -118,11 +118,11 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> anyhow::Result<WorkerGua
 /// # 返回值
 /// * `Ok(())` - 初始化成功
 /// * `Err(anyhow::Error)` - 初始化失败
-fn init_console_logger(filter: &EnvFilter) -> anyhow::Result<()> {
+fn init_console_logger(filter: &EnvFilter) -> crate::error::LogResult<()> {
     fmt()
         .with_env_filter(filter.clone())
         .try_init()
-        .map_err(|e| anyhow::anyhow!("Logger init failed: {}", e))?;
+        .map_err(|e| crate::error::LogError::LoggerInitFailed(e.into()))?;
 
     tracing::info!("Console logger initialized");
     Ok(())
@@ -138,12 +138,14 @@ fn init_console_logger(filter: &EnvFilter) -> anyhow::Result<()> {
 /// # 返回值
 /// * `Ok(PathBuf)` - 验证通过的规范路径
 /// * `Err(anyhow::Error)` - 路径验证失败
-fn validate_log_path(path: &Path) -> anyhow::Result<PathBuf> {
+fn validate_log_path(path: &Path) -> crate::error::LogResult<PathBuf> {
     if path
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        anyhow::bail!("Path traversal detected in log path");
+        return Err(crate::error::LogError::PathTraversalDetected(
+            path.display().to_string(),
+        ));
     }
 
     // 尝试规范化为绝对路径
@@ -152,7 +154,7 @@ fn validate_log_path(path: &Path) -> anyhow::Result<PathBuf> {
         path.parent()
             .and_then(|p| p.canonicalize().ok())
             .map(|p| p.join(path.file_name().unwrap_or_default()))
-            .ok_or_else(|| anyhow::anyhow!("Invalid log path: cannot resolve"))
+            .ok_or(crate::error::LogError::InvalidLogPath)
     })?;
 
     Ok(canonical)

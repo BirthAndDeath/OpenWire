@@ -70,10 +70,22 @@
     }
 
     function resize(node: HTMLTextAreaElement) {
-        const fn = () =>
-            (node.style.height = Math.min(node.scrollHeight, 300) + "px");
+        // 使用 requestAnimationFrame 批量处理，避免在同一个帧内多次触发 ResizeObserver
+        let rafId: number | null = null;
+        const fn = () => {
+            if (rafId !== null) return; // 同一帧内只执行一次
+            rafId = requestAnimationFrame(() => {
+                rafId = null;
+                node.style.height = Math.min(node.scrollHeight, 300) + "px";
+            });
+        };
         node.addEventListener("input", fn);
-        return { destroy: () => node.removeEventListener("input", fn) };
+        return {
+            destroy: () => {
+                node.removeEventListener("input", fn);
+                if (rafId !== null) cancelAnimationFrame(rafId);
+            },
+        };
     }
 
     const onKey = (e: KeyboardEvent) => {

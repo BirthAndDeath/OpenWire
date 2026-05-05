@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::{
     command::{FileTransferProgress, MessageEvent},
     core::ChatCore,
+    error::CoreError,
     message::{ChatMessageType, ChunkResponse, FileStreamChunk},
     transfer::{FileTransferState, TransferStatus},
 };
@@ -212,7 +213,7 @@ impl ChatCore {
     pub(crate) async fn handle_file_stream_chunk(
         &mut self,
         chunk: FileStreamChunk,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CoreError> {
         let file_id_hex = hex::encode(chunk.file_id);
 
         // ========== 安全校验：文件名路径遍历防护 ==========
@@ -225,7 +226,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            anyhow::anyhow!("{}", err_msg)
+            CoreError::FileTransferFailed(err_msg)
         })?;
 
         // ========== 安全校验：分片元数据一致性 ==========
@@ -236,7 +237,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         if chunk.chunk_index >= chunk.total_chunks {
             let err_msg = format!(
@@ -246,7 +247,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         // 验证 chunk_size 不为零，防止除零或无限循环
         if chunk.chunk_size == 0 {
@@ -255,7 +256,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         // 验证 offset 与 chunk_index 一致（每个分片的 offset = chunk_index * chunk_size）
         let expected_offset = (chunk.chunk_index as u64).saturating_mul(chunk.chunk_size as u64);
@@ -268,7 +269,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         // 验证 total_size 不为零
         if chunk.total_size == 0 {
@@ -277,7 +278,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         // ========== 文件大小限制：防止 DoS 攻击 ==========
         // 拒绝超过 MAX_FILE_SIZE 的文件，防止攻击者通过大文件耗尽磁盘空间
@@ -289,7 +290,7 @@ impl ChatCore {
                 &file_id_hex[..16]
             );
             tracing::error!("{}", err_msg);
-            return Err(anyhow::anyhow!("{}", err_msg));
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
         // 验证最后一个分片的 offset + decompressed_size <= total_size
         // （非最后一个分片的大小应等于 chunk_size）
@@ -304,7 +305,7 @@ impl ChatCore {
                     &file_id_hex[..16]
                 );
                 tracing::error!("{}", err_msg);
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(CoreError::FileTransferFailed(err_msg));
             }
         }
 
@@ -358,7 +359,7 @@ impl ChatCore {
                     &file_id_hex[..16]
                 );
                 tracing::error!("{}", err_msg);
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(CoreError::FileTransferFailed(err_msg));
             }
 
             let state = FileTransferState {
@@ -421,7 +422,7 @@ impl ChatCore {
                     &file_id_hex[..16]
                 );
                 tracing::error!("{}", err_msg);
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(CoreError::FileTransferFailed(err_msg));
             }
             if chunk.offset + decompressed_size > chunk.total_size {
                 let err_msg = format!(
@@ -432,7 +433,7 @@ impl ChatCore {
                     &file_id_hex[..16]
                 );
                 tracing::error!("{}", err_msg);
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(CoreError::FileTransferFailed(err_msg));
             }
         } else {
             // 非最后一个分片：解压后大小应 == chunk_size
@@ -444,7 +445,7 @@ impl ChatCore {
                     &file_id_hex[..16]
                 );
                 tracing::error!("{}", err_msg);
-                return Err(anyhow::anyhow!("{}", err_msg));
+                return Err(CoreError::FileTransferFailed(err_msg));
             }
         }
 
@@ -478,7 +479,24 @@ impl ChatCore {
         let (is_complete, filename, total_chunks, total_size, received_bytes) =
             if let Some(state) = self.file_transfers.get_mut(&file_id_hex) {
                 state.received_chunks.insert(chunk.chunk_index);
-                let received_bytes = state.received_chunks.len() as u64 * chunk.chunk_size as u64;
+                // 精确计算已接收字节数：最后一个分片可能小于 chunk_size
+                let last_chunk_index = state.total_chunks - 1;
+                let last_chunk_size = if state.total_size % state.chunk_size as u64 == 0 {
+                    state.chunk_size as u64
+                } else {
+                    state.total_size % state.chunk_size as u64
+                };
+                let received_bytes = state
+                    .received_chunks
+                    .iter()
+                    .map(|&idx| {
+                        if idx == last_chunk_index {
+                            last_chunk_size
+                        } else {
+                            state.chunk_size as u64
+                        }
+                    })
+                    .sum();
                 state.status = TransferStatus::Downloading { received_bytes };
 
                 // 持久化已接收分片列表到状态文件（断点续传支持）
@@ -542,7 +560,10 @@ impl ChatCore {
                 Ok(hash) => hash,
                 Err(e) => {
                     tracing::error!("计算下载文件哈希失败: {e}");
-                    return Err(anyhow::anyhow!("计算文件哈希失败: {}", e));
+                    return Err(CoreError::FileTransferFailed(format!(
+                        "计算文件哈希失败: {}",
+                        e
+                    )));
                 }
             };
 
@@ -555,7 +576,7 @@ impl ChatCore {
                 );
                 // 删除损坏的临时文件
                 let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(anyhow::anyhow!("文件哈希验证失败，文件可能已损坏"));
+                return Err(CoreError::FileHashMismatch);
             }
 
             tracing::info!("文件哈希验证通过");
@@ -588,7 +609,10 @@ impl ChatCore {
             // 重命名临时文件为最终文件名
             if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
                 tracing::error!("Failed to rename temp file: {e}");
-                return Err(anyhow::anyhow!("重命名临时文件失败: {}", e));
+                return Err(CoreError::FileRenameFailed(format!(
+                    "重命名临时文件失败: {}",
+                    e
+                )));
             }
 
             tracing::info!("File download completed: {} -> {:?}", filename, final_path);

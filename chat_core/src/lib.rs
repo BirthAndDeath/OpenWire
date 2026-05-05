@@ -4,6 +4,7 @@ pub mod core;
 mod coreconfig;
 pub mod corehandle;
 pub mod crypto;
+pub mod error;
 pub mod identity;
 mod log;
 pub mod message;

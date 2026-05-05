@@ -21,6 +21,8 @@
         sender_mldsa_pubkey_hex?: string;
         // 消息所属联系人的 ML-DSA 公钥 hex
         mldsa_pubkey_hex: string;
+        // 消息发送状态: true = 待确认（未收到送达回执）, false = 已送达
+        pending?: boolean;
     }
 
     // 文件传输进度信息
@@ -66,6 +68,7 @@
                 content: string;
                 is_outgoing: boolean;
                 ts: number;
+                pending: number;
             }[] = await invoke("load_messages", {
                 mldsaPubkeyHex: peerId,
                 before: null,
@@ -101,6 +104,8 @@
                     type,
                     file_hash_info,
                     mldsa_pubkey_hex: m.mldsa_pubkey_hex,
+                    // pending=1 表示待发送，pending=0 表示已送达
+                    pending: m.pending === 1 ? true : undefined,
                 };
             });
             const ids = new Set(loaded.map((m) => m.id));
@@ -121,6 +126,7 @@
         file_hash_info?: Msg["file_hash_info"],
         sender_mldsa_pubkey_hex?: string,
         mldsa_pubkey_hex?: string,
+        pending?: boolean,
     ) {
         // 如果指定了 mldsa_pubkey_hex 且与当前选中的联系人不同，则忽略此消息
         if (mldsa_pubkey_hex && contactId && mldsa_pubkey_hex !== contactId) {
@@ -136,6 +142,7 @@
             file_hash_info,
             sender_mldsa_pubkey_hex,
             mldsa_pubkey_hex: mldsa_pubkey_hex || contactId || "",
+            pending,
         };
         // 去重：如果消息 ID 已存在则跳过
         if (loadedMsgIds.has(newMsg.id)) return;
@@ -146,7 +153,34 @@
         );
     }
 
-    export function del(id: string) {
+    // 更新消息发送状态（从 pending 变为 sent）
+    export function markSent(messageHash: string) {
+        // 通过消息哈希找到对应的 pending 消息并标记为已送达
+        // 由于前端没有存储哈希，我们遍历所有 pending 消息
+        // 找到最近一条 pending 消息标记为已送达
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            const msg = msgs[i];
+            if (msg.me && msg.pending === true) {
+                msg.pending = false;
+                break; // 只标记最近一条
+            }
+        }
+    }
+
+    export async function del(id: string) {
+        // 如果是历史消息（id 格式为 "hist-{数字}"），调用后端删除
+        if (id.startsWith("hist-")) {
+            const msgId = parseInt(id.slice(5), 10);
+            if (!isNaN(msgId)) {
+                try {
+                    await invoke("delete_message", { messageId: msgId });
+                } catch (e) {
+                    console.error("删除消息失败:", e);
+                    return; // 后端删除失败，不更新 UI
+                }
+            }
+        }
+        // 前端 UI 移除
         msgs = msgs.filter((m) => m.id !== id);
         loadedMsgIds.delete(id);
     }
@@ -317,7 +351,16 @@
                     <!-- 普通文本消息 -->
                     <p>{m.content}</p>
                 {/if}
-                <time>{new Date(m.ts).toLocaleTimeString()}</time>
+                <div class="msg-meta">
+                    <time>{new Date(m.ts).toLocaleTimeString()}</time>
+                    {#if m.me && m.pending === true}
+                        <span class="pending-indicator" title="发送中..."
+                            >⏳</span
+                        >
+                    {:else if m.me && m.pending === false}
+                        <span class="sent-indicator" title="已送达">✓</span>
+                    {/if}
+                </div>
             </div>
             <button class="x" onclick={() => del(m.id)}>×</button>
         </div>
@@ -450,11 +493,34 @@
         line-height: 1.5;
         word-break: break-word;
     }
-    .bubble time {
-        display: block;
+    .msg-meta {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-top: 4px;
+    }
+    .msg-meta time {
         font-size: 11px;
         opacity: 0.6;
-        margin-top: 4px;
+    }
+    .pending-indicator {
+        font-size: 11px;
+        opacity: 0.7;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+    .sent-indicator {
+        font-size: 11px;
+        color: #22c55e;
+        opacity: 0.8;
+    }
+    @keyframes pulse {
+        0%,
+        100% {
+            opacity: 0.7;
+        }
+        50% {
+            opacity: 0.3;
+        }
     }
 
     .x {

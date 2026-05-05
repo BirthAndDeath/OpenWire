@@ -7,24 +7,30 @@
 // ============================================================
 
 const ALLOWED_COMMANDS = new Set([
-    'send', 'list_contacts', 'list_identities', 'select_identity',
+    'send', 'send_file', 'list_contacts', 'list_identities', 'select_identity',
     'delete_identity', 'generate_identity', 'add_contact',
+    'delete_contact', 'delete_message',
     'request_file_download', 'set_download_dir', 'get_download_dir',
     'load_messages', 'get_identity_qr_data',
+    'check_core_ready',
+    'is_keyring_available', 'set_password', 'retry_init',
     'plugin:window|set_content_protected'
 ]);
 
 const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|'];
 
 const SENSITIVE_COMMANDS = new Set([
-    'send', 'delete_identity', 'select_identity',
-    'generate_identity', 'add_contact', 'request_file_download', 'set_download_dir'
+    'send', 'send_file', 'delete_identity', 'select_identity',
+    'generate_identity', 'add_contact', 'delete_contact',
+    'request_file_download', 'set_download_dir'
 ]);
 
 const RATE_LIMITS = {
     send: { maxCalls: 10, windowMs: 60000 },
+    send_file: { maxCalls: 10, windowMs: 60000 },
     generate_identity: { maxCalls: 3, windowMs: 60000 },
     add_contact: { maxCalls: 20, windowMs: 60000 },
+    delete_contact: { maxCalls: 10, windowMs: 60000 },
     delete_identity: { maxCalls: 5, windowMs: 60000 },
     select_identity: { maxCalls: 30, windowMs: 60000 },
     request_file_download: { maxCalls: 20, windowMs: 60000 },
@@ -34,6 +40,7 @@ const RATE_LIMITS = {
     get_download_dir: { maxCalls: 60, windowMs: 60000 },
     load_messages: { maxCalls: 60, windowMs: 60000 },
     get_identity_qr_data: { maxCalls: 30, windowMs: 60000 },
+    check_core_ready: { maxCalls: 300, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -125,12 +132,26 @@ const VALIDATORS = {
         if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
         return requiredString(p.message, 'message', 65536);
     },
+    send_file: (p) => {
+        let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
+        if (err) return err;
+        if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
+        err = requiredString(p.filePath, 'filePath', 4096);
+        if (err) return err;
+        return null;
+    },
     add_contact: (p) => {
         let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
         if (err) return err;
         if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
         if (p.name !== undefined && p.name !== null && typeof p.name !== 'string') return 'name must be string';
         if (typeof p.name === 'string' && p.name.length > 256) return 'name exceeds limit (256)';
+        return null;
+    },
+    delete_contact: (p) => {
+        let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
+        if (err) return err;
+        if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
         return null;
     },
     select_identity: (p) => {
@@ -166,6 +187,14 @@ const VALIDATORS = {
         return null;
     },
     get_identity_qr_data: () => null,
+    check_core_ready: () => null,
+    is_keyring_available: () => null,
+    set_password: (p) => {
+        if (typeof p.password !== 'string') return 'password must be string';
+        if (p.password.length > 512) return 'password exceeds limit (512)';
+        return null;
+    },
+    retry_init: () => null,
 };
 
 // ============================================================

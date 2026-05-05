@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::error::{DhtError, DhtResult};
 use crate::p2p::validator::RecordValidator;
 use crate::signature::DhtRecordSignature;
 
@@ -257,6 +258,15 @@ impl libp2p::kad::store::RecordStore for ResourceLimitedRecordStore {
 
 impl RedbRecordStore {
     pub fn new(db: Arc<Database>) -> Self {
+        // 预先创建所有需要的表，避免后续 open_table() 时因表不存在而报错
+        if let Ok(write_txn) = db.begin_write() {
+            let _ = write_txn.open_table(RECORDS_TABLE);
+            let _ = write_txn.open_table(PROVIDERS_TABLE);
+            let _ = write_txn.open_table(PEER_MULTIADDRS_TABLE);
+            let _ = write_txn.open_table(PUBKEY_PEERID_TABLE);
+            let _ = write_txn.open_table(PUBKEY_MLKEM_TABLE);
+            let _ = write_txn.commit();
+        }
         Self { db }
     }
 
@@ -274,8 +284,8 @@ impl RedbRecordStore {
     /// 在写事务中执行操作，自动处理 begin_write/commit
     fn with_write_txn<T>(
         &self,
-        f: impl FnOnce(&redb::WriteTransaction) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
+        f: impl FnOnce(&redb::WriteTransaction) -> DhtResult<T>,
+    ) -> DhtResult<T> {
         let write_txn = self.db.as_ref().begin_write()?;
         let result = f(&write_txn)?;
         write_txn.commit()?;
@@ -285,9 +295,13 @@ impl RedbRecordStore {
     /// 在读事务中执行操作，自动处理 begin_read
     fn with_read_txn<T>(
         &self,
-        f: impl FnOnce(&redb::ReadTransaction) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let read_txn = self.db.as_ref().begin_read()?;
+        f: impl FnOnce(&redb::ReadTransaction) -> DhtResult<T>,
+    ) -> DhtResult<T> {
+        let read_txn = self
+            .db
+            .as_ref()
+            .begin_read()
+            .map_err(DhtError::ReadTransactionFailed)?;
         f(&read_txn)
     }
 
@@ -451,7 +465,7 @@ impl RedbRecordStore {
     }
 
     // Multiaddr management
-    pub fn add_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> anyhow::Result<()> {
+    pub fn add_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
 
@@ -474,7 +488,7 @@ impl RedbRecordStore {
         })
     }
 
-    pub fn remove_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> anyhow::Result<()> {
+    pub fn remove_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
 
@@ -498,7 +512,7 @@ impl RedbRecordStore {
         })
     }
 
-    pub fn get_multiaddrs(&self, peer_id: &PeerId) -> anyhow::Result<Vec<Multiaddr>> {
+    pub fn get_multiaddrs(&self, peer_id: &PeerId) -> DhtResult<Vec<Multiaddr>> {
         let peer_id_str = peer_id.to_string();
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PEER_MULTIADDRS_TABLE)?;
@@ -511,7 +525,7 @@ impl RedbRecordStore {
         })
     }
 
-    pub fn get_random_multiaddr(&self, peer_id: &PeerId) -> anyhow::Result<Option<Multiaddr>> {
+    pub fn get_random_multiaddr(&self, peer_id: &PeerId) -> DhtResult<Option<Multiaddr>> {
         let mut addrs = self.get_multiaddrs(peer_id)?;
         if addrs.is_empty() {
             return Ok(None);
@@ -522,7 +536,7 @@ impl RedbRecordStore {
     }
 
     // Pubkey to PeerID mapping (temporary, stored in DHT)
-    pub fn set_pubkey_peerid(&self, pubkey_hex: &str, peer_id: &PeerId) -> anyhow::Result<()> {
+    pub fn set_pubkey_peerid(&self, pubkey_hex: &str, peer_id: &PeerId) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
@@ -531,19 +545,41 @@ impl RedbRecordStore {
         })
     }
 
-    pub fn get_peerid_by_pubkey(&self, pubkey_hex: &str) -> anyhow::Result<Option<PeerId>> {
+    pub fn get_peerid_by_pubkey(&self, pubkey_hex: &str) -> DhtResult<Option<PeerId>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
             if let Some(data) = table.get(pubkey_hex)? {
                 let peer_id_str: &str = data.value();
-                Ok(Some(peer_id_str.parse()?))
+                let peer_id = peer_id_str
+                    .parse::<libp2p::PeerId>()
+                    .map_err(|e| DhtError::PeerIdParseError(e.into()))?;
+                Ok(Some(peer_id))
             } else {
                 Ok(None)
             }
         })
     }
 
-    pub fn remove_pubkey_peerid(&self, pubkey_hex: &str) -> anyhow::Result<()> {
+    /// 通过 PeerID 反向查找对应的 ML-DSA 公钥 hex
+    ///
+    /// 遍历 PUBKEY_PEERID_TABLE，查找值等于给定 PeerID 的条目。
+    /// 由于是反向查找（表结构是 pubkey->peerid），需要遍历所有条目。
+    /// 适用于小规模数据（联系人数量通常有限）。
+    pub fn get_pubkey_by_peerid(&self, peer_id: &PeerId) -> DhtResult<Option<String>> {
+        let peer_id_str = peer_id.to_string();
+        self.with_read_txn(|read_txn| {
+            let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
+            for result in table.iter()? {
+                let (key, value) = result?;
+                if value.value() == peer_id_str {
+                    return Ok(Some(key.value().to_string()));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    pub fn remove_pubkey_peerid(&self, pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
             table.remove(pubkey_hex)?;
@@ -555,7 +591,7 @@ impl RedbRecordStore {
     ///
     /// 遍历 PUBKEY_PEERID_TABLE 返回所有键（ML-DSA 公钥 hex），
     /// 用于 DHT 注册循环在身份切换后重新读取所有需要注册的身份。
-    pub fn get_all_pubkeys(&self) -> anyhow::Result<Vec<String>> {
+    pub fn get_all_pubkeys(&self) -> DhtResult<Vec<String>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
             let mut keys = Vec::new();
@@ -573,7 +609,7 @@ impl RedbRecordStore {
         &self,
         mldsa_pubkey_hex: &str,
         mlkem_pubkey_hex: &str,
-    ) -> anyhow::Result<()> {
+    ) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_MLKEM_TABLE)?;
             table.insert(mldsa_pubkey_hex, mlkem_pubkey_hex)?;
@@ -582,7 +618,7 @@ impl RedbRecordStore {
     }
 
     /// 查询联系人的 ML-KEM 公钥
-    pub fn get_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> anyhow::Result<Option<String>> {
+    pub fn get_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<Option<String>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_MLKEM_TABLE)?;
             if let Some(data) = table.get(mldsa_pubkey_hex)? {
@@ -594,7 +630,7 @@ impl RedbRecordStore {
     }
 
     /// 删除联系人的 ML-KEM 公钥
-    pub fn remove_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> anyhow::Result<()> {
+    pub fn remove_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_MLKEM_TABLE)?;
             table.remove(mldsa_pubkey_hex)?;
@@ -610,7 +646,7 @@ impl RedbRecordStore {
     ///
     /// # 参数
     /// - `own_pubkey_hex`: 自身 ML-DSA 公钥 hex，此条目不删除
-    pub fn clear_expired_pubkey_peerid_cache(&self, own_pubkey_hex: &str) -> anyhow::Result<()> {
+    pub fn clear_expired_pubkey_peerid_cache(&self, own_pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
             // 收集需要删除的键（redb 4.0 不支持在迭代时删除，先收集再删除）
@@ -639,7 +675,7 @@ impl RedbRecordStore {
     ///
     /// # 参数
     /// - `own_pubkey_hex`: 自身 ML-DSA 公钥 hex，此条目不删除
-    pub fn clear_expired_mlkem_pubkey_cache(&self, own_pubkey_hex: &str) -> anyhow::Result<()> {
+    pub fn clear_expired_mlkem_pubkey_cache(&self, own_pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_MLKEM_TABLE)?;
             let stale_keys: Vec<String> = table
@@ -660,27 +696,12 @@ impl RedbRecordStore {
     }
 
     /// 验证身份绑定：检查给定的 ML-DSA 公钥 hex 是否与 PeerID 和 ML-KEM 公钥一致
-    ///
-    /// 此函数验证本地 DHT 数据库中存储的绑定关系：
-    /// 1. ML-DSA 公钥 -> PeerID 映射是否存在
-    /// 2. ML-DSA 公钥 -> ML-KEM 公钥映射是否存在
-    ///
-    /// # 参数
-    /// - `mldsa_pubkey_hex`: 声称的 ML-DSA 公钥 hex
-    /// - `expected_peer_id`: 期望的 PeerID（如果为 None 则跳过检查）
-    /// - `expected_mlkem_pubkey_hex`: 期望的 ML-KEM 公钥 hex（如果为 None 则跳过检查）
-    ///
-    /// # 返回
-    /// - `Ok(true)`: 绑定验证通过
-    /// - `Ok(false)`: 绑定验证失败（映射不存在或不匹配）
-    /// - `Err(e)`: 数据库错误
     pub fn verify_identity_binding(
         &self,
         mldsa_pubkey_hex: &str,
         expected_peer_id: Option<&PeerId>,
         expected_mlkem_pubkey_hex: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        // 1. 验证 ML-DSA -> PeerID 绑定
+    ) -> DhtResult<bool> {
         if let Some(expected_pid) = expected_peer_id {
             match self.get_peerid_by_pubkey(mldsa_pubkey_hex)? {
                 Some(stored_pid) => {
@@ -704,7 +725,6 @@ impl RedbRecordStore {
             }
         }
 
-        // 2. 验证 ML-DSA -> ML-KEM 绑定
         if let Some(expected_mlkem) = expected_mlkem_pubkey_hex {
             match self.get_mlkem_pubkey(mldsa_pubkey_hex)? {
                 Some(stored_mlkem) => {
@@ -733,6 +753,90 @@ impl RedbRecordStore {
             &mldsa_pubkey_hex[..16]
         );
         Ok(true)
+    }
+
+    /// 批量清理过期记录
+    ///
+    /// 此方法会清理所有过期的DHT记录和提供者记录。
+    /// 建议定期调用此方法以维护数据库性能。
+    ///
+    /// # 返回
+    /// - `Ok((records_cleaned, providers_cleaned))`: 清理的记录数量
+    pub fn cleanup_expired_records(&self) -> DhtResult<(usize, usize)> {
+        let mut records_cleaned = 0;
+        let mut providers_cleaned = 0;
+
+        self.with_write_txn(|write_txn| {
+            // 清理过期记录
+            if let Ok(mut records_table) = write_txn.open_table(RECORDS_TABLE) {
+                let expired_keys: Vec<String> = records_table
+                    .iter()?
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(key, value)| {
+                        let data = value.value();
+                        if let Ok(stored) = postcard::from_bytes::<StoredRecord>(data)
+                            && Self::is_expired(stored.expires)
+                        {
+                            Some(key.value().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for key in expired_keys {
+                    records_table.remove(key.as_str())?;
+                    records_cleaned += 1;
+                }
+            }
+
+            // 清理过期提供者记录
+            if let Ok(mut providers_table) = write_txn.open_table(PROVIDERS_TABLE) {
+                let entries: Vec<(String, Vec<u8>)> = providers_table
+                    .iter()?
+                    .filter_map(|r| r.ok())
+                    .map(|(key, value)| (key.value().to_string(), value.value().to_vec()))
+                    .collect();
+
+                let mut keys_to_update = Vec::new();
+
+                for (key_str, data) in entries {
+                    if let Ok(mut providers) = postcard::from_bytes::<Vec<StoredProvider>>(&data) {
+                        let original_len = providers.len();
+                        providers.retain(|p| !Self::is_expired(p.expires));
+
+                        if providers.len() < original_len {
+                            providers_cleaned += original_len - providers.len();
+                            if !providers.is_empty() {
+                                keys_to_update.push((key_str.clone(), providers));
+                            } else {
+                                // 所有提供者都过期了，删除整个键
+                                let _ = providers_table.remove(key_str.as_str());
+                            }
+                        }
+                    }
+                }
+
+                // 更新剩余的提供者记录
+                for (key, providers) in keys_to_update {
+                    if let Ok(serialized) = postcard::to_allocvec(&providers) {
+                        let _ = providers_table.insert(key.as_str(), serialized.as_slice());
+                    }
+                }
+            }
+
+            Ok(())
+        })?;
+
+        if records_cleaned > 0 || providers_cleaned > 0 {
+            tracing::info!(
+                "清理了 {} 条过期DHT记录和 {} 条过期提供者记录",
+                records_cleaned,
+                providers_cleaned
+            );
+        }
+
+        Ok((records_cleaned, providers_cleaned))
     }
 }
 
@@ -817,6 +921,10 @@ impl RecordStore for RedbRecordStore {
         if let Some(txn) = read_txn
             && let Ok(table) = txn.open_table(RECORDS_TABLE)
         {
+            // 优化：预估容量，避免频繁重新分配
+            // 假设平均记录大小，预估初始容量
+            records.reserve(1000);
+
             let iter = table.iter().ok();
             if let Some(mut iter) = iter {
                 while let Some(Ok((key, value))) = iter.next() {
@@ -830,14 +938,20 @@ impl RecordStore for RedbRecordStore {
                             Instant::now()
                                 + Duration::from_secs(exp.saturating_sub(Self::now_unix()))
                         });
-                        // RecordKey is created from the UTF-8 string bytes
-                        // This matches how we stored it in put() using std::str::from_utf8
+
                         records.push(Cow::Owned(Record {
                             key: RecordKey::from(key_str.as_bytes().to_vec()),
                             value: stored.value,
                             publisher,
                             expires,
                         }));
+
+                        // 性能优化：如果记录数量过多，提前返回以保持O(log n)响应性
+                        // 在实际DHT使用中，不应该存储过多记录
+                        if records.len() >= 10_000 {
+                            tracing::warn!("DHT records() 返回超过10,000条记录，可能影响性能");
+                            break;
+                        }
                     }
                 }
             }
@@ -953,6 +1067,9 @@ impl RecordStore for RedbRecordStore {
         if let Some(txn) = read_txn
             && let Ok(table) = txn.open_table(PROVIDERS_TABLE)
         {
+            // 优化：预估容量
+            provided_records.reserve(500);
+
             let iter = table.iter().ok();
             if let Some(mut iter) = iter {
                 while let Some(Ok((key, value))) = iter.next() {
@@ -960,23 +1077,38 @@ impl RecordStore for RedbRecordStore {
                     let data = value.value();
                     if let Ok(providers) = postcard::from_bytes::<Vec<StoredProvider>>(data) {
                         for stored in providers {
-                            if !Self::is_expired(stored.expires)
-                                && let Ok(provider) = stored.provider.parse()
-                            {
-                                let expires = stored.expires.map(|exp| {
-                                    Instant::now()
-                                        + Duration::from_secs(exp.saturating_sub(Self::now_unix()))
-                                });
-                                // 从 PEER_MULTIADDRS_TABLE 获取该 provider 的地址
-                                let addresses = self.get_multiaddrs(&provider).unwrap_or_default();
+                            if !Self::is_expired(stored.expires) {
+                                if let Ok(provider) = stored.provider.parse() {
+                                    let expires = stored.expires.map(|exp| {
+                                        Instant::now()
+                                            + Duration::from_secs(
+                                                exp.saturating_sub(Self::now_unix()),
+                                            )
+                                    });
+                                    // 从 PEER_MULTIADDRS_TABLE 获取该 provider 的地址
+                                    let addresses =
+                                        self.get_multiaddrs(&provider).unwrap_or_default();
 
-                                provided_records.push(Cow::Owned(ProviderRecord {
-                                    key: RecordKey::from(key_str.as_bytes().to_vec()),
-                                    provider,
-                                    expires,
-                                    addresses,
-                                }));
+                                    provided_records.push(Cow::Owned(ProviderRecord {
+                                        key: RecordKey::from(key_str.as_bytes().to_vec()),
+                                        provider,
+                                        expires,
+                                        addresses,
+                                    }));
+
+                                    // 性能优化：限制返回记录数量
+                                    if provided_records.len() >= 5_000 {
+                                        tracing::warn!(
+                                            "DHT provided() 返回超过5,000条记录，可能影响性能"
+                                        );
+                                        break;
+                                    }
+                                }
                             }
+                        }
+                        // 如果已经达到限制，跳出外层循环
+                        if provided_records.len() >= 5_000 {
+                            break;
                         }
                     }
                 }

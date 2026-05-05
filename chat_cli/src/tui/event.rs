@@ -37,10 +37,41 @@ async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
         }
         // a 添加联系人
         KeyCode::Char('a') => {
+            app.add_contact_mode = true;
             app.status_message =
-                "请在输入框中输入对方 ML-DSA 公钥，然后按 Ctrl+Enter 添加".to_string();
+                "添加联系人模式：请粘贴对方 ML-DSA 公钥到输入框，然后按 Ctrl+Enter 确认添加"
+                    .to_string();
             app.current_focus = Focus::Input;
             app.input.clear();
+        }
+        // d 删除联系人
+        KeyCode::Char('d') => {
+            let selected_index = app.contact_list_state.selected();
+            let pubkey_to_delete = selected_index
+                .and_then(|i| app.contacts.get(i))
+                .map(|c| c.mldsa_pubkey_hex.clone());
+            if let Some(pubkey) = pubkey_to_delete {
+                let pubkey_short = pubkey[..16.min(pubkey.len())].to_string();
+                app.push_message(format!("正在删除联系人: {}..", pubkey_short));
+                let ok = app.core_handle.delete_contact(&pubkey).await;
+                if ok {
+                    app.push_message(format!("✅ 已删除联系人: {}..", pubkey_short));
+                    app.status_message = format!("已删除联系人: {}..", pubkey_short);
+                } else {
+                    app.push_message(format!("❌ 删除联系人失败: {}..", pubkey_short));
+                    app.status_message = "删除联系人失败".to_string();
+                }
+                app.refresh_contacts().await;
+                // 如果删除后联系人列表为空，重置选中状态
+                if app.contacts.is_empty() {
+                    app.contact_list_state.select(None);
+                } else if let Some(i) = selected_index
+                    && i >= app.contacts.len()
+                {
+                    app.contact_list_state
+                        .select(Some(app.contacts.len().saturating_sub(1)));
+                }
+            }
         }
         // r 刷新联系人列表
         KeyCode::Char('r') => {
@@ -84,21 +115,39 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
         .contains(crossterm::event::KeyModifiers::CONTROL);
     match key_event.code {
         KeyCode::Enter if !app.input.trim().is_empty() => {
-            // Ctrl+Enter: 添加联系人（输入框中输入公钥后按此快捷键）
-            if is_ctrl {
+            // Ctrl+Enter 或添加联系人模式：添加联系人
+            if is_ctrl || app.add_contact_mode {
                 let pubkey_hex = app.input.trim().to_string();
                 if !pubkey_hex.is_empty() {
+                    // 验证公钥格式
+                    if !chat_core::validate_mldsa_pubkey_hex(&pubkey_hex) {
+                        app.push_message(
+                            "错误: ML-DSA 公钥格式不正确（应为3904字符的hex编码）".to_string(),
+                        );
+                        app.input.clear();
+                        app.add_contact_mode = false;
+                        app.status_message.clear();
+                        return;
+                    }
+                    app.push_message(format!(
+                        "正在添加联系人: {}... (通过 DHT 网络查询身份绑定)",
+                        &pubkey_hex[..16.min(pubkey_hex.len())]
+                    ));
                     let ok = app.core_handle.add_contact(&pubkey_hex, None).await;
                     if ok {
                         app.push_message(format!(
-                            "已添加联系人: {}..",
+                            "✅ 已添加联系人: {}..",
                             &pubkey_hex[..16.min(pubkey_hex.len())]
                         ));
                         app.refresh_contacts().await;
                     } else {
-                        app.push_message("错误: 添加联系人失败".to_string());
+                        app.push_message(
+                            "❌ 添加联系人失败：无法验证身份绑定或联系人已存在".to_string(),
+                        );
                     }
                     app.input.clear();
+                    app.add_contact_mode = false;
+                    app.status_message.clear();
                     let msg_count = app.current_messages().len();
                     if msg_count > 0 {
                         app.message_list_state.select(Some(msg_count - 1));

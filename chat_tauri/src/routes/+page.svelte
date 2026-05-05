@@ -115,14 +115,30 @@
   let passwordModalError = $state("");
   let startupPassword = $state("");
 
+  // === 核心是否已就绪（后端核心初始化完成） ===
+  let coreReady = $state(false);
+
   // === 监听消息和事件 ===
   onMount(() => {
     let unlistenWarning: (() => void) | undefined;
     let unlistenMessage: (() => void) | undefined;
     let unlistenFileProgress: (() => void) | undefined;
     let unlistenNeedPassword: (() => void) | undefined;
+    let unlistenCoreReady: (() => void) | undefined;
+    let unlistenDeliveryReceipt: (() => void) | undefined;
+    let pollingTimer: ReturnType<typeof setInterval> | undefined;
 
     (async () => {
+      // 监听 core-ready 事件（核心初始化完成后由后端发送）
+      // 注意：Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
+      // 事件可能丢失。因此同时使用 check_core_ready 命令轮询作为可靠兜底。
+      unlistenCoreReady = await listen<boolean>("core-ready", () => {
+        coreReady = true;
+        // 核心就绪后加载数据
+        loadContacts();
+        loadCurrentIdentity();
+      });
+
       // 监听 need-password 事件（Keyring 不可用时由后端发送）
       unlistenNeedPassword = await listen<boolean>("need-password", () => {
         showPasswordModal = true;
@@ -135,6 +151,14 @@
         showWarning(e.payload, 5000);
         console.warn("Received warning from backend:", e.payload);
       });
+
+      // 监听送达回执事件，将 pending 消息标记为已送达
+      unlistenDeliveryReceipt = await listen<string>(
+        "delivery-receipt",
+        (e) => {
+          msgListRef?.markSent(e.payload);
+        },
+      );
 
       unlistenMessage = await listen<string>("chat-message", (e) => {
         // 尝试解析结构化 JSON 消息（FileHash 类型）
@@ -196,30 +220,58 @@
       );
     })();
 
-    loadContacts();
-    loadCurrentIdentity();
+    // 轮询检查 Core 就绪状态（兜底机制）
+    // 由于 Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
+    // core-ready 事件会丢失。通过轮询 check_core_ready 命令可靠检测。
+    pollingTimer = setInterval(async () => {
+      if (coreReady) {
+        clearInterval(pollingTimer);
+        return;
+      }
+      try {
+        const ready = await invoke<boolean>("check_core_ready");
+        if (ready) {
+          coreReady = true;
+          clearInterval(pollingTimer);
+          loadContacts();
+          loadCurrentIdentity();
+        }
+      } catch (e) {
+        console.warn("check_core_ready 调用失败:", e);
+      }
+    }, 200);
 
     return () => {
+      if (pollingTimer) clearInterval(pollingTimer);
       unlistenWarning?.();
       unlistenMessage?.();
       unlistenFileProgress?.();
       unlistenNeedPassword?.();
+      unlistenCoreReady?.();
+      unlistenDeliveryReceipt?.();
     };
   });
 
   // === 拖动调整 ===
-  function drag(start: number, min: number, max: number, vertical: boolean) {
+  // 使用 requestAnimationFrame 批量处理拖动事件，
+  // 避免在同一个帧内多次触发 ResizeObserver（VList 虚拟滚动组件内部使用）
+  let dragRafId: number | null = null;
+
+  function drag(min: number, max: number, vertical: boolean) {
     return (e: MouseEvent) => {
-      const val = vertical
-        ? Math.max(min, Math.min(max, e.clientX))
-        : Math.max(min, Math.min(max, window.innerHeight - e.clientY - 16));
-      vertical ? (sidebarW = val) : (inputH = val);
+      if (dragRafId !== null) return; // 同一帧内只执行最后一次
+      dragRafId = requestAnimationFrame(() => {
+        dragRafId = null;
+        const val = vertical
+          ? Math.max(min, Math.min(max, e.clientX))
+          : Math.max(min, Math.min(max, window.innerHeight - e.clientY - 16));
+        vertical ? (sidebarW = val) : (inputH = val);
+      });
     };
   }
 
   function startDrag(isSidebar: boolean) {
     const handler = drag(
-      isSidebar ? 0 : 0,
       isSidebar ? 200 : 100,
       isSidebar ? 500 : 300,
       isSidebar,
@@ -227,6 +279,10 @@
     const up = () => {
       document.removeEventListener("mousemove", handler);
       document.removeEventListener("mouseup", up);
+      if (dragRafId !== null) {
+        cancelAnimationFrame(dragRafId);
+        dragRafId = null;
+      }
     };
     document.addEventListener("mousemove", handler);
     document.addEventListener("mouseup", up);
@@ -237,7 +293,8 @@
 
   const send = async (text: string) => {
     if (!selectedId) return;
-    msgListRef?.add(text, true);
+    // 添加消息到列表，标记为 pending（待确认送达）
+    msgListRef?.add(text, true, "text", undefined, undefined, undefined, true);
     contacts = contacts.map((c) =>
       c.pubkey_hex === selectedId
         ? { ...c, lastMsg: text, lastTime: Date.now() }
@@ -326,7 +383,18 @@
       </button>
     </div>
 
-    <Contactlist {contacts} {selectedId} onselect={select} />
+    <Contactlist
+      {contacts}
+      {selectedId}
+      onselect={select}
+      ondelete={(id) => {
+        // 从联系人列表中移除
+        contacts = contacts.filter((c) => c.pubkey_hex !== id);
+        // 如果删除的是当前选中的联系人，清空选择
+        if (selectedId === id)
+          selectedId = contacts.length > 0 ? contacts[0].pubkey_hex : null;
+      }}
+    />
 
     <!-- 添加好友按钮 -->
     <div class="add-friend-wrapper">

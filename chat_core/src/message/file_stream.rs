@@ -1,9 +1,10 @@
 use crate::crypto::constant_time_compare;
-use anyhow;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+use crate::error::{FileTransferError, FileTransferResult};
 
 /// 文件哈希信息（FileHash 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,7 +133,7 @@ impl FileStreamChunk {
         file: &mut File,
         config: &ChunkReadConfig,
         compression_level: i32,
-    ) -> anyhow::Result<(Self, usize)> {
+    ) -> FileTransferResult<(Self, usize)> {
         use sha2::Digest;
 
         // 定位到指定偏移量
@@ -144,10 +145,7 @@ impl FileStreamChunk {
         buf.truncate(n);
 
         if n == 0 {
-            return Err(anyhow::anyhow!(
-                "No data read from file at offset {}",
-                config.offset
-            ));
+            return Err(FileTransferError::NoDataRead(config.offset));
         }
 
         // 计算原始数据哈希
@@ -192,14 +190,13 @@ impl FileStreamChunk {
         &self,
         file: &mut File,
         expected_file_id: &[u8; 32],
-    ) -> anyhow::Result<usize> {
+    ) -> FileTransferResult<usize> {
         // 校验 file_id
         if &self.file_id != expected_file_id {
-            return Err(anyhow::anyhow!(
-                "File ID mismatch: expected {:?}, got {:?}",
-                expected_file_id,
-                self.file_id
-            ));
+            return Err(FileTransferError::FileIdMismatch {
+                expected: *expected_file_id,
+                got: self.file_id,
+            });
         }
 
         // 解压缩
@@ -212,10 +209,7 @@ impl FileStreamChunk {
             hasher.finalize()
         };
         if !constant_time_compare(&computed_hash, &self.chunk_hash) {
-            return Err(anyhow::anyhow!(
-                "Chunk {} hash mismatch: data integrity check failed",
-                self.chunk_index
-            ));
+            return Err(FileTransferError::ChunkHashMismatch(self.chunk_index));
         }
 
         // 定位到指定偏移量并写入

@@ -1,5 +1,6 @@
-use anyhow::Context;
 use libp2p::Multiaddr;
+
+use crate::error::{P2pError, P2pResult};
 
 ///公共 bootstrap 节点
 pub const BOOTSTRAP: &[(&str, &str)] = &[
@@ -59,6 +60,8 @@ pub const BOOTSTRAP: &[(&str, &str)] = &[
 ];
 
 /// 解析 dnsaddr 为实际地址
-pub fn resolve_dnsaddr(dnsaddr: &str) -> anyhow::Result<Multiaddr> {
-    dnsaddr.parse().context("Failed to parse dnsaddr")
+pub fn resolve_dnsaddr(dnsaddr: &str) -> P2pResult<Multiaddr> {
+    dnsaddr
+        .parse()
+        .map_err(|e| P2pError::DnsResolveFailed(format!("Failed to parse dnsaddr: {}", e).into()))
 }

@@ -106,9 +106,15 @@ pub enum ChatCommand {
 ///
 /// 上层（chat_cli/chat_tauri）负责序列化为 JSON 供前端消费。
 /// chat_core 自身不依赖 serde_json，仅使用 serde derive。
+///
+/// 注意：OnlineStatus 已移出此枚举，改为 MessageEvent 的独立变体，
+/// 避免在线状态更新被误当作聊天消息显示在消息历史中。
+/// 使用 serde 内部标记枚举格式，序列化为 `{"type":"text","text":"...","sender":"..."}` 而非 `{"Text":{...}}`
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
 pub enum IncomingMessage {
     /// 文本消息
+    #[serde(rename = "text")]
     Text {
         /// 消息文本内容
         text: String,
@@ -116,6 +122,7 @@ pub enum IncomingMessage {
         sender: String,
     },
     /// 文件分享消息
+    #[serde(rename = "file_hash")]
     FileShare {
         /// 文件名
         filename: String,
@@ -129,16 +136,12 @@ pub enum IncomingMessage {
         sender: String,
     },
     /// 消息送达回执
+    #[serde(rename = "delivery_receipt")]
     DeliveryReceipt {
         /// 已送达消息的哈希
         message_hash: String,
         /// 发送方的 ML-DSA 公钥 hex
         peer_id: String,
-    },
-    /// 在线状态更新
-    OnlineStatus {
-        /// 当前在线连接数
-        count: usize,
     },
 }
 
@@ -150,6 +153,11 @@ pub enum IncomingMessage {
 pub enum MessageEvent {
     /// 收到新消息（结构化数据，上层负责序列化）
     ReceiveMessage(IncomingMessage),
+    /// 在线状态更新（独立事件，不混入消息历史）
+    OnlineStatus {
+        /// 当前在线连接数
+        count: usize,
+    },
     /// 发生错误
     Error(String),
     /// 日志信息（连接状态等）

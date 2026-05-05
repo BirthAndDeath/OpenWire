@@ -1,5 +1,5 @@
 use crate::App;
-use anyhow::Context;
+use crate::error::CliError;
 use chat_core::storage;
 use chat_core::{IncomingMessage, MessageEvent, validate_mldsa_pubkey_hex};
 use serde_json::json;
@@ -7,15 +7,12 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 /// JSON 模式运行 - 面向 shell 调用，输出精简的 JSON 格式
-pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
+pub async fn json_run(app: &mut App) -> Result<(), CliError> {
     // 获取对 core 的引用并启动它
-    let mut core = app
-        .core
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("核心未初始化"))?;
+    let mut core = app.core.take().ok_or(CliError::CoreNotInitialized)?;
     let rx = core
         .take_rx_message()
-        .ok_or_else(|| anyhow::anyhow!("消息通道未初始化"))?;
+        .ok_or(CliError::ChannelNotInitialized)?;
     let handle = core.core_handle.clone();
 
     // 启动核心服务
@@ -72,17 +69,16 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
                             "timestamp": chrono::Utc::now().to_rfc3339()
                         })
                     }
-                    IncomingMessage::OnlineStatus { count } => {
-                        json!({
-                            "type": "message",
-                            "subtype": "online_status",
-                            "data": {
-                                "count": count,
-                            },
-                            "timestamp": chrono::Utc::now().to_rfc3339()
-                        })
-                    }
                 },
+                MessageEvent::OnlineStatus { count } => {
+                    json!({
+                        "type": "online_status",
+                        "data": {
+                            "count": count,
+                        },
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    })
+                }
                 MessageEvent::Log(data) => {
                     json!({
                         "type": "log",
@@ -185,11 +181,7 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
                                         "data": contacts_json,
                                         "timestamp": chrono::Utc::now().to_rfc3339()
                                     });
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string(&output)
-                                            .context("Failed to serialize contacts JSON")?
-                                    );
+                                    println!("{}", serde_json::to_string(&output)?);
                                     tokio::io::stdout().flush().await.ok();
                                 }
                                 Err(e) => {
@@ -248,11 +240,7 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
                                 },
                                 "timestamp": chrono::Utc::now().to_rfc3339()
                             });
-                            println!(
-                                "{}",
-                                serde_json::to_string(&success_output)
-                                    .context("Failed to serialize success JSON")?
-                            );
+                            println!("{}", serde_json::to_string(&success_output)?);
                             tokio::io::stdout().flush().await.ok();
                         } else {
                             let error_output = json!({
@@ -294,7 +282,7 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
             }
         }
 
-        anyhow::Ok(())
+        Ok::<(), CliError>(())
     });
 
     // 等待输入处理任务完成
@@ -312,10 +300,7 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
                 "data": format!("{:?}", join_result),
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
-            println!(
-                "{}",
-                serde_json::to_string(&exit_output).context("Failed to serialize exit JSON")?
-            );
+            println!("{}", serde_json::to_string(&exit_output)?);
         }
         Err(e) => {
             let error_output = json!({
@@ -323,10 +308,7 @@ pub async fn json_run(app: &mut App) -> anyhow::Result<()> {
                 "data": format!("等待后台线程失败: {:?}", e),
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
-            eprintln!(
-                "{}",
-                serde_json::to_string(&error_output).context("Failed to serialize error JSON")?
-            );
+            eprintln!("{}", serde_json::to_string(&error_output)?);
         }
     }
 

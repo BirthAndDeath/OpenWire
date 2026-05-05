@@ -1,9 +1,10 @@
 use chat_core::storage;
-use chat_core::{ChatCommand, ChatMessageType, MessageEvent};
+use chat_core::{ChatCommand, ChatMessageType, IncomingMessage, MessageEvent};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
@@ -180,10 +181,14 @@ struct ContactDto {
 #[tauri::command]
 async fn list_contacts() -> Result<Vec<ContactDto>, String> {
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let owner_identity_id = storage::get_current_identity(pool)
-        .await
-        .map_err(|e| format!("获取当前身份失败: {}", e))?
-        .ok_or_else(|| "未选择身份".to_string())?;
+    let owner_identity_id = match storage::get_current_identity(pool).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // 核心尚未初始化或无当前身份时返回空列表，而非报错
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(format!("获取当前身份失败: {}", e)),
+    };
     let contacts = storage::list_contacts(pool, &owner_identity_id)
         .await
         .map_err(|e| format!("加载联系人失败: {}", e))?
@@ -208,6 +213,8 @@ struct MessageDto {
     content: String,
     is_outgoing: bool,
     ts: i64,
+    /// 消息发送状态: 0=已送达, 1=待发送(pending), 2=发送失败
+    pending: i32,
 }
 
 #[tauri::command]
@@ -217,10 +224,14 @@ async fn load_messages(
     limit: Option<i64>,
 ) -> Result<Vec<MessageDto>, String> {
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let owner_identity_id = storage::get_current_identity(pool)
-        .await
-        .map_err(|e| format!("获取当前身份失败: {}", e))?
-        .ok_or_else(|| "未选择身份".to_string())?;
+    let owner_identity_id = match storage::get_current_identity(pool).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            // 核心尚未初始化或无当前身份时返回空列表
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(format!("获取当前身份失败: {}", e)),
+    };
     let msgs = storage::get_messages(
         pool,
         &owner_identity_id,
@@ -237,6 +248,7 @@ async fn load_messages(
         content: msg.content,
         is_outgoing: msg.is_outgoing != 0,
         ts: msg.ts,
+        pending: msg.pending,
     })
     .collect();
     Ok(msgs)
@@ -467,6 +479,102 @@ async fn discover_contact(
     }
 }
 
+/// 删除联系人
+///
+/// 从数据库中删除指定联系人。前端会先弹出确认对话框，后端再次确认后执行删除。
+#[tauri::command]
+async fn delete_contact(
+    app_handle: tauri::AppHandle,
+    _state: tauri::State<'_, AppData>,
+    mldsa_pubkey_hex: &str,
+) -> Result<bool, String> {
+    // 验证参数
+    if mldsa_pubkey_hex.is_empty() {
+        return Err("联系人标识不能为空".to_string());
+    }
+
+    // 后端再次确认：验证 hex 格式
+    hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
+
+    // 使用 tauri_plugin_dialog 弹出确认对话框（Rust 端确认）
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    app_handle
+        .dialog()
+        .message(
+            "确定要删除该联系人吗？\n删除后聊天记录将一并删除，且需要重新添加联系人才能发送消息。",
+        )
+        .title("删除联系人")
+        .buttons(MessageDialogButtons::YesNo)
+        .show(move |confirmed| {
+            let _ = tx.send(confirmed);
+        });
+
+    // 等待用户确认
+    let confirmed = rx.await.map_err(|_| "对话框通信失败".to_string())?;
+    if !confirmed {
+        tracing::info!("用户取消了删除联系人操作");
+        return Err("用户取消了操作".to_string());
+    }
+
+    // 获取当前身份并执行删除
+    let pool = storage::pool().ok_or_else(|| "数据库连接不可用".to_string())?;
+    let owner_identity_id = storage::get_current_identity(pool)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| "未选择身份，无法删除联系人".to_string())?;
+
+    // 先删除与该联系人的所有聊天记录，再删除联系人
+    match storage::delete_messages_by_peer(pool, &owner_identity_id, mldsa_pubkey_hex).await {
+        Ok(deleted_msgs) => {
+            tracing::info!(
+                "已删除 {} 条与 {} 的聊天记录",
+                deleted_msgs,
+                &mldsa_pubkey_hex[..16]
+            );
+        }
+        Err(e) => {
+            tracing::error!("删除聊天记录失败: {}", e);
+            // 不阻断流程，继续删除联系人
+        }
+    }
+
+    match storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex).await {
+        Ok(affected) => {
+            if affected > 0 {
+                tracing::info!("已删除联系人 {}", &mldsa_pubkey_hex[..16]);
+                Ok(true)
+            } else {
+                Err("未找到该联系人".to_string())
+            }
+        }
+        Err(e) => {
+            tracing::error!("删除联系人失败: {}", e);
+            Err(format!("删除联系人失败: {}", e))
+        }
+    }
+}
+
+/// 删除单条消息
+#[tauri::command]
+async fn delete_message(message_id: i64) -> Result<bool, String> {
+    let pool = storage::pool().ok_or_else(|| "数据库连接不可用".to_string())?;
+    match storage::delete_message(pool, message_id).await {
+        Ok(affected) => {
+            if affected > 0 {
+                tracing::info!("已删除消息 id={}", message_id);
+                Ok(true)
+            } else {
+                Err("未找到该消息".to_string())
+            }
+        }
+        Err(e) => {
+            tracing::error!("删除消息失败: {}", e);
+            Err(format!("删除消息失败: {}", e))
+        }
+    }
+}
+
 /// 生成新身份（ML-DSA + ML-KEM 密钥对）
 ///
 /// 返回新生成身份的 identity_id（ML-DSA 公钥 hex）
@@ -573,25 +681,25 @@ async fn get_download_dir(state: tauri::State<'_, AppData>) -> Result<String, St
 /// - `Ok(Some(_))` → Keyring 可用且已有主密钥 → 返回 `true`
 /// - `Ok(None)` → Keyring 可能不可用或没有主密钥 → 保守返回 `false`
 /// - `Err(_)` → Keyring 不可用 → 返回 `false`
+/// 前端轮询检查 Core 是否已初始化完成。
+///
+/// 由于 Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
+/// core-ready 事件会丢失。此命令让前端通过轮询可靠地检测 Core 就绪状态。
+#[tauri::command]
+async fn check_core_ready(state: tauri::State<'_, AppData>) -> Result<bool, String> {
+    let inner = state.inner.read().await;
+    Ok(inner.core_ready)
+}
+
 #[tauri::command]
 async fn is_keyring_available() -> Result<bool, String> {
-    match rootcell::identity::PrivateKeyHandle::load_master_key() {
-        Ok(Some(_)) => {
-            tracing::debug!("Keyring is available (master key found)");
-            Ok(true)
-        }
-        Ok(None) => {
-            // load_master_key() 返回 Ok(None) 可能是 Keyring 不可用，
-            // 也可能是 Keyring 可用但还没有主密钥。
-            // 保守处理：返回 false，让前端显示密码设置选项。
-            tracing::debug!("Keyring status: no master key found, treating as unavailable");
-            Ok(false)
-        }
-        Err(e) => {
-            tracing::debug!("Keyring error: {}", e);
-            Ok(false)
-        }
+    let available = rootcell::identity::PrivateKeyHandle::check_keyring_available();
+    if available {
+        tracing::debug!("Keyring is available");
+    } else {
+        tracing::debug!("Keyring is not available");
     }
+    Ok(available)
 }
 
 /// 设置用户密码（Keyring 降级模式）。
@@ -643,6 +751,9 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
                 inner.need_password = false;
             }
 
+            // 发送核心就绪事件，通知前端可以安全加载数据
+            app_handle.emit("core-ready", true).ok();
+
             let mut rx = match chat_core_instance.take_rx_message() {
                 Some(rx) => rx,
                 None => {
@@ -662,9 +773,24 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
                             app_handle_for_events.emit("log", data).ok();
                         }
                         MessageEvent::ReceiveMessage(msg) => {
-                            // 将 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
-                            let json = serde_json::to_string(&msg).unwrap_or_default();
-                            app_handle_for_events.emit("chat-message", json).ok();
+                            // DeliveryReceipt 是送达回执，不显示在消息历史中，
+                            // 而是作为独立事件发送，让前端将对应 pending 消息标记为已送达
+                            if let IncomingMessage::DeliveryReceipt {
+                                ref message_hash, ..
+                            } = msg
+                            {
+                                app_handle_for_events
+                                    .emit("delivery-receipt", message_hash)
+                                    .ok();
+                            } else {
+                                // 将其他 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
+                                let json = serde_json::to_string(&msg).unwrap_or_default();
+                                app_handle_for_events.emit("chat-message", json).ok();
+                            }
+                        }
+                        MessageEvent::OnlineStatus { count } => {
+                            // 在线状态更新作为独立事件发送，不混入消息历史
+                            app_handle_for_events.emit("online-status", count).ok();
                         }
                         MessageEvent::Warning(data) => {
                             app_handle_for_events.emit("warning", data).ok();
@@ -707,6 +833,8 @@ pub struct AppDataInner {
     pub need_password: bool,
     /// 当前下载目录（由 set_download_dir 设置，get_download_dir 读取）
     pub download_dir: Option<PathBuf>,
+    /// Core 是否已初始化完成（前端通过 check_core_ready 命令轮询）
+    pub core_ready: bool,
 }
 
 /// 用于在核心初始化完成前占位的初始状态
@@ -719,6 +847,7 @@ fn create_placeholder_appdata() -> AppData {
             passwd: None,
             need_password: false,
             download_dir: None,
+            core_ready: false,
         })),
     }
 }
@@ -738,8 +867,13 @@ async fn setup_core_and_event_loop(
     inner.data_dir = cfg.data_dir.clone();
     inner.mlkem_pubkey_hex = chat_core_instance.mlkem_pubkey_hex.clone();
     inner.need_password = false;
+    inner.core_ready = true;
     // passwd 保持之前设置的值，不需要覆盖
     drop(inner);
+
+    // 发送核心就绪事件，通知前端可以安全加载数据
+    apphandle.emit("core-ready", true).ok();
+    tracing::info!("✅ Core 初始化完成，已发送 core-ready 事件");
 
     let mut rx = match chat_core_instance.take_rx_message() {
         Some(rx) => rx,
@@ -759,9 +893,24 @@ async fn setup_core_and_event_loop(
                 app_handle_for_events.emit("log", data).ok();
             }
             MessageEvent::ReceiveMessage(msg) => {
-                // 将 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
-                let json = serde_json::to_string(&msg).unwrap_or_default();
-                app_handle_for_events.emit("chat-message", json).ok();
+                // DeliveryReceipt 是送达回执，不显示在消息历史中，
+                // 而是作为独立事件发送，让前端将对应 pending 消息标记为已送达
+                if let IncomingMessage::DeliveryReceipt {
+                    ref message_hash, ..
+                } = msg
+                {
+                    app_handle_for_events
+                        .emit("delivery-receipt", message_hash)
+                        .ok();
+                } else {
+                    // 将其他 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
+                    let json = serde_json::to_string(&msg).unwrap_or_default();
+                    app_handle_for_events.emit("chat-message", json).ok();
+                }
+            }
+            MessageEvent::OnlineStatus { count } => {
+                // 在线状态更新作为独立事件发送，不混入消息历史
+                app_handle_for_events.emit("online-status", count).ok();
             }
             MessageEvent::Warning(data) => {
                 app_handle_for_events.emit("warning", data).ok();
@@ -831,8 +980,15 @@ pub fn run() {
                         tracing::error!("{}", err_msg);
 
                         // 判断是否是 Keyring 不可用导致的失败（无密码）
+                        // 覆盖所有 Keyring 相关错误场景：
+                        // - "Keyring unavailable" — Keyring 服务不可用
+                        // - "Private key not found" — 私钥文件存在但 Keyring 无法解密
+                        // - "Failed to create Keyring entry" — 生成新身份时 Keyring 写入失败
+                        // - "Failed to get password from Keyring" — Keyring 读取失败
                         let needs_password = err_msg.contains("Keyring unavailable")
-                            || err_msg.contains("Private key not found");
+                            || err_msg.contains("Private key not found")
+                            || err_msg.contains("Failed to create Keyring entry")
+                            || err_msg.contains("Failed to get password from Keyring");
 
                         if needs_password {
                             // 更新 AppData 标记需要密码
@@ -918,7 +1074,10 @@ pub fn run() {
             get_identity_qr_data,
             set_password,
             retry_init,
-            is_keyring_available
+            is_keyring_available,
+            check_core_ready,
+            delete_contact,
+            delete_message
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

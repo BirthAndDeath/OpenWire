@@ -24,6 +24,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 
+use crate::error::FileTransferResult;
+
 /// 单文件最大大小（100MB），防止 DoS 攻击
 /// 接收方拒绝超过此大小的文件下载请求
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
@@ -40,7 +42,7 @@ pub const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 ///
 /// 用于验证文件完整性（下载完成后比对哈希）。
 /// 使用 8KB 缓冲区流式读取，避免大文件占用过多内存。
-pub async fn compute_file_hash(file_path: &Path) -> anyhow::Result<[u8; 32]> {
+pub async fn compute_file_hash(file_path: &Path) -> FileTransferResult<[u8; 32]> {
     let mut file = tokio::fs::File::open(file_path).await?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];

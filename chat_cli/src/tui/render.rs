@@ -233,12 +233,26 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
             " 模式: 浏览消息 (↑/↓选择, Enter回复){}{}",
             identity_prefix, online_indicator
         ),
-        Focus::Input => format!(
-            " 模式: 输入文本 (Enter发送, Tab切换焦点, Esc退出){}{}",
-            identity_prefix, online_indicator
-        ),
+        Focus::Input => {
+            if app.add_contact_mode {
+                format!(
+                    " 添加联系人: 粘贴对方 ML-DSA 公钥后按 Enter 添加 (Esc取消){}{}",
+                    identity_prefix, online_indicator
+                )
+            } else if app.file_send_mode {
+                format!(
+                    " 发送文件: 输入文件路径后按 Enter (Esc取消){}{}",
+                    identity_prefix, online_indicator
+                )
+            } else {
+                format!(
+                    " 输入消息: Enter发送, Tab切换焦点, Esc退出{}{}",
+                    identity_prefix, online_indicator
+                )
+            }
+        }
         Focus::SidebarArea => format!(
-            " 模式: 选择联系人 (↑/↓选择, Enter确认){}{}",
+            " 联系人列表: ↑/↓选择, Enter聊天, a添加联系人, r刷新, d删除{}{}",
             identity_prefix, online_indicator
         ),
         Focus::IdentityArea => {

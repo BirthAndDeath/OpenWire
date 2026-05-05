@@ -1,5 +1,4 @@
 use crate::crypto::constant_time_compare;
-use anyhow;
 use libp2p::PeerId;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
@@ -27,6 +26,8 @@ pub enum ChatMessageType {
     FileDownloadRequest = 3,
     /// 消息送达回执
     DeliveryReceipt = 4,
+    /// ML-KEM 公钥交换（连接建立时自动交换最新的临时加密公钥）
+    MlkemKeyExchange = 5,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,7 +61,10 @@ pub struct ChatResponse {
 
 impl ChatResponse {
     /// 创建一个新的签名响应
-    pub fn new_signed(mldsa_private_key: &[u8], mldsa_public_key: &[u8]) -> anyhow::Result<Self> {
+    pub fn new_signed(
+        mldsa_private_key: &[u8],
+        mldsa_public_key: &[u8],
+    ) -> crate::error::MessageResult<Self> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
@@ -68,7 +72,12 @@ impl ChatResponse {
         rand::rng().fill(&mut nonce);
 
         let hash = Self::compute_hash(timestamp, &nonce);
-        let signature = crate::signature::sign_data(mldsa_private_key, &hash)?;
+        let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
+            crate::error::MessageError::SignFailed(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         Ok(Self {
             timestamp,
@@ -79,9 +88,16 @@ impl ChatResponse {
     }
 
     /// 验证响应签名
-    pub fn verify(&self) -> anyhow::Result<bool> {
+    pub fn verify(&self) -> crate::error::MessageResult<bool> {
         let hash = Self::compute_hash(self.timestamp, &self.nonce);
-        crate::signature::verify_signature(&self.sender_public_key, &hash, &self.signature)
+        crate::signature::verify_signature(&self.sender_public_key, &hash, &self.signature).map_err(
+            |e| {
+                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            },
+        )
     }
 
     fn compute_hash(timestamp: u64, nonce: &[u8]) -> Vec<u8> {
@@ -119,7 +135,7 @@ impl ChatMessage {
         data: Vec<u8>,
         mldsa_private_key: &[u8],
         mldsa_public_key: &[u8],
-    ) -> anyhow::Result<Self> {
+    ) -> crate::error::MessageResult<Self> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let mut nonce = [0u8; 16];
         rng().fill(&mut nonce);
@@ -128,7 +144,12 @@ impl ChatMessage {
         let hash = Self::compute_hash(msgtype, timestamp, &nonce, &data);
 
         // 使用 ML-DSA 签名
-        let signature = crate::signature::sign_data(mldsa_private_key, &hash)?;
+        let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
+            crate::error::MessageError::SignFailed(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         Ok(Self {
             msgtype,
@@ -151,7 +172,7 @@ impl ChatMessage {
     /// ⚠️ 注意：此方法不验证 sender_public_key 是否与 DHT 中注册的身份绑定一致。
     /// 攻击者可以使用自己的 ML-DSA 密钥对签名消息，但声称是其他身份。
     /// 在需要身份绑定的场景中，请使用 verify_with_identity_binding() 替代。
-    pub fn verify(&self) -> anyhow::Result<bool> {
+    pub fn verify(&self) -> crate::error::MessageResult<bool> {
         // 1. 验证消息新鲜度 (防止重放攻击的一部分)
         if !self.is_fresh() {
             return Ok(false);
@@ -165,6 +186,12 @@ impl ChatMessage {
 
         // 3. 验证 ML-DSA 签名
         crate::signature::verify_signature(&self.sender_public_key, &computed, &self.signature)
+            .map_err(|e| {
+                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))
+            })
     }
 
     /// 验证消息签名、哈希、新鲜度，以及 DHT 身份绑定
@@ -187,7 +214,7 @@ impl ChatMessage {
         &self,
         store: &crate::p2p::dht::RedbRecordStore,
         expected_peer_id: Option<&PeerId>,
-    ) -> anyhow::Result<bool> {
+    ) -> crate::error::MessageResult<bool> {
         // 1-3. 基础验证（签名、哈希、新鲜度）
         if !self.verify()? {
             return Ok(false);
@@ -200,15 +227,16 @@ impl ChatMessage {
             Some(dht_peer_id) => {
                 // 5. 如果提供了期望的 PeerID，验证是否匹配
                 if let Some(expected) = expected_peer_id
-                    && &dht_peer_id != expected {
-                        tracing::warn!(
-                            "身份绑定验证失败: ML-DSA {} 的 DHT PeerID {} 与消息来源 PeerID {} 不匹配",
-                            &sender_pubkey_hex[..16],
-                            dht_peer_id,
-                            expected
-                        );
-                        return Ok(false);
-                    }
+                    && &dht_peer_id != expected
+                {
+                    tracing::warn!(
+                        "身份绑定验证失败: ML-DSA {} 的 DHT PeerID {} 与消息来源 PeerID {} 不匹配",
+                        &sender_pubkey_hex[..16],
+                        dht_peer_id,
+                        expected
+                    );
+                    return Ok(false);
+                }
                 tracing::debug!(
                     "身份绑定验证通过: ML-DSA {} -> PeerID {}",
                     &sender_pubkey_hex[..16],

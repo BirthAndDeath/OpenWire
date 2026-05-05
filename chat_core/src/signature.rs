@@ -1,4 +1,3 @@
-use anyhow::Context;
 use aws_lc_rs::encoding::AsRawBytes;
 use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
 use aws_lc_rs::unstable::signature::{ML_DSA_65, ML_DSA_65_SIGNING, PqdsaKeyPair};
@@ -52,15 +51,15 @@ pub fn validate_mldsa_pubkey_hex(hex: &str) -> bool {
 /// # 返回
 /// - public_key: 公钥(用于验证签名)
 /// - secret_key: 私钥(原始格式)
-pub fn generate_mldsa_keypair() -> anyhow::Result<MlDsaKeypair> {
+pub fn generate_mldsa_keypair() -> crate::error::SignatureResult<MlDsaKeypair> {
     let key_pair = PqdsaKeyPair::generate(&ML_DSA_65_SIGNING)
-        .context("Failed to generate ML-DSA 65 keypair")?;
+        .map_err(crate::error::SignatureError::GenerateMlDsaKeypairFailed)?;
 
     let public_key = key_pair.public_key().as_ref().to_vec();
     let secret_key = key_pair
         .private_key()
         .as_raw_bytes()
-        .context("Failed to get raw private key")?
+        .map_err(|_| crate::error::SignatureError::EmptyPrivateKey)?
         .as_ref()
         .to_vec();
 
@@ -75,14 +74,14 @@ pub fn generate_mldsa_keypair() -> anyhow::Result<MlDsaKeypair> {
 ///
 /// # 返回
 /// - 签名结果
-pub fn sign_data(private_key: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn sign_data(private_key: &[u8], data: &[u8]) -> crate::error::SignatureResult<Vec<u8>> {
     let key_pair = PqdsaKeyPair::from_raw_private_key(&ML_DSA_65_SIGNING, private_key)
-        .map_err(|e| anyhow::anyhow!("Failed to parse ML-DSA private key: {:?}", e))?;
+        .map_err(crate::error::SignatureError::ParseMlDsaPrivateKeyFailed)?;
 
     let mut signature = vec![0u8; ML_DSA_65_SIGNATURE_LEN];
     key_pair
         .sign(data, &mut signature)
-        .map_err(|e| anyhow::anyhow!("Failed to sign data: {:?}", e))?;
+        .map_err(crate::error::SignatureError::SignDataFailed)?;
 
     Ok(signature)
 }
@@ -96,7 +95,11 @@ pub fn sign_data(private_key: &[u8], data: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// # 返回
 /// - 验证是否成功
-pub fn verify_signature(public_key: &[u8], data: &[u8], signature: &[u8]) -> anyhow::Result<bool> {
+pub fn verify_signature(
+    public_key: &[u8],
+    data: &[u8],
+    signature: &[u8],
+) -> crate::error::SignatureResult<bool> {
     let public_key_obj = UnparsedPublicKey::new(&ML_DSA_65, public_key);
 
     match public_key_obj.verify(data, signature) {
@@ -131,16 +134,16 @@ impl DhtRecordSignature {
         publisher: &libp2p::PeerId,
         record_key: &[u8],
         record_value: &[u8],
-    ) -> anyhow::Result<Self> {
+    ) -> crate::error::SignatureResult<Self> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Time error: {:?}", e))?
+            .map_err(crate::error::SignatureError::TimeError)?
             .as_millis() as u64;
 
         // 生成随机盐值
         let mut salt = [0u8; 32];
         aws_lc_rs::rand::fill(&mut salt)
-            .map_err(|e| anyhow::anyhow!("Failed to generate salt: {:?}", e))?;
+            .map_err(crate::error::SignatureError::GenerateSaltFailed)?;
 
         // 计算要签名的数据哈希（包含时间戳、盐和发布者 PeerID）
         let message_hash =
@@ -174,11 +177,11 @@ impl DhtRecordSignature {
         record_value: &[u8],
         publisher: &libp2p::PeerId,
         max_age_ms: u64,
-    ) -> anyhow::Result<bool> {
+    ) -> crate::error::SignatureResult<bool> {
         // 检查时间戳是否过期
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Time error: {:?}", e))?
+            .map_err(crate::error::SignatureError::TimeError)?
             .as_millis() as u64;
 
         if now.saturating_sub(self.timestamp) > max_age_ms {
@@ -230,10 +233,10 @@ impl DhtRecordSignature {
     }
 
     /// 从字节数组反序列化
-    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> crate::error::SignatureResult<Self> {
         if bytes.len() < 48 {
             // 8 (timestamp) + 32 (salt) + 8 (sig_len)
-            return Err(anyhow::anyhow!("Signature data too short"));
+            return Err(crate::error::SignatureError::SignatureDataTooShort);
         }
 
         let timestamp = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -241,7 +244,7 @@ impl DhtRecordSignature {
         let sig_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
 
         if bytes.len() < 48 + sig_len {
-            return Err(anyhow::anyhow!("Signature data incomplete"));
+            return Err(crate::error::SignatureError::SignatureDataIncomplete);
         }
 
         let signature = bytes[48..48 + sig_len].to_vec();
@@ -291,15 +294,15 @@ impl SignedIdentityRecord {
         publisher: &libp2p::PeerId,
         record_key: &[u8],
         value: String,
-    ) -> anyhow::Result<Self> {
+    ) -> crate::error::SignatureResult<Self> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Time error: {:?}", e))?
+            .map_err(crate::error::SignatureError::TimeError)?
             .as_millis() as u64;
 
         let mut salt = [0u8; 32];
         aws_lc_rs::rand::fill(&mut salt)
-            .map_err(|e| anyhow::anyhow!("Failed to generate salt: {:?}", e))?;
+            .map_err(crate::error::SignatureError::GenerateSaltFailed)?;
 
         let publisher_str = publisher.to_string();
         let message_hash =
@@ -328,11 +331,11 @@ impl SignedIdentityRecord {
         record_key: &[u8],
         publisher: &libp2p::PeerId,
         max_age_ms: u64,
-    ) -> anyhow::Result<bool> {
+    ) -> crate::error::SignatureResult<bool> {
         // 检查时间戳是否过期
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| anyhow::anyhow!("Time error: {:?}", e))?
+            .map_err(crate::error::SignatureError::TimeError)?
             .as_millis() as u64;
 
         if now.saturating_sub(self.timestamp) > max_age_ms {
@@ -375,14 +378,13 @@ impl SignedIdentityRecord {
 }
 
 /// 反序列化 ML-DSA 公钥
-pub fn deserialize_mldsa_public_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn deserialize_mldsa_public_key(bytes: &[u8]) -> crate::error::SignatureResult<Vec<u8>> {
     // ML-DSA 65 公钥长度为 1952 字节
     if bytes.len() != ML_DSA_65_PUBLIC_KEY_LEN {
-        return Err(anyhow::anyhow!(
-            "Invalid ML-DSA 65 public key length: expected {}, got {}",
-            ML_DSA_65_PUBLIC_KEY_LEN,
-            bytes.len()
-        ));
+        return Err(crate::error::SignatureError::InvalidPublicKeyLength {
+            expected: ML_DSA_65_PUBLIC_KEY_LEN,
+            actual: bytes.len(),
+        });
     }
 
     Ok(bytes.to_vec())
@@ -394,9 +396,9 @@ pub fn serialize_mldsa_private_key(sk: &[u8]) -> Vec<u8> {
 }
 
 /// 反序列化 ML-DSA 私钥
-pub fn deserialize_mldsa_private_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn deserialize_mldsa_private_key(bytes: &[u8]) -> crate::error::SignatureResult<Vec<u8>> {
     if bytes.is_empty() {
-        return Err(anyhow::anyhow!("Empty private key"));
+        return Err(crate::error::SignatureError::EmptyPrivateKey);
     }
     Ok(bytes.to_vec())
 }

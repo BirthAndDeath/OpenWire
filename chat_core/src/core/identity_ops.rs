@@ -1,84 +1,46 @@
+use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use zeroize::Zeroizing;
 
-use crate::{core::ChatCore, crypto, identity, p2p, storage};
+use crate::{core::ChatCore, identity, p2p, storage};
 
 impl ChatCore {
     pub(crate) async fn generate_identity(&mut self) {
-        // 使用统一的完整身份生成逻辑（ML-DSA + 临时 ML-KEM）
         let temp_cfg = crate::coreconfig::CoreConfig {
             data_dir: self.data_dir.clone(),
             ..Default::default()
         };
 
         match crate::identity::generate_complete_identity(&temp_cfg).await {
-            Ok((mldsa_public_key, mlkem_public_key)) => {
-                let mldsa_public_key = mldsa_public_key.to_vec();
-                let mldsa_id = hex::encode(&mldsa_public_key);
-                let mlkem_id = hex::encode(&mlkem_public_key);
+            Ok(identity) => {
+                let mldsa_id = hex::encode(&identity.mldsa_public_key);
+                let mlkem_id = hex::encode(&identity.mlkem_public_key);
                 tracing::info!(
                     "Generated new identity: ML-DSA={}, ML-KEM={} (ephemeral)",
                     &mldsa_id[..16],
                     &mlkem_id[..16]
                 );
 
-                // 更新核心身份字段，使新身份立即生效
+                // 更新核心身份字段
                 self.mldsa_pubkey_hex = Some(mldsa_id.clone());
                 self.mldsa_identity_id = Some(mldsa_id.clone());
                 self.mlkem_pubkey_hex = Some(mlkem_id.clone());
+                self.mlkem_decap_key = Some(identity.mlkem_decap_key);
 
-                // 从存储加载新身份的 ML-DSA 私钥并缓存到内存
-                // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
-                match rootcell::identity::PrivateKeyHandle::load(
-                    &self.data_dir.to_string_lossy(),
-                    &format!("{}_mldsa", mldsa_id),
-                    None,
-                ) {
-                    Ok(handle) => {
-                        self.mldsa_private_key =
-                            Some(Zeroizing::new(handle.get_private_key().to_vec()));
+                // 加载新身份的 ML-DSA 私钥并缓存到内存
+                self.cache_mldsa_private_key(&mldsa_id);
+
+                // 重新初始化 swarm（新 PeerID）
+                self.reinitialize_swarm();
+
+                // 立即发布新身份到 DHT
+                if let Ok(store) = self.get_dht_store() {
+                    if let Some(peer_id) = self.current_peer_id {
+                        let _ = store.set_pubkey_peerid(&mldsa_id, &peer_id);
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to cache ML-DSA private key for new identity: {e}");
-                    }
+                    let _ = store.set_mlkem_pubkey(&mldsa_id, &mlkem_id);
                 }
 
-                // 生成新的临时 PeerID 并重新初始化 swarm
-                match identity::generate_temporary_peerid() {
-                    Ok(keypair) => {
-                        let peer_id = keypair.public().to_peer_id();
-                        match p2p::swarm_init(&self.data_dir, keypair.clone()) {
-                            Ok(p2p::SwarmWithValidator { swarm, validator }) => {
-                                self.swarm = swarm;
-                                self.validator = validator;
-                                self.identity_keypair = keypair;
-                                self.current_peer_id = Some(peer_id);
-
-                                // 立即发布新身份到 DHT（使用缓存的连接）
-                                if let Ok(store) = self.get_dht_store() {
-                                    let _ = store.set_pubkey_peerid(&mldsa_id, &peer_id);
-                                    let _ = store.set_mlkem_pubkey(&mldsa_id, &mlkem_id);
-                                }
-
-                                tracing::info!(
-                                    "Swarm reinitialized for new identity, PeerID={}",
-                                    peer_id
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to reinitialize swarm for new identity: {e}"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to generate temporary PeerID for new identity: {e}"
-                        );
-                    }
-                }
-
-                // 更新数据库中的当前身份标记（自动切换到新生成的身份）
+                // 更新数据库中的当前身份标记
                 if let Some(pool) = storage::pool() {
                     let _ = storage::set_current_identity(pool, &mldsa_id).await;
                 }
@@ -94,8 +56,7 @@ impl ChatCore {
         }
     }
 
-    /// 选择当前身份（通过 ML-DSA identity_id）
-    /// 运行时切换：重新加载密钥、重新生成 ML-KEM/PeerID、重新初始化 swarm
+    /// 选择当前身份（运行时切换）
     pub(crate) async fn select_identity(&mut self, identity_id: String) {
         // 1. 更新数据库中的当前身份标记
         if let Some(pool) = storage::pool() {
@@ -143,32 +104,37 @@ impl ChatCore {
         );
 
         // 3. 生成新的临时 ML-KEM 密钥对
-        let (mlkem_public_key, mlkem_secret_key) = match crypto::generate_mlkem_keypair() {
-            Ok(kp) => kp,
+        // 直接生成 DecapsulationKey 对象，避免序列化/反序列化问题
+        let mlkem_decap_key = match DecapsulationKey::generate(&ML_KEM_768) {
+            Ok(key) => key,
             Err(e) => {
-                tracing::error!("Failed to generate ML-KEM keypair: {e}");
-                self.send_warning_mpsc(format!("切换身份失败：无法生成会话密钥: {}", e))
+                tracing::error!("Failed to generate ML-KEM DecapsulationKey: {:?}", e);
+                self.send_warning_mpsc(format!("切换身份失败：无法生成会话密钥: {:?}", e))
                     .await;
                 return;
             }
         };
-        // 保存新的 ML-KEM 私钥到 Keyring
-        // 使用 Zeroizing 包装临时副本，确保保存后 drop 时自动清零内存
-        let mlkem_secret_key = Zeroizing::new(mlkem_secret_key);
-        if let Err(e) = rootcell::identity::PrivateKeyHandle::save(
-            &self.data_dir.to_string_lossy(),
-            &format!("{}_mlkem", identity_id),
-            &mlkem_secret_key,
-        ) {
-            tracing::error!("Failed to save ML-KEM private key: {e}");
-            self.send_warning_mpsc(format!("切换身份失败：无法保存会话密钥: {}", e))
-                .await;
-            return;
-        }
-        // Zeroizing 的 drop 会自动清零内存，无需手动 drop
+        let mlkem_encap_key = match mlkem_decap_key.encapsulation_key() {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("Failed to get ML-KEM EncapsulationKey: {:?}", e);
+                self.send_warning_mpsc(format!("切换身份失败：无法获取加密密钥: {:?}", e))
+                    .await;
+                return;
+            }
+        };
+        let mlkem_public_key = match mlkem_encap_key.key_bytes() {
+            Ok(key) => key.as_ref().to_vec(),
+            Err(e) => {
+                tracing::error!("Failed to serialize ML-KEM public key: {:?}", e);
+                self.send_warning_mpsc(format!("切换身份失败：无法序列化公钥: {:?}", e))
+                    .await;
+                return;
+            }
+        };
         let mlkem_pubkey_hex = hex::encode(&mlkem_public_key);
 
-        // 4. 生成新的临时 PeerID（Ed25519）
+        // 4. 生成新的临时 PeerID 并重新初始化 swarm
         let keypair = match identity::generate_temporary_peerid() {
             Ok(kp) => kp,
             Err(e) => {
@@ -180,9 +146,9 @@ impl ChatCore {
         };
         let peer_id = keypair.public().to_peer_id();
 
-        // 5. 重新初始化 swarm（新 PeerID 需要新传输层身份）
+        let dht_db = self.dht_db.clone().unwrap();
         let p2p::SwarmWithValidator { swarm, validator } =
-            match p2p::swarm_init(&self.data_dir, keypair.clone()) {
+            match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
                 Ok(sv) => sv,
                 Err(e) => {
                     tracing::error!("Failed to reinitialize swarm: {e}");
@@ -192,7 +158,7 @@ impl ChatCore {
                 }
             };
 
-        // 6. 更新 ChatCore 字段
+        // 5. 更新 ChatCore 字段
         self.swarm = swarm;
         self.validator = validator;
         self.identity_keypair = keypair;
@@ -200,11 +166,10 @@ impl ChatCore {
         self.current_peer_id = Some(peer_id);
         self.mldsa_identity_id = Some(identity_id.clone());
         self.mlkem_pubkey_hex = Some(mlkem_pubkey_hex.clone());
-        // 缓存 ML-DSA 私钥到内存，避免后续发送消息时重复访问 Keyring
-        // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
+        self.mlkem_decap_key = Some(mlkem_decap_key);
         self.mldsa_private_key = Some(Zeroizing::new(mldsa_handle.get_private_key().to_vec()));
 
-        // 7. 立即发布新身份到 DHT（使用缓存的连接）
+        // 6. 立即发布新身份到 DHT
         if let Ok(store) = self.get_dht_store() {
             let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
             let _ = store.set_mlkem_pubkey(&mldsa_pubkey_hex, &mlkem_pubkey_hex);
@@ -226,47 +191,16 @@ impl ChatCore {
                 Ok(_) => {
                     tracing::info!("Deleted identity: {}", identity_id);
 
-                    // 清理本地 DHT 数据库中该身份的所有记录
+                    // 清理本地 DHT 数据库
                     if let Ok(store) = self.get_dht_store() {
                         let _ = store.remove_pubkey_peerid(&identity_id);
                         let _ = store.remove_mlkem_pubkey(&identity_id);
-                        tracing::info!(
-                            "Cleaned up local DHT records for deleted identity: {}",
-                            &identity_id[..16]
-                        );
                     }
 
-                    // 发布空记录到 Kademlia 网络，覆盖其他节点缓存的旧记录
-                    // 注意：DHT 是分布式网络，无法强制删除其他节点上的记录，
-                    // 但通过发布空值记录可以覆盖旧记录，使后续查询返回空值。
-                    // 使用 SignedIdentityRecord 格式（空 value 表示删除），
-                    // 接收方在反序列化失败时会自动拒绝该记录。
-                    let peerid_key = format!("peerid:{}", identity_id);
-                    let mlkem_key = format!("mlkem:{}", identity_id);
-                    // 使用空 Vec 作为记录值，接收方反序列化 SignedIdentityRecord 时会失败，
-                    // 从而自动拒绝该记录（视为未找到）。
-                    let empty_record = |key: String| libp2p::kad::Record {
-                        key: libp2p::kad::RecordKey::new(&key),
-                        value: Vec::new(), // 空值，反序列化会失败，接收方视为记录不存在
-                        publisher: None,
-                        expires: None,
-                    };
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .put_record(empty_record(peerid_key), libp2p::kad::Quorum::One);
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .put_record(empty_record(mlkem_key), libp2p::kad::Quorum::One);
-                    tracing::info!(
-                        "Published tombstone records to DHT network for deleted identity: {}",
-                        &identity_id[..16]
-                    );
+                    // 发布空记录到 Kademlia 网络（墓碑记录）
+                    self.publish_tombstone_records(&identity_id);
 
-                    // 如果删除的是当前身份，重置 ChatCore 字段
+                    // 如果删除的是当前身份，重置字段
                     if self.mldsa_identity_id.as_deref() == Some(&identity_id) {
                         self.mldsa_pubkey_hex = None;
                         self.mldsa_identity_id = None;
@@ -284,5 +218,72 @@ impl ChatCore {
                 }
             }
         }
+    }
+
+    /// 缓存 ML-DSA 私钥到内存
+    fn cache_mldsa_private_key(&mut self, identity_id: &str) {
+        match rootcell::identity::PrivateKeyHandle::load(
+            &self.data_dir.to_string_lossy(),
+            &format!("{}_mldsa", identity_id),
+            None,
+        ) {
+            Ok(handle) => {
+                self.mldsa_private_key = Some(Zeroizing::new(handle.get_private_key().to_vec()));
+            }
+            Err(e) => {
+                tracing::error!("Failed to cache ML-DSA private key for new identity: {e}");
+            }
+        }
+    }
+
+    /// 重新初始化 swarm（生成新 PeerID）
+    fn reinitialize_swarm(&mut self) {
+        let dht_db = self.dht_db.clone().unwrap();
+        match identity::generate_temporary_peerid() {
+            Ok(keypair) => {
+                let peer_id = keypair.public().to_peer_id();
+                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+                    Ok(p2p::SwarmWithValidator { swarm, validator }) => {
+                        self.swarm = swarm;
+                        self.validator = validator;
+                        self.identity_keypair = keypair;
+                        self.current_peer_id = Some(peer_id);
+                        tracing::info!("Swarm reinitialized, PeerID={}", peer_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to reinitialize swarm: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to generate temporary PeerID: {e}");
+            }
+        }
+    }
+
+    /// 发布空记录到 Kademlia 网络（墓碑记录）
+    fn publish_tombstone_records(&mut self, identity_id: &str) {
+        let peerid_key = format!("peerid:{}", identity_id);
+        let mlkem_key = format!("mlkem:{}", identity_id);
+        let empty_record = |key: String| libp2p::kad::Record {
+            key: libp2p::kad::RecordKey::new(&key),
+            value: Vec::new(),
+            publisher: None,
+            expires: None,
+        };
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(empty_record(peerid_key), libp2p::kad::Quorum::One);
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .put_record(empty_record(mlkem_key), libp2p::kad::Quorum::One);
+        tracing::info!(
+            "Published tombstone records to DHT network for deleted identity: {}",
+            &identity_id[..16]
+        );
     }
 }

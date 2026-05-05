@@ -2,11 +2,14 @@
 #![doc = include_str!("../../README.md")]
 use std::collections::HashMap;
 
-use anyhow::Context;
 use chat_core::ChatCore;
+use chat_core::IncomingMessage;
+use chat_core::MessageEvent;
 use chat_core::storage::{self, Contact, Identity, list_contacts, list_identities, pool};
+use error::CliError;
 use etcetera::BaseStrategy;
 use ratatui::widgets::ListState;
+pub mod error;
 pub mod notui;
 pub mod tui;
 pub mod use_json;
@@ -33,12 +36,12 @@ pub struct App {
     identities: Vec<Identity>,
     identity_list_state: ListState,
     status_message: String, // 状态提示信息
-    /// 当前选中的联系人 ML-DSA 公钥 hex（用于过滤消息显示）
-    selected_contact: Option<String>,
     /// 在线联系人数量（通过 libp2p 连接事件更新）
     online_peers: usize,
     /// 文件发送模式：为 true 时，按 Enter 将输入框内容作为文件路径发送
     file_send_mode: bool,
+    /// 添加联系人模式：为 true 时，按 Ctrl+Enter 将输入框内容作为公钥添加联系人
+    add_contact_mode: bool,
     /// 剪贴板实例（复用避免每次创建）
     clipboard: Option<arboard::Clipboard>,
 }
@@ -108,11 +111,11 @@ impl App {
     ///
     /// 如果提供了 `password`（原始密码），使用 Argon2id 派生密钥后初始化。
     /// 否则先尝试无密码初始化；如果 Keyring 不可用，交互式提示用户输入密码。
-    pub async fn try_init(password: Option<&str>) -> anyhow::Result<App> {
+    pub async fn try_init(password: Option<&str>) -> Result<App, CliError> {
         let data_dir = etcetera::choose_base_strategy()
-            .context("Failed to get base strategy")?
+            .map_err(|_| CliError::BaseStrategyFailed)?
             .config_dir()
-            .join("myapp");
+            .join("chat");
         let log_path = data_dir.join("log");
         #[cfg(debug_assertions)]
         let log_level = "debug";
@@ -154,12 +157,18 @@ impl App {
                 let password = match rpassword::read_password() {
                     Ok(p) => p,
                     Err(rp_err) => {
-                        anyhow::bail!("无法读取密码输入: {}. 原始错误: {}", rp_err, e);
+                        return Err(CliError::PasswordReadFailed(format!(
+                            "无法读取密码输入: {}. 原始错误: {}",
+                            rp_err, e
+                        )));
                     }
                 };
 
                 if password.trim().is_empty() {
-                    anyhow::bail!("用户取消了密码输入。Keyring 错误: {}", e);
+                    return Err(CliError::PasswordCancelled(format!(
+                        "用户取消了密码输入。Keyring 错误: {}",
+                        e
+                    )));
                 }
 
                 // 使用统一的 Argon2id KDF 派生密钥
@@ -181,7 +190,10 @@ impl App {
                         return Self::build_app(core, data_dir).await;
                     }
                     Err(e2) => {
-                        anyhow::bail!("密码派生密钥初始化也失败: {}. 原始 Keyring 错误: {}", e2, e);
+                        return Err(CliError::KeyDerivationFailed(format!(
+                            "密码派生密钥初始化也失败: {}. 原始 Keyring 错误: {}",
+                            e2, e
+                        )));
                     }
                 }
             }
@@ -189,11 +201,11 @@ impl App {
     }
 
     /// 在初始化 ChatCore 后构建 App 实例
-    async fn build_app(core: ChatCore, _data_dir: std::path::PathBuf) -> anyhow::Result<App> {
+    async fn build_app(core: ChatCore, _data_dir: std::path::PathBuf) -> Result<App, CliError> {
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // 默认选中第一条消息
         let core_handle = core.core_handle.clone();
-        let pool = pool().context("Database pool not initialized")?;
+        let pool = pool().ok_or(CliError::PoolNotInitialized)?;
         let owner = storage::get_current_identity(pool)
             .await
             .ok()
@@ -238,9 +250,9 @@ impl App {
             identities,
             identity_list_state: ListState::default(),
             status_message: String::new(),
-            selected_contact: None,
             online_peers: 0,
             file_send_mode: false,
+            add_contact_mode: false,
             clipboard: None,
         })
     }
@@ -271,5 +283,67 @@ impl App {
     /// 获取当前身份信息
     pub fn current_identity(&self) -> Option<&Identity> {
         self.identities.iter().find(|id| id.is_current == 1)
+    }
+
+    /// 统一处理 MessageEvent — 更新 App 内部状态
+    ///
+    /// 所有 CLI 模式（notui/tui/json）共享此方法，避免重复的 match 逻辑。
+    /// 调用方在返回后根据自身模式做额外输出（println / JSON / 渲染）。
+    pub fn handle_message_event(&mut self, msg: MessageEvent) {
+        match msg {
+            MessageEvent::ReceiveMessage(msg) => {
+                match msg {
+                    IncomingMessage::Text { text, sender } => {
+                        self.push_message_to(&sender, format!("[对方] {}", text));
+                    }
+                    IncomingMessage::FileShare {
+                        filename,
+                        file_id,
+                        total_size,
+                        sender,
+                        ..
+                    } => {
+                        self.push_message_to(
+                            &sender,
+                            format!(
+                                "[文件] {} ({} bytes, id={})",
+                                filename,
+                                total_size,
+                                &file_id[..16]
+                            ),
+                        );
+                    }
+                    IncomingMessage::DeliveryReceipt { peer_id, .. } => {
+                        self.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
+                    }
+                }
+                // 更新选中状态到最新消息
+                let msg_count = self.current_messages().len();
+                if msg_count > 0 {
+                    self.message_list_state.select(Some(msg_count - 1));
+                }
+            }
+            MessageEvent::OnlineStatus { count } => {
+                self.online_peers = count;
+            }
+            MessageEvent::FileTransferProgress(progress) => {
+                self.push_message(format!(
+                    "[文件传输] {} ({}/{}) - {}",
+                    progress.filename,
+                    progress.received_bytes,
+                    progress.total_size,
+                    progress.status,
+                ));
+            }
+            MessageEvent::Warning(data) => {
+                self.push_message(format!("[警告] {}", data));
+            }
+            MessageEvent::Log(data) => {
+                self.push_message(format!("[日志] {}", data));
+            }
+            MessageEvent::Error(data) => {
+                self.push_message(format!("[错误] {}", data));
+            }
+        }
     }
 }

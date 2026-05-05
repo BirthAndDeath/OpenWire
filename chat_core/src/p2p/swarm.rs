@@ -1,4 +1,3 @@
-use anyhow::Context;
 use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, ping, relay};
@@ -6,6 +5,7 @@ use libp2p::{PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, ping, relay};
 use redb::Database;
 use std::num::NonZero;
 use std::ops::Deref;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use super::behaviour::MyBehaviour;
 use super::bootstrap;
 use super::dht;
 use super::validator::{RecordValidator, RecordValidatorConfig};
+use crate::error::{P2pError, P2pResult};
 use crate::{ChatMessage, ChatResponse};
 
 use std::sync::LazyLock;
@@ -25,15 +26,46 @@ static PROTOCOL_KAD: LazyLock<StreamProtocol> =
 static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/rr_msg/0.0.1"));
 
-/// 请求消息最大大小（1MB）
-const REQUEST_SIZE_MAX: usize = 1024 * 1024;
-/// 响应消息最大大小（1MB）
+// ============================================================================
+// DDoS 防护配置
+// ============================================================================
+
+/// 请求消息最大大小（非文件消息，256KB）
 ///
-/// 虽然当前 ChatResponse 仅包含 timestamp（8 字节），但将响应大小限制提升至与请求一致，
-/// 避免未来扩展时（如文件下载 chunk 响应）因大小限制不足导致通信失败。
-const RESPONSE_SIZE_MAX: usize = 1024 * 1024;
-/// Identify 缓存大小
+/// 普通聊天消息远小于此值，256KB 足以容纳加密后的消息+元数据。
+/// 文件传输使用专门的 FileStreamChunk 协议，不经过 request-response。
+const REQUEST_SIZE_MAX: usize = 256 * 1024;
+/// 响应消息最大大小（256KB）
+const RESPONSE_SIZE_MAX: usize = 256 * 1024;
+
+/// Identify 协议缓存大小
 const IDENTIFY_CACHE_SIZE: usize = 100;
+
+/// 空闲连接超时（秒）
+///
+/// 连接空闲（无活跃流、无待处理流、所有 handler 返回 keep_alive=false）后，
+/// 等待此时间后关闭连接。防止僵尸连接占用资源。
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 30;
+
+/// 每个连接最大并发协商入站流数
+///
+/// 防止攻击者通过大量并发入站流协商请求耗尽连接资源。
+const MAX_NEGOTIATING_INBOUND_STREAMS: usize = 5;
+
+/// request-response 协议最大并发流数
+///
+/// 限制每个连接上同时处理的请求-响应流数量，防止单个连接洪泛。
+const RR_MAX_CONCURRENT_STREAMS: usize = 10;
+
+/// 并发拨号因子
+///
+/// 单个出站连接尝试中并发拨号的地址数。降低此值可减少出站连接洪泛的影响。
+const DIAL_CONCURRENCY_FACTOR: u8 = 3;
+
+// ============================================================================
+// Kademlia 配置
+// ============================================================================
+
 /// Kademlia 查询超时（秒）
 const KAD_QUERY_TIMEOUT_SECS: u64 = 60;
 /// Kademlia 复制因子
@@ -46,10 +78,20 @@ const KAD_BOOTSTRAP_INTERVAL_SECS: u64 = 300;
 const KAD_PROVIDER_TTL_SECS: u64 = 24 * 60 * 60;
 /// Kademlia 发布间隔（秒）- 1小时
 const KAD_PUBLICATION_INTERVAL_SECS: u64 = 60 * 60;
+
+// ============================================================================
+// DHT 存储限制
+// ============================================================================
+
 /// 每个节点最大记录数
-const MAX_RECORDS_PER_PEER: usize = 1000;
+///
+/// 防止单个 peer 通过发布大量 DHT 记录耗尽存储资源。
+const MAX_RECORDS_PER_PEER: usize = 500;
 /// 签名最大允许年龄（毫秒）
 const MAX_SIGNATURE_AGE_MS: u64 = 60000;
+
+/// 路由表缓存文件名
+const ROUTING_TABLE_CACHE_FILE: &str = "routing_table.cache";
 
 /// Swarm 初始化结果，包含 swarm 和 validator
 pub struct SwarmWithValidator {
@@ -63,10 +105,14 @@ pub struct SwarmWithValidator {
 /// - 补充：QUIC（原生 TLS 1.3，性能更优）
 /// - 发现：mDNS 局域网自动发现
 /// - 消息：rrmsg
+///
+/// `dht_db` 是共享的 DHT 数据库连接（Arc<Database>），由调用方统一管理，
+/// 避免多个组件各自打开数据库导致文件锁冲突。
 pub fn swarm_init(
-    data_dir: &std::path::Path,
+    data_dir: &Path,
     keypair: libp2p::identity::Keypair,
-) -> anyhow::Result<SwarmWithValidator> {
+    dht_db: Arc<Database>,
+) -> P2pResult<SwarmWithValidator> {
     // 创建记录验证器（基于签名验证）
     let validator_config = RecordValidatorConfig {
         max_records_per_peer: MAX_RECORDS_PER_PEER,
@@ -82,7 +128,8 @@ pub fn swarm_init(
         // QUIC 传输层：内置 TLS 1.3，0-RTT，更好 NAT 穿透
         .with_quic()
         // DNS 解析（支持 /dns4, /dns6, /dnsaddr）
-        .with_dns()?
+        .with_dns()
+        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
         .with_behaviour(|key| {
             let peer_id = key.public().to_peer_id();
 
@@ -90,18 +137,29 @@ pub fn swarm_init(
                 .set_request_size_maximum(REQUEST_SIZE_MAX as u64)
                 .set_response_size_maximum(RESPONSE_SIZE_MAX as u64);
 
+            // 配置 request-response 协议，限制并发流数防止洪泛攻击
+            let rr_config = rrconfig::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
+
             let rr_msg = cbor::Behaviour::with_codec(
                 codec,
                 [(PROTOCOL_MSGRR.deref().to_owned(), ProtocolSupport::Full)],
-                rrconfig::default(),
+                rr_config,
             );
 
             // --- mDNS 配置 ---
             let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
+                    .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
-            // 创建 Kademlia 行为实例（传入 validator 引用，用于 put() 签名验证）
-            let kademlia = create_kademlia_with_validator(peer_id, data_dir, validator.clone())?;
+            // 创建 Kademlia 行为实例（传入共享的 DHT 数据库连接和 validator）
+            let kademlia = create_kademlia_with_validator(
+                peer_id,
+                dht_db.clone(),
+                validator.clone(),
+                data_dir,
+            )?;
             let identify_config =
                 identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
                     .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
@@ -120,27 +178,42 @@ pub fn swarm_init(
                 relay,
                 dcutr,
             })
-        })?
+        })
+        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
+        // Swarm 级 DDoS 防护配置
+        .with_swarm_config(|cfg| {
+            cfg.with_idle_connection_timeout(Duration::from_secs(IDLE_CONNECTION_TIMEOUT_SECS))
+                .with_max_negotiating_inbound_streams(MAX_NEGOTIATING_INBOUND_STREAMS)
+                .with_dial_concurrency_factor(
+                    NonZero::new(DIAL_CONCURRENCY_FACTOR).expect("DIAL_CONCURRENCY_FACTOR > 0"),
+                )
+        })
         .build();
 
     // 端口 0 表示系统自动分配
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    swarm.listen_on("/ip6/::/udp/0/quic-v1".parse()?)?;
+    swarm
+        .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    swarm
+        .listen_on("/ip6/::/udp/0/quic-v1".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
 
     Ok(SwarmWithValidator { swarm, validator })
 }
 
 /// 创建 Kademlia 行为（带签名验证器）
+///
+/// 使用调用方传入的共享 `Arc<Database>`，避免重复打开导致文件锁冲突。
 fn create_kademlia_with_validator(
     peer_id: PeerId,
-    data_dir: &std::path::Path,
+    db: Arc<Database>,
     validator: Arc<std::sync::RwLock<RecordValidator>>,
-) -> anyhow::Result<kad::Behaviour<dht::ResourceLimitedRecordStore>> {
-    let db_path = data_dir.join("dht.redb");
-    // 先删除旧数据库文件，再创建新的（切换身份时 DHT 存储需要重新初始化）
-    let _ = std::fs::remove_file(&db_path);
-    let db = Arc::new(Database::create(&db_path).context("Failed to create DHT database")?);
-
+    data_dir: &Path,
+) -> P2pResult<kad::Behaviour<dht::ResourceLimitedRecordStore>> {
     // 配置资源限制
     let limits = dht::ResourceLimits {
         max_records_per_peer: MAX_RECORDS_PER_PEER,
@@ -154,9 +227,11 @@ fn create_kademlia_with_validator(
 
     // 配置Kademlia网络参数
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
-    let replication_factor =
-        NonZero::new(KAD_REPLICATION_FACTOR).context("KAD_REPLICATION_FACTOR must be non-zero")?;
-    let parallelism = NonZero::new(KAD_PARALLELISM).context("KAD_PARALLELISM must be non-zero")?;
+    let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
+        P2pError::SwarmInitFailed("KAD_REPLICATION_FACTOR must be non-zero".into())
+    })?;
+    let parallelism = NonZero::new(KAD_PARALLELISM)
+        .ok_or_else(|| P2pError::SwarmInitFailed("KAD_PARALLELISM must be non-zero".into()))?;
     let _ = &mut config
         .set_query_timeout(Duration::from_secs(KAD_QUERY_TIMEOUT_SECS))
         .set_replication_factor(replication_factor)
@@ -167,13 +242,168 @@ fn create_kademlia_with_validator(
 
     let mut kademlia = kad::Behaviour::with_config(peer_id, store, config);
     kademlia.set_mode(Some(Mode::Server));
-    for (peerid, addr) in bootstrap::BOOTSTRAP {
-        let peer_id = PeerId::from_str(peerid).context("Failed to parse bootstrap peer ID")?;
-        let multiaddr = bootstrap::resolve_dnsaddr(addr)?;
-        kademlia.add_address(&peer_id, multiaddr);
+
+    // 先加载缓存的路由表（如果存在），减少对 bootstrap 节点的单点依赖
+    let cache_path = data_dir.join(ROUTING_TABLE_CACHE_FILE);
+    let cached_count = load_routing_table(&mut kademlia, &cache_path);
+    if cached_count > 0 {
+        tracing::info!(
+            "Loaded {} cached peers from routing table cache, skipping bootstrap",
+            cached_count
+        );
+    } else {
+        // 无缓存时使用硬编码的 bootstrap 节点
+        for (peerid, addr) in bootstrap::BOOTSTRAP {
+            let peer_id = PeerId::from_str(peerid).map_err(|e| {
+                P2pError::SwarmInitFailed(
+                    format!("Failed to parse bootstrap peer ID: {}", e).into(),
+                )
+            })?;
+            let multiaddr = bootstrap::resolve_dnsaddr(addr).map_err(|e| {
+                P2pError::SwarmInitFailed(format!("Failed to resolve dnsaddr: {}", e).into())
+            })?;
+            kademlia.add_address(&peer_id, multiaddr);
+        }
     }
+
     if let Err(e) = kademlia.bootstrap() {
         tracing::trace!("Bootstrap error: {}", e);
     }
     Ok(kademlia)
+}
+
+// ============================================================================
+// 路由表持久化（PEX）
+// ============================================================================
+
+/// 将当前 Kademlia 路由表中的已知 peers 保存到缓存文件。
+///
+/// 序列化格式：每行一个 peer，格式为 `PeerIdBase58 multiaddr1 multiaddr2 ...`
+/// 使用 Base58 编码 PeerId，Multiaddr 使用其标准字符串表示。
+///
+/// 此函数在以下时机调用：
+/// 1. `ChatCore::drop()` — 正常退出时保存
+/// 2. 主事件循环中定期调用 — 确保运行期间缓存持续更新
+///
+/// 缓存文件保留在磁盘上，即使程序崩溃也不会丢失上次保存的路由表。
+pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
+    let entries = {
+        let kademlia = swarm.behaviour_mut();
+        let mut peers: Vec<(PeerId, Vec<String>)> = Vec::new();
+
+        for bucket in kademlia.kademlia.kbuckets() {
+            for entry in bucket.iter() {
+                let peer_id = entry.node.key.preimage();
+                let addrs: Vec<String> = entry.node.value.iter().map(|a| a.to_string()).collect();
+                if !addrs.is_empty() {
+                    peers.push((*peer_id, addrs));
+                }
+            }
+        }
+        peers
+    };
+
+    if entries.is_empty() {
+        tracing::debug!("Routing table is empty, skipping cache save");
+        return;
+    }
+
+    match std::fs::File::create(cache_path) {
+        Ok(file) => {
+            use std::io::Write;
+            let mut writer = std::io::BufWriter::new(file);
+            for (peer_id, addrs) in &entries {
+                let line = format!("{} {}\n", peer_id.to_base58(), addrs.join(" "));
+                if let Err(e) = writer.write_all(line.as_bytes()) {
+                    tracing::warn!("Failed to write routing table cache entry: {}", e);
+                    return;
+                }
+            }
+            if let Err(e) = writer.flush() {
+                tracing::warn!("Failed to flush routing table cache: {}", e);
+            }
+            tracing::info!(
+                "Saved {} peers to routing table cache: {:?}",
+                entries.len(),
+                cache_path
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create routing table cache file {:?}: {}",
+                cache_path,
+                e
+            );
+        }
+    }
+}
+
+/// 从缓存文件加载路由表，将缓存的 peers 添加到 Kademlia 路由表中。
+///
+/// 返回成功加载的 peer 数量。
+/// 如果缓存文件不存在或格式错误，返回 0。
+fn load_routing_table(
+    kademlia: &mut kad::Behaviour<dht::ResourceLimitedRecordStore>,
+    cache_path: &Path,
+) -> usize {
+    if !cache_path.exists() {
+        return 0;
+    }
+
+    let content = match std::fs::read_to_string(cache_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to read routing table cache {:?}: {}", cache_path, e);
+            return 0;
+        }
+    };
+
+    let mut loaded_count = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // 格式: "PeerIdBase58 multiaddr1 multiaddr2 ..."
+        let mut parts = line.splitn(2, ' ');
+        let peer_id_str = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let addrs_str = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let peer_id = match PeerId::from_str(peer_id_str) {
+            Ok(pid) => pid,
+            Err(e) => {
+                tracing::trace!("Skipping invalid PeerId in routing table cache: {}", e);
+                continue;
+            }
+        };
+
+        for addr_str in addrs_str.split(' ') {
+            let addr_str = addr_str.trim();
+            if addr_str.is_empty() {
+                continue;
+            }
+            match addr_str.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => {
+                    kademlia.add_address(&peer_id, addr);
+                }
+                Err(e) => {
+                    tracing::trace!(
+                        "Skipping invalid Multiaddr '{}' in routing table cache: {}",
+                        addr_str,
+                        e
+                    );
+                }
+            }
+        }
+        loaded_count += 1;
+    }
+
+    loaded_count
 }

@@ -6,6 +6,8 @@ use sqlx::{
 use std::{path::Path, time::Duration};
 use tracing;
 
+use crate::error::{StorageError, StorageResult};
+
 static DB_POOL: std::sync::OnceLock<Pool<Sqlite>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, FromRow)]
@@ -18,14 +20,16 @@ pub struct Identity {
 
 // ========== 初始化 ==========
 
-pub async fn init(cfg: &CoreConfig) -> anyhow::Result<()> {
+pub async fn init(cfg: &CoreConfig) -> StorageResult<()> {
     let db_path = cfg.data_dir.join("database.sqlite");
     init_path(&db_path).await
 }
 
-pub async fn init_path(path: &Path) -> anyhow::Result<()> {
+pub async fn init_path(path: &Path) -> StorageResult<()> {
     if path.is_dir() {
-        anyhow::bail!("Database path must be a file");
+        return Err(StorageError::InvalidPath(
+            "Database path must be a file".to_string(),
+        ));
     }
     let is_new = !path.exists();
     if let Some(p) = path.parent() {
@@ -61,7 +65,7 @@ pub async fn init_path(path: &Path) -> anyhow::Result<()> {
 
     DB_POOL
         .set(pool)
-        .map_err(|_| anyhow::anyhow!("Pool already initialized"))?;
+        .map_err(|_| StorageError::PoolAlreadyInitialized)?;
     Ok(())
 }
 
@@ -72,7 +76,7 @@ pub fn pool() -> Option<&'static Pool<Sqlite>> {
 // ========== 身份管理（以 ML-DSA 公钥为唯一身份标识） ==========
 
 /// 添加新身份（ML-DSA 公钥 hex 作为 identity_id）
-pub async fn add_identity(pool: &Pool<Sqlite>, identity_id: &str) -> anyhow::Result<()> {
+pub async fn add_identity(pool: &Pool<Sqlite>, identity_id: &str) -> StorageResult<()> {
     sqlx::query(
         "INSERT INTO identities (identity_id, is_current) VALUES (?, 0) ON CONFLICT(identity_id) DO NOTHING",
     )
@@ -83,7 +87,7 @@ pub async fn add_identity(pool: &Pool<Sqlite>, identity_id: &str) -> anyhow::Res
 }
 
 /// 获取当前身份的 identity_id（ML-DSA 公钥 hex）
-pub async fn get_current_identity(pool: &Pool<Sqlite>) -> anyhow::Result<Option<String>> {
+pub async fn get_current_identity(pool: &Pool<Sqlite>) -> StorageResult<Option<String>> {
     let row = sqlx::query_scalar::<_, String>(
         "SELECT identity_id FROM identities WHERE is_current = 1 LIMIT 1",
     )
@@ -92,7 +96,7 @@ pub async fn get_current_identity(pool: &Pool<Sqlite>) -> anyhow::Result<Option<
     Ok(row)
 }
 
-pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> anyhow::Result<()> {
+pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> StorageResult<()> {
     sqlx::query("UPDATE identities SET is_current = 0")
         .execute(pool)
         .await?;
@@ -103,7 +107,7 @@ pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> any
     Ok(())
 }
 
-pub async fn list_identities(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Identity>> {
+pub async fn list_identities(pool: &Pool<Sqlite>) -> StorageResult<Vec<Identity>> {
     sqlx::query_as::<_, Identity>(
         r#"SELECT id, identity_id, is_current, created_at FROM identities ORDER BY id"#,
     )
@@ -116,7 +120,7 @@ pub async fn delete_identity(
     pool: &Pool<Sqlite>,
     data_dir: &Path,
     identity_id: &str,
-) -> anyhow::Result<u64> {
+) -> StorageResult<u64> {
     let data_dir_str = data_dir.to_string_lossy();
 
     // 1. 删除加密的私钥文件

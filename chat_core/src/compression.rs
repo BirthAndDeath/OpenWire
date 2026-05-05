@@ -44,7 +44,7 @@ pub fn compression_level(msgtype: crate::message::ChatMessageType) -> i32 {
 /// # 注意
 /// 此方法会将整个数据加载到内存，仅适用于小数据（建议 <1MB）。
 /// 对于大文件，请使用 [`compress_file`] 进行流式处理。
-pub async fn compress(data: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
+pub async fn compress(data: &[u8], level: i32) -> crate::error::CompressionResult<Vec<u8>> {
     use futures::io::Cursor;
 
     let reader = Cursor::new(data);
@@ -53,7 +53,9 @@ pub async fn compress(data: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
         ZstdEncoder::with_quality(buf_reader, async_compression::Level::Precise(level));
 
     let mut output = Vec::new();
-    futures::io::copy(&mut encoder, &mut output).await?;
+    futures::io::copy(&mut encoder, &mut output)
+        .await
+        .map_err(crate::error::CompressionError::CompressFailed)?;
 
     Ok(output)
 }
@@ -71,16 +73,15 @@ pub async fn compress(data: &[u8], level: i32) -> anyhow::Result<Vec<u8>> {
 /// # 注意
 /// 此方法会将整个数据加载到内存，仅适用于小数据（建议 <1MB）。
 /// 对于大文件，请使用 [`decompress_file`] 进行流式处理。
-pub async fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub async fn decompress(data: &[u8]) -> crate::error::CompressionResult<Vec<u8>> {
     if data.is_empty() {
-        return Err(anyhow::anyhow!("Compressed data is empty"));
+        return Err(crate::error::CompressionError::CompressedDataEmpty);
     }
 
     // 限制输入数据大小，防止处理过大的非有效负载或潜在的 DoS
     if data.len() > DECOMPRESS_MAX_SIZE * 2 {
-        return Err(anyhow::anyhow!(
-            "Compressed data is suspiciously large: {} bytes",
-            data.len()
+        return Err(crate::error::CompressionError::CompressedDataTooLarge(
+            data.len(),
         ));
     }
 
@@ -90,12 +91,13 @@ pub async fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let decoder = ZstdDecoder::new(reader);
 
     let mut output = Vec::new();
-    futures::io::copy(decoder, &mut output).await?;
+    futures::io::copy(decoder, &mut output)
+        .await
+        .map_err(crate::error::CompressionError::DecompressFailed)?;
 
     if output.len() > DECOMPRESS_MAX_SIZE {
-        return Err(anyhow::anyhow!(
-            "Decompressed data exceeds size limit: {} bytes",
-            output.len()
+        return Err(crate::error::CompressionError::DecompressedDataTooLarge(
+            output.len(),
         ));
     }
 
@@ -115,9 +117,13 @@ pub async fn compress_file(
     input_path: &Path,
     output_path: &Path,
     level: i32,
-) -> anyhow::Result<()> {
-    let input_file = File::open(input_path).await?;
-    let output_file = File::create(output_path).await?;
+) -> crate::error::CompressionResult<()> {
+    let input_file = File::open(input_path)
+        .await
+        .map_err(crate::error::CompressionError::FileIoError)?;
+    let output_file = File::create(output_path)
+        .await
+        .map_err(crate::error::CompressionError::FileIoError)?;
 
     // 将 tokio AsyncRead 转换为 futures AsyncRead
     let reader = input_file.compat();
@@ -131,7 +137,9 @@ pub async fn compress_file(
     let mut writer = output_file.compat_write();
 
     // 使用 futures::io::copy 进行流式复制（自动压缩）
-    futures::io::copy(&mut encoder, &mut writer).await?;
+    futures::io::copy(&mut encoder, &mut writer)
+        .await
+        .map_err(crate::error::CompressionError::CompressFailed)?;
 
     Ok(())
 }
@@ -144,9 +152,16 @@ pub async fn compress_file(
 /// # 参数
 /// - `input_path`: 已压缩的源文件路径
 /// - `output_path`: 目标文件路径（解压后）
-pub async fn decompress_file(input_path: &Path, output_path: &Path) -> anyhow::Result<()> {
-    let input_file = File::open(input_path).await?;
-    let output_file = File::create(output_path).await?;
+pub async fn decompress_file(
+    input_path: &Path,
+    output_path: &Path,
+) -> crate::error::CompressionResult<()> {
+    let input_file = File::open(input_path)
+        .await
+        .map_err(crate::error::CompressionError::FileIoError)?;
+    let output_file = File::create(output_path)
+        .await
+        .map_err(crate::error::CompressionError::FileIoError)?;
 
     // 将 tokio AsyncRead 转换为 futures AsyncRead
     let reader = input_file.compat();
@@ -159,7 +174,9 @@ pub async fn decompress_file(input_path: &Path, output_path: &Path) -> anyhow::R
     let mut writer = output_file.compat_write();
 
     // 使用 futures::io::copy 进行流式复制（自动解压）
-    futures::io::copy(&mut decoder, &mut writer).await?;
+    futures::io::copy(&mut decoder, &mut writer)
+        .await
+        .map_err(crate::error::CompressionError::DecompressFailed)?;
 
     Ok(())
 }
@@ -190,7 +207,7 @@ mod tests {
     async fn test_decompress_empty_data() {
         let result = decompress(&[]).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("empty"));
+        assert!(result.unwrap_err().to_string().contains("空"));
     }
 
     #[test]

@@ -2,16 +2,24 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
-use anyhow::Context;
 use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey, ML_KEM_768};
 use blake3;
 
 /// ML-KEM-768 公钥大小（字节）
-const MLKEM768_PUBLIC_KEY_SIZE: usize = 1184;
+///
+/// 注意：aws-lc-rs 的 ML_KEM_768 实际公钥大小为 1184 字节。
+/// 此常量用于序列化/反序列化时的容量预分配，不做严格校验。
+pub const MLKEM768_PUBLIC_KEY_SIZE: usize = 1184;
 /// ML-KEM-768 私钥大小（字节）
-const MLKEM768_SECRET_KEY_SIZE: usize = 2400;
+///
+/// 注意：aws-lc-rs 的 ML_KEM_768 实际私钥大小为 2400 字节。
+/// 此常量用于序列化/反序列化时的容量预分配，不做严格校验。
+pub const MLKEM768_SECRET_KEY_SIZE: usize = 2400;
 /// ML-KEM-768 密文大小（字节）
-const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
+///
+/// aws-lc-rs 的 ML_KEM_768 encapsulate() 返回标准 ML-KEM-768 的
+/// ciphertext，大小为 1088 字节。
+pub const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 
 /// 当前加密协议版本
 ///
@@ -23,70 +31,6 @@ const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 /// 若需支持消息序列化格式的向前兼容，应在 ChatMessage 结构体中
 /// 添加独立的 version 字段。
 const CURRENT_ENCRYPTION_VERSION: u8 = 1;
-
-/// ML-KEM/Kyber 密钥对类型别名
-pub type MlKemKeypair = (Vec<u8>, Vec<u8>); // (public_key, secret_key)
-
-/// 生成新的 ML-KEM 密钥对（临时密钥交换）
-///
-/// # 设计说明
-/// ML-KEM 密钥对是**临时**的，每次会话重新生成。
-/// 持久化身份由 ML-DSA 公钥提供，ML-KEM 仅用于一次会话的密钥封装。
-///
-/// # 返回
-/// - public_key: 公钥(用于加密)
-/// - secret_key: 私钥(用于解密)
-pub fn generate_mlkem_keypair() -> anyhow::Result<MlKemKeypair> {
-    let decap_key =
-        DecapsulationKey::generate(&ML_KEM_768).context("Failed to generate ML-KEM-768 keypair")?;
-
-    let encap_key = decap_key
-        .encapsulation_key()
-        .context("Failed to get encapsulation key")?;
-
-    let pk_bytes = encap_key
-        .key_bytes()
-        .context("Failed to serialize public key")?;
-    let sk_bytes = decap_key
-        .key_bytes()
-        .context("Failed to serialize private key")?;
-
-    Ok((pk_bytes.as_ref().to_vec(), sk_bytes.as_ref().to_vec()))
-}
-
-/// 将 ML-KEM 公钥序列化为字节数组
-pub fn serialize_mlkem_public_key(pk: &[u8]) -> Vec<u8> {
-    pk.to_vec()
-}
-
-/// 从字节数组反序列化 ML-KEM 公钥
-pub fn deserialize_mlkem_public_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if bytes.len() != MLKEM768_PUBLIC_KEY_SIZE {
-        return Err(anyhow::anyhow!(
-            "Invalid ML-KEM public key length: expected {}, got {}",
-            MLKEM768_PUBLIC_KEY_SIZE,
-            bytes.len()
-        ));
-    }
-    Ok(bytes.to_vec())
-}
-
-/// 将 ML-KEM 私钥序列化为字节数组
-pub fn serialize_mlkem_private_key(sk: &[u8]) -> Vec<u8> {
-    sk.to_vec()
-}
-
-/// 从字节数组反序列化 ML-KEM 私钥
-pub fn deserialize_mlkem_private_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if bytes.len() != MLKEM768_SECRET_KEY_SIZE {
-        return Err(anyhow::anyhow!(
-            "Invalid ML-KEM private key length: expected {}, got {}",
-            MLKEM768_SECRET_KEY_SIZE,
-            bytes.len()
-        ));
-    }
-    Ok(bytes.to_vec())
-}
 
 /// 使用 ML-KEM/Kyber + AES-GCM 进行混合加密
 ///
@@ -101,37 +45,37 @@ pub fn deserialize_mlkem_private_key(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// 2. 得到共享密钥和封装的密文
 /// 3. 从共享密钥派生 AES 密钥
 /// 4. 使用 AES-GCM 加密实际消息数据
-/// 5. 返回：encapsulated_key + nonce + ciphertext
+/// 5. 返回：version + encapsulated_key + nonce + ciphertext
 ///
 /// # 优势
 /// - **后量子安全**：ML-KEM/Kyber 是 NIST 标准化的后量子密钥封装机制
 /// - **身份与加密分离**：ML-DSA 提供持久身份，ML-KEM 提供临时会话加密
 /// - **前向保密**：每次加密使用随机性，相同的明文产生不同的密文
-pub fn encrypt_message(data: &[u8], recipient_mlkem_public_key: &[u8]) -> anyhow::Result<Vec<u8>> {
-    // 1. 验证公钥长度并反序列化
-    let pk_bytes = deserialize_mlkem_public_key(recipient_mlkem_public_key)?;
+pub fn encrypt_message(
+    data: &[u8],
+    recipient_mlkem_public_key: &[u8],
+) -> crate::error::CryptoResult<Vec<u8>> {
+    // 1. 使用 AWS LC RS 进行密钥封装(KEM)
+    let encap_key = EncapsulationKey::new(&ML_KEM_768, recipient_mlkem_public_key)
+        .map_err(crate::error::CryptoError::InvalidMlKemPublicKey)?;
 
-    // 2. 使用 AWS LC RS 进行密钥封装(KEM)
-    let encap_key = EncapsulationKey::new(&ML_KEM_768, &pk_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid ML-KEM public key: {:?}", e))?;
-
-    let (shared_secret, ciphertext_kem) = encap_key
+    let (ciphertext_kem, shared_secret) = encap_key
         .encapsulate()
-        .map_err(|e| anyhow::anyhow!("KEM encapsulation failed: {:?}", e))?;
+        .map_err(crate::error::CryptoError::KemEncapsulationFailed)?;
 
-    // 3. 从共享密钥派生 AES-256 密钥
+    // 2. 从共享密钥派生 AES-256 密钥
     let aes_key = derive_aes_key_from_mlkem(shared_secret.as_ref());
 
-    // 4. 生成随机 nonce
+    // 3. 生成随机 nonce
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-    // 5. 使用 AES-GCM 加密数据
+    // 4. 使用 AES-GCM 加密数据
     let cipher = Aes256Gcm::new(&aes_key.into());
     let ciphertext = cipher
         .encrypt(&nonce, data)
-        .map_err(|e| anyhow::anyhow!("AES-GCM encryption failed: {}", e))?;
+        .map_err(|e| crate::error::CryptoError::AesGcmEncryptionFailed(e.to_string()))?;
 
-    // 6. 组合:version + ciphertext_kem + nonce + ciphertext
+    // 5. 组合: version + ciphertext_kem + nonce + ciphertext
     let kem_ciphertext_bytes = ciphertext_kem.as_ref();
     let mut result = Vec::with_capacity(
         1 + // version byte
@@ -151,6 +95,17 @@ pub fn encrypt_message(data: &[u8], recipient_mlkem_public_key: &[u8]) -> anyhow
 
 /// 使用 ML-KEM/Kyber + AES-GCM 进行混合解密
 ///
+/// # 参数
+/// - `encrypted_data`: 加密数据（version + kem_ciphertext + nonce + aes_ciphertext）
+/// - `decap_key`: ML-KEM 解封装密钥对象（由 ChatCore 缓存，避免序列化/反序列化问题）
+///
+/// # 设计说明
+/// 注意：此函数接受 `&DecapsulationKey` 而非 `&[u8]` 私钥字节。
+/// 这是因为 aws-lc-rs 的 `DecapsulationKey::key_bytes()` 输出格式与
+/// `DecapsulationKey::new()` 输入格式不兼容（已知的库限制），
+/// 因此无法通过序列化/反序列化私钥字节来重建 DecapsulationKey。
+/// 解决方案是在 ChatCore 中缓存 DecapsulationKey 对象，直接传入引用。
+///
 /// # 流程
 /// 1. 提取 Kyber 封装的密文
 /// 2. 使用本地 Kyber 私钥进行解封装,得到共享密钥
@@ -158,52 +113,44 @@ pub fn encrypt_message(data: &[u8], recipient_mlkem_public_key: &[u8]) -> anyhow
 /// 4. 使用 AES-GCM 解密数据
 pub fn decrypt_message(
     encrypted_data: &[u8],
-    local_mlkem_private_key: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    // 1. 验证私钥长度并反序列化
-    let sk_bytes = deserialize_mlkem_private_key(local_mlkem_private_key)?;
-
-    // 2. 检查版本标识并解析 KEM 封装的密文
+    decap_key: &DecapsulationKey,
+) -> crate::error::CryptoResult<Vec<u8>> {
+    // 1. 检查版本标识
     if encrypted_data.is_empty() {
-        return Err(anyhow::anyhow!("Encrypted data is empty"));
+        return Err(crate::error::CryptoError::EncryptedDataEmpty);
     }
 
     let version = encrypted_data[0];
     if version != CURRENT_ENCRYPTION_VERSION {
-        return Err(anyhow::anyhow!(
-            "Unsupported encryption version: {}. Current version is {}",
+        return Err(crate::error::CryptoError::UnsupportedEncryptionVersion {
             version,
-            CURRENT_ENCRYPTION_VERSION
-        ));
+            current: CURRENT_ENCRYPTION_VERSION,
+        });
     }
 
     let data_without_version = &encrypted_data[1..];
-    let kem_ciphertext_size = MLKEM768_CIPHERTEXT_SIZE;
-    if data_without_version.len() < kem_ciphertext_size {
-        return Err(anyhow::anyhow!(
-            "Encrypted data too short to contain KEM ciphertext"
-        ));
+
+    // 2. 提取 KEM 封装的密文（固定大小）
+    if data_without_version.len() < MLKEM768_CIPHERTEXT_SIZE {
+        return Err(crate::error::CryptoError::EncryptedDataTooShort);
     }
 
-    let (kem_ciphertext_bytes, rest) = data_without_version.split_at(kem_ciphertext_size);
+    let (kem_ciphertext_bytes, rest) = data_without_version.split_at(MLKEM768_CIPHERTEXT_SIZE);
 
     // 3. 使用私钥解封装,得到共享密钥
-    let decap_key = DecapsulationKey::new(&ML_KEM_768, &sk_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid ML-KEM private key: {:?}", e))?;
-
     // 将字节切片转换为 Ciphertext 类型
     let ciphertext: aws_lc_rs::kem::Ciphertext = kem_ciphertext_bytes.into();
 
     let shared_secret = decap_key
         .decapsulate(ciphertext)
-        .map_err(|e| anyhow::anyhow!("KEM decapsulation failed: {:?}", e))?;
+        .map_err(crate::error::CryptoError::KemDecapsulationFailed)?;
 
     // 4. 从共享密钥派生 AES-256 密钥
     let aes_key = derive_aes_key_from_mlkem(shared_secret.as_ref());
 
     // 5. 分离 nonce 和 ciphertext
     if rest.len() < 12 {
-        return Err(anyhow::anyhow!("Encrypted data too short to contain nonce"));
+        return Err(crate::error::CryptoError::EncryptedDataTooShort);
     }
     let (nonce_bytes, ciphertext) = rest.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
@@ -212,7 +159,7 @@ pub fn decrypt_message(
     let cipher = Aes256Gcm::new(&aes_key.into());
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("AES-GCM decryption failed: {}", e))?;
+        .map_err(|e| crate::error::CryptoError::AesGcmDecryptionFailed(e.to_string()))?;
 
     Ok(plaintext)
 }
@@ -236,20 +183,6 @@ fn derive_aes_key_from_mlkem(shared_secret: &[u8]) -> [u8; 32] {
     key
 }
 
-/// 验证公钥是否与 PeerID 匹配
-///
-/// libp2p 的 PeerID 就是从公钥计算得出的，所以这个验证非常可靠
-pub fn verify_public_key_matches_peer_id(
-    public_key: &[u8],
-    peer_id: &libp2p::PeerId,
-) -> anyhow::Result<bool> {
-    // 从公钥重建 libp2p PublicKey
-    let pk = libp2p::identity::PublicKey::try_decode_protobuf(public_key)?;
-    let computed_peer_id = pk.to_peer_id();
-
-    Ok(&computed_peer_id == peer_id)
-}
-
 /// 恒定时间比较两个字节数组
 ///
 /// 防止时序攻击，无论比较结果如何，都执行相同数量的操作
@@ -266,13 +199,118 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     result == 0
 }
 
-/// 使用恒定时间比较验证两个字节数组是否相等
-///
-/// 适用于比较密钥、哈希值等敏感数据
-pub fn verify_bytes_constant_time(a: &[u8], b: &[u8]) -> anyhow::Result<()> {
-    if constant_time_compare(a, b) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Bytes do not match"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mlkem_encrypt_decrypt_roundtrip() {
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let plaintext = b"Hello, ML-KEM encryption!";
+        let encrypted = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        println!("加密输出总大小: {} 字节", encrypted.len());
+        println!("  版本: {} 字节", 1);
+        println!("  KEM 密文: {} 字节", MLKEM768_CIPHERTEXT_SIZE);
+        println!("  Nonce: {} 字节", 12);
+        println!(
+            "  AES-GCM 密文: {} 字节",
+            encrypted.len() - 1 - MLKEM768_CIPHERTEXT_SIZE - 12
+        );
+
+        assert_eq!(encrypted[0], CURRENT_ENCRYPTION_VERSION, "版本字节应为 1");
+
+        let decrypted = decrypt_message(&encrypted, &decap_key).unwrap();
+        assert_eq!(decrypted, plaintext, "解密后的数据应与原始明文一致");
+    }
+
+    #[test]
+    fn test_mlkem_encrypt_short_data() {
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let plaintext = b"ss";
+        let encrypted = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        println!("短数据加密后总大小: {} 字节", encrypted.len());
+        println!("  KEM 密文: {} 字节", MLKEM768_CIPHERTEXT_SIZE);
+        println!(
+            "  AES-GCM 密文: {} 字节",
+            encrypted.len() - 1 - MLKEM768_CIPHERTEXT_SIZE - 12
+        );
+
+        let decrypted = decrypt_message(&encrypted, &decap_key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_mlkem_wrong_key_decrypt_fails() {
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let wrong_decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成错误的 DecapsulationKey 失败");
+
+        let plaintext = b"secret message";
+        let encrypted = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        let result = decrypt_message(&encrypted, &wrong_decap_key);
+        assert!(result.is_err(), "使用错误的私钥解密应该失败");
+    }
+
+    #[test]
+    fn test_mlkem_tampered_ciphertext_fails() {
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let plaintext = b"test data";
+        let mut encrypted = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        let aes_start = 1 + MLKEM768_CIPHERTEXT_SIZE + 12;
+        if encrypted.len() > aes_start {
+            encrypted[aes_start] ^= 0xFF;
+        }
+
+        let result = decrypt_message(&encrypted, &decap_key);
+        assert!(result.is_err(), "篡改后的密文解密应该失败");
+    }
+
+    #[test]
+    fn test_mlkem_multiple_encryptions_different() {
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let plaintext = b"same data";
+        let encrypted1 = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+        let encrypted2 = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        assert_ne!(encrypted1, encrypted2, "两次加密结果应该不同");
+
+        assert_eq!(
+            decrypt_message(&encrypted1, &decap_key).unwrap(),
+            decrypt_message(&encrypted2, &decap_key).unwrap()
+        );
     }
 }

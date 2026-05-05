@@ -28,6 +28,7 @@
 //! - 加密文件加载后以只读方式管理
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow;
 use tracing;
@@ -41,6 +42,46 @@ const KEYRING_SERVICE: &str = "rootcell";
 
 /// 主密钥在 Keyring 中的标识符（短标识，避免平台长度限制）
 const MASTER_KEY_IDENTIFIER: &str = "rc_master";
+
+/// 全局标志：Keyring 默认存储是否已初始化
+static KEYRING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// 确保 Keyring 的默认存储后端已初始化。
+///
+/// keyring v4 架构变更：`keyring-core` 不再自动检测存储后端，
+/// 需要显式调用 `set_default_store()` 注册后端。
+/// 此函数在首次调用时通过 `keyring::use_native_store()` 设置平台原生存储。
+///
+/// 线程安全：使用 AtomicBool 确保只初始化一次。
+fn ensure_keyring_initialized() {
+    if KEYRING_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    // 使用 CAS 确保只有一个线程执行初始化
+    if KEYRING_INITIALIZED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return; // 其他线程已初始化
+    }
+
+    // keyring v4 架构变更：需要显式调用 use_native_store() 注册平台原生存储后端。
+    //
+    // Linux/BSD: 传 `true` 强制使用 Secret Service (dbus)，避免 keyutils（内核密钥环）
+    // 不支持持久化存储的问题。
+    // 其他平台: 传 `false` 使用平台默认后端（macOS Keychain, Windows Credential Manager）。
+    let not_keyutils = cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd"
+    ));
+    if let Err(e) = keyring::use_native_store(not_keyutils) {
+        tracing::warn!(
+            "Failed to initialize native keyring store: {}. Keyring will be unavailable.",
+            e
+        );
+    }
+}
 
 /// 私钥存储方式
 #[derive(Debug, Clone, PartialEq)]
@@ -79,9 +120,12 @@ impl PrivateKeyHandle {
     ///
     /// 主密钥仅 32 字节，identifier 仅 9 字符，不会触发平台长度限制。
     pub fn generate_and_save_master_key() -> anyhow::Result<[u8; 32]> {
+        // 确保 Keyring 默认存储后端已初始化（keyring v4 需要显式设置）
+        ensure_keyring_initialized();
+
         let key: [u8; 32] = rand::random();
         let key_hex = hex::encode(key);
-        match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
+        match keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
             Ok(entry) => {
                 entry.set_password(&key_hex)?;
                 tracing::info!("✅ Generated and saved master key to Keyring");
@@ -95,7 +139,10 @@ impl PrivateKeyHandle {
 
     /// 从 Keyring 加载主密钥
     pub fn load_master_key() -> anyhow::Result<Option<[u8; 32]>> {
-        match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
+        // 确保 Keyring 默认存储后端已初始化（keyring v4 需要显式设置）
+        ensure_keyring_initialized();
+
+        match keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
             Ok(entry) => match entry.get_password() {
                 Ok(pwd) if !pwd.trim().is_empty() => {
                     let decoded = hex::decode(pwd.trim())?;
@@ -133,16 +180,40 @@ impl PrivateKeyHandle {
         Self::load_master_key().ok().flatten().is_some()
     }
 
+    /// 检查 Keyring 是否真正可用。
+    ///
+    /// 直接检测默认存储后端是否已成功注册，无需创建测试条目。
+    /// `ensure_keyring_initialized()` 调用 `use_native_store()` 注册后端，
+    /// 注册成功后 `get_default_store()` 返回 `Some`。
+    ///
+    /// # 与 `load_master_key()` 的区别
+    ///
+    /// `load_master_key()` 返回 `Ok(None)` 有两种可能：
+    /// 1. Keyring 可用但还没有主密钥（正常情况）
+    /// 2. Keyring 完全不可用（后端未初始化、dbus 服务未运行等）
+    /// - 无法区分，因此需要独立的可用性检测。
+    ///
+    /// # 返回
+    /// - `true`: Keyring 可用
+    /// - `false`: Keyring 不可用（后端未初始化或连接失败）
+    pub fn check_keyring_available() -> bool {
+        ensure_keyring_initialized();
+        keyring_core::get_default_store().is_some()
+    }
+
     /// 删除 Keyring 中的主密钥
     pub fn delete_master_key() -> anyhow::Result<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
+        // 确保 Keyring 默认存储后端已初始化（keyring v4 需要显式设置）
+        ensure_keyring_initialized();
+
+        let entry = keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
         match entry.get_password() {
             Ok(_) => {
                 entry.delete_credential()?;
                 tracing::info!("Deleted master key from Keyring");
                 Ok(())
             }
-            Err(keyring::Error::NoEntry) => {
+            Err(keyring_core::Error::NoEntry) => {
                 tracing::debug!("Master key not found in Keyring, skipping deletion");
                 Ok(())
             }

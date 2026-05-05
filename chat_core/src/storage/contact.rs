@@ -1,5 +1,7 @@
 use sqlx::{FromRow, Pool, Sqlite};
 
+use crate::error::StorageResult;
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Contact {
     pub mldsa_pubkey_hex: String,          // 对方 ML-DSA 公钥 hex
@@ -19,7 +21,7 @@ pub async fn upsert_contact(
     mldsa_pubkey_hex: &str,
     name: Option<&str>,
     mlkem_public_key: Option<&[u8]>,
-) -> anyhow::Result<()> {
+) -> StorageResult<()> {
     sqlx::query(
         r#"INSERT INTO contacts (owner_identity_id, mldsa_pubkey_hex, name, mlkem_public_key, added_at)
           VALUES (?1, ?2, ?3, ?4, unixepoch())
@@ -41,7 +43,7 @@ pub async fn get_contact_mlkem_pubkey(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
     mldsa_pubkey_hex: &str,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> StorageResult<Option<Vec<u8>>> {
     let result = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT mlkem_public_key FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2",
     )
@@ -58,7 +60,7 @@ pub async fn update_contact_mlkem_pubkey(
     owner_identity_id: &str,
     mldsa_pubkey_hex: &str,
     mlkem_public_key: &[u8],
-) -> anyhow::Result<bool> {
+) -> StorageResult<bool> {
     let rows = sqlx::query(
         "UPDATE contacts SET mlkem_public_key = ? WHERE owner_identity_id = ?2 AND mldsa_pubkey_hex = ?3",
     )
@@ -76,7 +78,7 @@ pub async fn get_contact_by_mldsa_pubkey(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
     mldsa_pubkey: &[u8],
-) -> anyhow::Result<Option<Contact>> {
+) -> StorageResult<Option<Contact>> {
     let mldsa_pubkey_hex = hex::encode(mldsa_pubkey);
     let result = sqlx::query_as::<_, Contact>(
         "SELECT mldsa_pubkey_hex, owner_identity_id, name, mlkem_public_key, added_at FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2",
@@ -93,7 +95,7 @@ pub async fn is_contact_exists(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
     mldsa_pubkey_hex: &str,
-) -> anyhow::Result<bool> {
+) -> StorageResult<bool> {
     let result = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2",
     )
@@ -109,7 +111,7 @@ pub async fn delete_contact(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
     mldsa_pubkey_hex: &str,
-) -> anyhow::Result<u64> {
+) -> StorageResult<u64> {
     Ok(
         sqlx::query("DELETE FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2")
             .bind(owner_identity_id)
@@ -124,7 +126,7 @@ pub async fn delete_contact(
 pub async fn list_contacts(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
-) -> anyhow::Result<Vec<Contact>> {
+) -> StorageResult<Vec<Contact>> {
     sqlx::query_as::<_, Contact>(
         r#"SELECT mldsa_pubkey_hex, owner_identity_id, name, mlkem_public_key, added_at
           FROM contacts WHERE owner_identity_id = ? ORDER BY added_at DESC"#,

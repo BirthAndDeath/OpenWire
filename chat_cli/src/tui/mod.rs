@@ -1,12 +1,11 @@
-use anyhow::Context;
-use chat_core::{IncomingMessage, MessageEvent};
+use crate::error::CliError;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 
 use crate::{App, Focus};
@@ -15,16 +14,22 @@ pub mod event;
 pub mod render;
 
 /// TUI 模式
-pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
+pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
     let mut event_stream = crossterm::event::EventStream::new();
     enable_raw_mode()?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     terminal.clear()?;
-    let mut core = app.core.take().context("Core not initialized")?;
-    let mut rx = core.take_rx_message().context("消息通道未初始化")?;
+    let mut core = app.core.take().ok_or(CliError::CoreNotInitialized)?;
+    let mut rx = core
+        .take_rx_message()
+        .ok_or(CliError::ChannelNotInitialized)?;
     let mut tick = interval(Duration::from_millis(16));
     let core_joinhandle = core.run();
+
+    // 粘贴检测：记录上次字符输入时间，快速连续输入时跳过中间渲染
+    let mut last_char_time = Instant::now();
+    let paste_debounce = Duration::from_millis(50);
 
     loop {
         let should_render;
@@ -32,49 +37,7 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
         tokio::select! {
             msg = rx.recv() => {
                 if let Some(msg) = msg {
-                    match msg {
-                        MessageEvent::ReceiveMessage(msg) => {
-                            match msg {
-                                IncomingMessage::Text { text, sender } => {
-                                    app.push_message_to(&sender, format!("[对方] {}", text));
-                                }
-                                IncomingMessage::FileShare { filename, file_id, total_size, sender, .. } => {
-                                    app.push_message_to(&sender, format!("[文件] {} ({} bytes, id={})", filename, total_size, &file_id[..16]));
-                                }
-                                IncomingMessage::DeliveryReceipt { peer_id, .. } => {
-                                    app.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
-                                }
-                                IncomingMessage::OnlineStatus { count } => {
-                                    app.online_peers = count;
-                                }
-                            }
-                            should_render = true;
-                            continue;
-                        }
-                        MessageEvent::FileTransferProgress(progress) => {
-                            app.push_message(format!(
-                                "[文件传输] {} ({}/{}) - {}",
-                                progress.filename,
-                                progress.received_bytes,
-                                progress.total_size,
-                                progress.status,
-                            ));
-                        }
-                        MessageEvent::Warning(data) => {
-                            app.push_message(format!("[警告] {}", data));
-                        }
-                        MessageEvent::Log(data) => {
-                            app.push_message(format!("[日志] {}", data));
-                        }
-                        MessageEvent::Error(data) => {
-                            app.push_message(format!("[错误] {}", data));
-                        }
-                    }
-                    // 更新选中状态到最新消息
-                    let msg_count = app.current_messages().len();
-                    if msg_count > 0 {
-                        app.message_list_state.select(Some(msg_count - 1));
-                    }
+                    app.handle_message_event(msg);
                     should_render = true;
                 } else {
                     break;
@@ -96,7 +59,21 @@ pub async fn tui_run(app: &mut App) -> anyhow::Result<()> {
                         }
                     }
                 }
-                should_render = true;
+                // 粘贴优化：如果连续字符输入间隔 < 50ms，跳过渲染，由 tick 定时器负责刷新
+                if let Event::Key(key) = &event
+                    && let KeyCode::Char(_) = key.code
+                    && key.kind == KeyEventKind::Press
+                {
+                    let now = Instant::now();
+                    if now - last_char_time < paste_debounce {
+                        should_render = false;
+                    } else {
+                        should_render = true;
+                    }
+                    last_char_time = now;
+                } else {
+                    should_render = true;
+                }
             }
             _ = tick.tick() => {
                 should_render = true;

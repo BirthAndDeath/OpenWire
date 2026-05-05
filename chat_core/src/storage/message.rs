@@ -1,5 +1,7 @@
 use sqlx::{FromRow, Pool, Row, Sqlite};
 
+use crate::error::{StorageError, StorageResult};
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Message {
     pub id: i64,
@@ -23,7 +25,7 @@ pub async fn add_message(
     content: &str,
     is_outgoing: bool,
     pending: bool,
-) -> anyhow::Result<i64> {
+) -> StorageResult<i64> {
     let pending_val = if pending { 1 } else { 0 };
     let row = sqlx::query(
         r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts)
@@ -52,7 +54,7 @@ pub async fn add_message_with_hash(
     is_outgoing: bool,
     pending: bool,
     message_hash: &str,
-) -> anyhow::Result<Option<i64>> {
+) -> StorageResult<Option<i64>> {
     // 先检查哈希是否已存在
     let existing: Option<String> =
         sqlx::query_scalar("SELECT message_hash FROM messages WHERE message_hash = ?1 LIMIT 1")
@@ -82,7 +84,7 @@ pub async fn add_message_with_hash(
     Ok(Some(row.get(0)))
 }
 
-pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<Option<Message>> {
+pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<Option<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE id = ?"#,
@@ -99,7 +101,7 @@ pub async fn get_messages(
     peer_pubkey_hex: &str,
     before: Option<i64>,
     limit: i64,
-) -> anyhow::Result<Vec<Message>> {
+) -> StorageResult<Vec<Message>> {
     // 限制最大查询数量防止DoS
     let limit = limit.min(1000);
 
@@ -123,7 +125,7 @@ pub async fn get_last_message(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
     peer_pubkey_hex: &str,
-) -> anyhow::Result<Option<Message>> {
+) -> StorageResult<Option<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC LIMIT 1"#,
@@ -135,7 +137,7 @@ pub async fn get_last_message(
     .map_err(Into::into)
 }
 
-pub async fn delete_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<u64> {
+pub async fn delete_message(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<u64> {
     Ok(sqlx::query("DELETE FROM messages WHERE id = ?")
         .bind(msg_id)
         .execute(pool)
@@ -143,12 +145,28 @@ pub async fn delete_message(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<
         .rows_affected())
 }
 
+/// 删除与指定联系人的所有聊天记录
+pub async fn delete_messages_by_peer(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
+) -> StorageResult<u64> {
+    Ok(
+        sqlx::query("DELETE FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2")
+            .bind(owner_identity_id)
+            .bind(peer_pubkey_hex)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
 // ========== 批量操作 ==========
 
 pub async fn add_messages_batch(
     pool: &Pool<Sqlite>,
     messages: &[(String, String, String, bool, bool)], // (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending)
-) -> anyhow::Result<Vec<i64>> {
+) -> StorageResult<Vec<i64>> {
     let mut tx = pool.begin().await?;
     let mut ids = Vec::with_capacity(messages.len());
 
@@ -172,12 +190,12 @@ pub async fn add_messages_batch(
     Ok(ids)
 }
 
-pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> anyhow::Result<u64> {
+pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
     if ids.len() > 1000 {
-        anyhow::bail!("Batch size too large");
+        return Err(StorageError::BatchSizeTooLarge);
     }
 
     // 使用参数化查询，无注入风险
@@ -195,12 +213,12 @@ pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> anyhow::Result
     Ok(query.execute(pool).await?.rows_affected())
 }
 
-pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> anyhow::Result<u64> {
+pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<u64> {
     if ids.is_empty() {
         return Ok(0);
     }
     if ids.len() > 1000 {
-        anyhow::bail!("Batch size too large");
+        return Err(StorageError::BatchSizeTooLarge);
     }
 
     let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{}", i)).collect();
@@ -219,7 +237,7 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> anyhow::
 
 // ========== 待发送消息管理（离线消息队列） ==========
 
-pub async fn list_pending(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
+pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE pending = 1 ORDER BY ts"#,
@@ -229,7 +247,7 @@ pub async fn list_pending(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
     .map_err(Into::into)
 }
 
-pub async fn list_failed(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
+pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE pending = 2 ORDER BY ts"#,
@@ -239,7 +257,7 @@ pub async fn list_failed(pool: &Pool<Sqlite>) -> anyhow::Result<Vec<Message>> {
     .map_err(Into::into)
 }
 
-pub async fn mark_sent(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<bool> {
+pub async fn mark_sent(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 0 WHERE id = ?")
         .bind(msg_id)
         .execute(pool)
@@ -248,7 +266,7 @@ pub async fn mark_sent(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<bool>
     Ok(rows > 0)
 }
 
-pub async fn mark_pending(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<bool> {
+pub async fn mark_pending(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 1 WHERE id = ?")
         .bind(msg_id)
         .execute(pool)
@@ -257,8 +275,23 @@ pub async fn mark_pending(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<bo
     Ok(rows > 0)
 }
 
-pub async fn mark_failed(pool: &Pool<Sqlite>, msg_id: i64) -> anyhow::Result<bool> {
+pub async fn mark_failed(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 2 WHERE id = ?")
+        .bind(msg_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows > 0)
+}
+
+/// 更新消息的 message_hash 字段（用于重发后修正 hash）
+pub async fn update_message_hash(
+    pool: &Pool<Sqlite>,
+    msg_id: i64,
+    new_hash: &str,
+) -> StorageResult<bool> {
+    let rows = sqlx::query("UPDATE messages SET message_hash = ? WHERE id = ?")
+        .bind(new_hash)
         .bind(msg_id)
         .execute(pool)
         .await?

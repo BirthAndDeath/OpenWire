@@ -1,4 +1,5 @@
 use crate::App;
+use crate::error::CliError;
 use chat_core::IncomingMessage;
 use chat_core::MessageEvent;
 use chat_core::storage;
@@ -8,15 +9,12 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
-pub async fn no_tui_run(app: &mut App) -> anyhow::Result<()> {
+pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
     // 获取对 core 的引用并启动它
-    let mut core = app
-        .core
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("核心未初始化"))?;
+    let mut core = app.core.take().ok_or(CliError::CoreNotInitialized)?;
     let rx = core
         .take_rx_message()
-        .ok_or_else(|| anyhow::anyhow!("消息通道未初始化"))?;
+        .ok_or(CliError::ChannelNotInitialized)?;
     let handle = core.core_handle.clone();
 
     // 启动核心服务
@@ -162,7 +160,7 @@ pub async fn no_tui_run(app: &mut App) -> anyhow::Result<()> {
             println!("[我] {}", message);
         }
 
-        anyhow::Ok(())
+        Ok::<(), CliError>(())
     });
 
     // 等待输入处理任务完成（实际上不会完成，直到用户中断）

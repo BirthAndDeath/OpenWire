@@ -1,9 +1,11 @@
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
 
+use aws_lc_rs::kem::DecapsulationKey;
 use libp2p::{PeerId, Swarm};
 use lru::LruCache;
 use tokio::sync::mpsc;
 use tokio::try_join;
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 /// 消息通道容量
@@ -17,6 +19,7 @@ use crate::{
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
     coreconfig::CoreConfig,
     corehandle::CoreHandle,
+    error::{CoreError, CoreResult},
     identity,
     log::init_logger,
     message::{ChatMessage, ChatMessageType},
@@ -25,10 +28,12 @@ use crate::{
 };
 
 pub mod command_handler;
+pub mod contact_ops;
 pub mod dht_ops;
 pub mod event_loop;
 pub mod file_transfer;
 pub mod identity_ops;
+pub mod message_ops;
 
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 pub struct ChatCore {
@@ -72,13 +77,27 @@ pub struct ChatCore {
     pub(crate) dht_db: Option<std::sync::Arc<redb::Database>>,
     /// 已建立连接的 PeerID 集合（用于在线状态计数）
     pub(crate) connected_peers: std::collections::HashSet<PeerId>,
+    /// 当前会话的 ML-KEM 解封装密钥对象（缓存，避免序列化/反序列化问题）
+    ///
+    /// # 设计说明
+    /// aws-lc-rs 的 `DecapsulationKey::key_bytes()` 输出格式与
+    /// `DecapsulationKey::new()` 输入格式不兼容（已知的库限制），
+    /// 因此无法通过序列化/反序列化私钥字节来重建 DecapsulationKey。
+    /// 解决方案是在 ChatCore 中缓存 DecapsulationKey 对象，直接传入引用。
+    ///
+    /// 此字段在 try_init() 中初始化，生命周期与 ChatCore 实例相同。
+    /// 每次会话重新生成 ML-KEM 密钥对时，此字段也会更新。
+    pub(crate) mlkem_decap_key: Option<DecapsulationKey>,
 }
 
 impl ChatCore {
     /// 异步初始化核心
-    pub async fn try_init(cfg: CoreConfig) -> anyhow::Result<Self> {
+    pub async fn try_init(cfg: CoreConfig) -> CoreResult<Self> {
         if let Err(e) = init_logger(&cfg) {
-            return Err(anyhow::anyhow!("Failed to init logger:{}", e));
+            return Err(CoreError::InitFailed(format!(
+                "Failed to init logger: {}",
+                e
+            )));
         };
 
         // 确保数据目录存在，防止因目录缺失导致身份文件无法读写而反复生成新身份
@@ -87,14 +106,17 @@ impl ChatCore {
         }
         tracing::info!("Initializing chat core with data dir: {:?}", cfg.data_dir);
 
-        let _ = try_join!(storage::init(&cfg))?;
+        let _ = try_join!(storage::init(&cfg))
+            .map_err(|e| CoreError::InitFailed(format!("Storage init failed: {}", e)))?;
 
         // 加载或生成完整身份（ML-DSA 持久化 + ML-KEM 临时）
-        let (mldsa_public_key, mlkem_public_key) =
-            identity::load_or_generate_complete_identity(&cfg).await?;
-        let mldsa_public_key = mldsa_public_key.to_vec();
+        let identity = identity::load_or_generate_complete_identity(&cfg)
+            .await
+            .map_err(|e| CoreError::InitFailed(format!("Identity init failed: {}", e)))?;
+        let mldsa_public_key = identity.mldsa_public_key.to_vec();
         let mldsa_identity_id = hex::encode(&mldsa_public_key);
-        let mlkem_pubkey_hex = hex::encode(&mlkem_public_key);
+        let mlkem_pubkey_hex = hex::encode(&identity.mlkem_public_key);
+        let mlkem_decap_key = identity.mlkem_decap_key;
         tracing::info!(
             "Loaded identity: ML-DSA={}, ML-KEM={} (ephemeral)",
             &mldsa_identity_id[..16],
@@ -108,7 +130,10 @@ impl ChatCore {
                 &cfg.data_dir.to_string_lossy(),
                 &format!("{}_mldsa", mldsa_identity_id),
                 cfg.passwd.as_deref(),
-            )?;
+            )
+            .map_err(|e| {
+                CoreError::InitFailed(format!("Failed to load ML-DSA private key: {}", e))
+            })?;
 
             // 如果当前是密码派生模式但 Keyring 可用，自动升级到 Keyring 存储
             if let Err(e) = handle.try_upgrade_to_keyring() {
@@ -123,12 +148,27 @@ impl ChatCore {
         };
 
         // 为当前会话生成临时的 libp2p PeerID（不持久化）
-        let keypair = identity::generate_temporary_peerid()?;
+        let keypair = identity::generate_temporary_peerid().map_err(|e| {
+            CoreError::InitFailed(format!("Failed to generate temporary PeerID: {}", e))
+        })?;
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Generated temporary PeerID for transport: {}", peer_id);
 
+        // 先初始化 DHT 数据库连接（共享连接池），再传入 swarm_init，
+        // 避免 swarm_init 内部 create_kademlia_with_validator 再次打开同一文件导致锁冲突。
+        let dht_db = {
+            let dht_path = cfg.data_dir.join("dht.redb");
+            // 先删除旧数据库文件（切换身份时 DHT 存储需要重新初始化）
+            let _ = std::fs::remove_file(&dht_path);
+            let db = redb::Database::create(&dht_path).map_err(|e| {
+                CoreError::InitFailed(format!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))
+            })?;
+            Some(Arc::new(db))
+        };
+
         let p2p::SwarmWithValidator { swarm, validator } =
-            p2p::swarm_init(&cfg.data_dir, keypair.clone())?;
+            p2p::swarm_init(&cfg.data_dir, keypair.clone(), dht_db.clone().unwrap())
+                .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -156,14 +196,7 @@ impl ChatCore {
             );
         }
 
-        // 初始化 DHT 数据库连接（缓存，避免每次发送消息都打开/关闭）
-        // 注意：必须成功创建，否则后续 send_text 等操作会失败
-        let dht_db = {
-            let dht_path = cfg.data_dir.join("dht.redb");
-            let db = redb::Database::create(&dht_path)
-                .map_err(|e| anyhow::anyhow!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))?;
-            Some(Arc::new(db))
-        };
+        let shutdown_token = CancellationToken::new();
 
         Ok(ChatCore {
             swarm,
@@ -174,7 +207,10 @@ impl ChatCore {
             rx_cmd: cmd_rx,
             mdns_cache,
             data_dir: cfg.data_dir.clone(),
-            core_handle: CoreHandle { cmd_tx },
+            core_handle: CoreHandle {
+                cmd_tx,
+                shutdown_token,
+            },
             mldsa_pubkey_hex: Some(mldsa_pubkey_hex_for_dht),
             current_peer_id: Some(peer_id_for_dht),
             mldsa_identity_id: Some(mldsa_identity_id),
@@ -185,15 +221,16 @@ impl ChatCore {
             file_path_map: HashMap::new(),
             dht_db,
             connected_peers: std::collections::HashSet::new(),
+            mlkem_decap_key: Some(mlkem_decap_key),
         })
     }
 
     /// 获取缓存的 DHT 数据库连接，返回 RedbRecordStore
     /// 如果数据库连接不可用，返回错误
-    pub(crate) fn get_dht_store(&self) -> anyhow::Result<p2p::dht::RedbRecordStore> {
+    pub(crate) fn get_dht_store(&self) -> CoreResult<p2p::dht::RedbRecordStore> {
         match self.dht_db {
             Some(ref db) => Ok(p2p::dht::RedbRecordStore::new(db.clone())),
-            None => Err(anyhow::anyhow!("DHT 数据库连接未初始化")),
+            None => Err(CoreError::DhtDatabaseNotInitialized),
         }
     }
 
@@ -218,7 +255,7 @@ impl ChatCore {
         &self,
         msgtype: ChatMessageType,
         data: Vec<u8>,
-    ) -> anyhow::Result<ChatMessage> {
+    ) -> CoreResult<ChatMessage> {
         // data 已由调用方预处理（FileStream 类型在 FileStreamChunk::from_file 中压缩）
         let processed_data = data;
 
@@ -226,15 +263,18 @@ impl ChatCore {
         let mldsa_private_key = self
             .mldsa_private_key
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("ML-DSA private key not cached in memory"))?;
+            .ok_or(CoreError::MlDsaPrivateKeyNotCached)?;
         let mldsa_public_key =
-            crate::identity::extract_public_key_from_private(mldsa_private_key, true)?;
+            crate::identity::extract_public_key_from_private(mldsa_private_key, true).map_err(
+                |e| CoreError::InitFailed(format!("Failed to extract public key: {}", e)),
+            )?;
         ChatMessage::new_signed(
             msgtype,
             processed_data,
             mldsa_private_key,
             &mldsa_public_key,
         )
+        .map_err(CoreError::MessageError)
     }
 
     /// 发送日志事件到外部通道
@@ -261,10 +301,28 @@ impl ChatCore {
             tracing::error!("Failed to send message event: {e}");
         }
     }
+
+    /// 发送在线状态更新事件（独立事件，不混入消息历史）
+    pub(crate) async fn send_online_status(&mut self, count: usize) {
+        if let Err(e) = self
+            .tx_message
+            .send(MessageEvent::OnlineStatus { count })
+            .await
+        {
+            tracing::error!("Failed to send online status event: {e}");
+        }
+    }
 }
 
 impl Drop for ChatCore {
     fn drop(&mut self) {
+        // 先触发取消信号，让 DHT 注册循环等后台任务优雅退出
+        self.core_handle.shutdown_token.cancel();
+        // 再发送关闭命令，让主事件循环退出
         let _ = self.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
+
+        // 保存路由表到缓存文件，下次启动时可跳过 bootstrap 节点
+        let cache_path = self.data_dir.join("routing_table.cache");
+        p2p::save_routing_table(&mut self.swarm, &cache_path);
     }
 }

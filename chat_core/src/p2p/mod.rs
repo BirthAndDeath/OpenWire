@@ -7,12 +7,15 @@ pub mod validator;
 
 pub use behaviour::MyBehaviour;
 pub use events::swarm_event;
-pub use swarm::{SwarmWithValidator, swarm_init};
+pub use swarm::{SwarmWithValidator, save_routing_table, swarm_init};
 pub use validator::{RecordValidator, RecordValidatorConfig};
 
 use libp2p::PeerId;
+use redb::Database;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::error::{DhtError, DhtResult};
 
 /// 全局 DHT 查询回调注册表
 ///
@@ -86,7 +89,7 @@ pub fn complete_dht_query(query_id: &str, result: Option<PeerId>) {
     }
 }
 
-/// 从本地 DHT 数据库查询 ML-KEM 公钥对应的 PeerID
+/// 从本地 DHT 数据库查询 ML-DSA 公钥对应的 PeerID
 ///
 /// # 注意
 /// 此函数仅查询本地持久化的 DHT 数据库，不发起网络 DHT 查询。
@@ -94,7 +97,9 @@ pub fn complete_dht_query(query_id: &str, result: Option<PeerId>) {
 ///
 /// # 参数
 /// - `data_dir`: 数据目录路径
-/// - `pubkey_hex`: ML-KEM 公钥的 hex 编码
+/// - `pubkey_hex`: ML-DSA 公钥的 hex 编码
+/// - `dht_db`: 可选的共享 DHT 数据库连接。如果提供，优先使用该连接避免文件锁冲突。
+///   如果为 None，则打开文件（适用于无 ChatCore 实例的场景）。
 ///
 /// # 返回
 /// - `Ok(Some(peer_id))`: 找到对应的 PeerID
@@ -103,15 +108,18 @@ pub fn complete_dht_query(query_id: &str, result: Option<PeerId>) {
 pub fn lookup_peerid_by_pubkey(
     data_dir: &Path,
     pubkey_hex: &str,
-) -> anyhow::Result<Option<PeerId>> {
-    let dht_path = data_dir.join("dht.redb");
-
-    if !dht_path.exists() {
-        return Ok(None);
-    }
-
-    let db = redb::Database::open(&dht_path)?;
-    let store = dht::RedbRecordStore::new(std::sync::Arc::new(db));
+    dht_db: Option<Arc<Database>>,
+) -> DhtResult<Option<PeerId>> {
+    let store = if let Some(db) = dht_db {
+        dht::RedbRecordStore::new(db)
+    } else {
+        let dht_path = data_dir.join("dht.redb");
+        if !dht_path.exists() {
+            return Ok(None);
+        }
+        let db = redb::Database::open(&dht_path).map_err(DhtError::CreateDatabaseFailed)?;
+        dht::RedbRecordStore::new(std::sync::Arc::new(db))
+    };
     store.get_peerid_by_pubkey(pubkey_hex)
 }
 
@@ -133,9 +141,10 @@ pub async fn lookup_peerid_by_pubkey_network(
     swarm: &mut libp2p::Swarm<MyBehaviour>,
     data_dir: &Path,
     pubkey_hex: &str,
-) -> anyhow::Result<Option<PeerId>> {
-    // 1. 先查本地数据库
-    if let Some(peer_id) = lookup_peerid_by_pubkey(data_dir, pubkey_hex)? {
+    dht_db: Option<Arc<Database>>,
+) -> DhtResult<Option<PeerId>> {
+    // 1. 先查本地数据库（优先使用共享连接，避免文件锁冲突）
+    if let Some(peer_id) = lookup_peerid_by_pubkey(data_dir, pubkey_hex, dht_db)? {
         tracing::debug!(
             "DHT network lookup: found {} in local database",
             &pubkey_hex[..16]
@@ -157,8 +166,8 @@ pub async fn lookup_peerid_by_pubkey_network(
     // 注册回调，等待网络查询结果
     let rx = register_dht_query_callback(pubkey_hex.to_string());
 
-    // 发起 Kademlia get_record 查询
-    let query_id = swarm.behaviour_mut().kademlia.get_record(key);
+    // 发起 Kademlia get_record 查询（clone key 以便超时后重试）
+    let query_id = swarm.behaviour_mut().kademlia.get_record(key.clone());
     tracing::debug!("DHT get_record query started: {:?}", query_id);
 
     // 3. 等待结果（超时 30 秒）
@@ -187,14 +196,53 @@ pub async fn lookup_peerid_by_pubkey_network(
             Ok(None)
         }
         Err(_) => {
-            // 超时
+            // 超时 - 自动重试一次，使用更短的超时时间
             tracing::warn!(
-                "DHT network lookup: timeout for pubkey {}",
+                "DHT network lookup: timeout for pubkey {}, retrying once with shorter timeout",
                 &pubkey_hex[..16]
             );
-            // 清理回调
+            // 清理旧回调
             dht_query_callbacks().lock().unwrap().remove(pubkey_hex);
-            Ok(None)
+
+            // 重试：注册新回调并发起新查询
+            let rx2 = register_dht_query_callback(pubkey_hex.to_string());
+            let query_id2 = swarm.behaviour_mut().kademlia.get_record(key);
+            tracing::debug!("DHT get_record retry started: {:?}", query_id2);
+
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx2).await {
+                Ok(Ok(Some(peer_id))) => {
+                    tracing::info!(
+                        "DHT network retry: found PeerID {} for pubkey {}",
+                        peer_id,
+                        &pubkey_hex[..16]
+                    );
+                    Ok(Some(peer_id))
+                }
+                Ok(Ok(None)) => {
+                    tracing::warn!(
+                        "DHT network retry: no record found for pubkey {}",
+                        &pubkey_hex[..16]
+                    );
+                    dht_query_callbacks().lock().unwrap().remove(pubkey_hex);
+                    Ok(None)
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        "DHT network retry: query cancelled for pubkey {}",
+                        &pubkey_hex[..16]
+                    );
+                    dht_query_callbacks().lock().unwrap().remove(pubkey_hex);
+                    Ok(None)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "DHT network retry: also timed out for pubkey {}",
+                        &pubkey_hex[..16]
+                    );
+                    dht_query_callbacks().lock().unwrap().remove(pubkey_hex);
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -208,6 +256,7 @@ pub async fn lookup_peerid_by_pubkey_network(
 /// - `mldsa_pubkey_hex`: 声称的 ML-DSA 公钥 hex
 /// - `expected_peer_id`: 期望的 PeerID（如果为 None 则跳过检查）
 /// - `expected_mlkem_pubkey_hex`: 期望的 ML-KEM 公钥 hex（如果为 None 则跳过检查）
+/// - `dht_db`: 可选的共享 DHT 数据库连接。如果提供，优先使用该连接避免文件锁冲突。
 ///
 /// # 返回
 /// - `Ok(true)`: 绑定验证通过
@@ -218,15 +267,18 @@ pub fn verify_identity_binding(
     mldsa_pubkey_hex: &str,
     expected_peer_id: Option<&PeerId>,
     expected_mlkem_pubkey_hex: Option<&str>,
-) -> anyhow::Result<bool> {
-    let dht_path = data_dir.join("dht.redb");
-
-    if !dht_path.exists() {
-        return Ok(false);
-    }
-
-    let db = redb::Database::open(&dht_path)?;
-    let store = dht::RedbRecordStore::new(std::sync::Arc::new(db));
+    dht_db: Option<Arc<Database>>,
+) -> DhtResult<bool> {
+    let store = if let Some(db) = dht_db {
+        dht::RedbRecordStore::new(db)
+    } else {
+        let dht_path = data_dir.join("dht.redb");
+        if !dht_path.exists() {
+            return Ok(false);
+        }
+        let db = redb::Database::open(&dht_path).map_err(DhtError::CreateDatabaseFailed)?;
+        dht::RedbRecordStore::new(std::sync::Arc::new(db))
+    };
     store.verify_identity_binding(
         mldsa_pubkey_hex,
         expected_peer_id,
