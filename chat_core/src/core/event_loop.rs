@@ -57,8 +57,8 @@ impl ChatCore {
         self.discover_all_contacts(&dht_reg_cmd_tx).await;
 
         // 主事件循环：处理网络事件和控制命令
-        let mut retry_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        retry_interval.tick().await; // 跳过首次立即触发
+        // 注意：消息重试仅在 ConnectionEstablished 事件中触发（events.rs），
+        // 不在定时器中重试，避免对方离线时频繁无效查询。
 
         // DHT 清理间隔：每小时清理一次过期记录
         let mut dht_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -89,9 +89,6 @@ impl ChatCore {
                     } else {
                         self.handle_command(cmd).await;
                     }
-                }
-                _ = retry_interval.tick() => {
-                    self.handle_command(ChatCommand::RetryPendingMessages).await;
                 }
                 _ = dht_cleanup_interval.tick() => {
                     self.cleanup_expired_dht_records();

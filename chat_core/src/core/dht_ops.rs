@@ -1,4 +1,4 @@
-use crate::{core::ChatCore, p2p, signature::SignedIdentityRecord};
+use crate::{core::ChatCore, signature::SignedIdentityRecord};
 
 impl ChatCore {
     /// 将身份记录发布到 Kademlia DHT 网络
@@ -104,65 +104,6 @@ impl ChatCore {
                     label,
                     e
                 );
-            }
-        }
-    }
-
-    /// 通过 Kademlia get_record 从 DHT 网络查询联系人的 ML-KEM 公钥
-    #[allow(dead_code)]
-    pub(crate) async fn query_mlkem_from_dht_network(
-        &mut self,
-        mldsa_pubkey_hex: &str,
-    ) -> Option<Vec<u8>> {
-        let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-        let key = libp2p::kad::RecordKey::new(&mlkem_key);
-
-        tracing::info!(
-            "Querying ML-KEM pubkey from DHT network for {}",
-            &mldsa_pubkey_hex[..16]
-        );
-
-        let query_id = format!("mlkem_{}", mldsa_pubkey_hex);
-        let rx = p2p::register_mlkem_query_callback(query_id.clone());
-
-        let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(Some(mlkem_hex))) => match hex::decode(&mlkem_hex) {
-                Ok(mlkem_bytes) => {
-                    tracing::info!(
-                        "Found ML-KEM pubkey via DHT network for {}",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                    Some(mlkem_bytes)
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to decode ML-KEM hex for {}: {}",
-                        &mldsa_pubkey_hex[..16],
-                        e
-                    );
-                    None
-                }
-            },
-            Ok(Ok(None)) => {
-                tracing::info!(
-                    "DHT ML-KEM query: no record found for {}",
-                    &mldsa_pubkey_hex[..16]
-                );
-                None
-            }
-            Ok(Err(_)) => {
-                tracing::warn!("DHT ML-KEM query cancelled for {}", &mldsa_pubkey_hex[..16]);
-                None
-            }
-            Err(_) => {
-                tracing::warn!("DHT ML-KEM query timeout for {}", &mldsa_pubkey_hex[..16]);
-                p2p::mlkem_query_callbacks()
-                    .lock()
-                    .unwrap()
-                    .remove(&query_id);
-                None
             }
         }
     }

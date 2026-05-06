@@ -166,21 +166,6 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
                     mlkem_pubkey_hex: mlkem,
                 });
             }
-
-            // === 新增：连接建立后向对方发送当前 ML-KEM 公钥 ===
-            // 确保对方能立即获取到我们最新的临时加密公钥，避免因公钥过期导致解密失败
-            if let Some(ref mlkem_hex) = core.mlkem_pubkey_hex {
-                if let Ok(msg) = core
-                    .build_signed_message(
-                        ChatMessageType::MlkemKeyExchange,
-                        mlkem_hex.as_bytes().to_vec(),
-                    )
-                    .await
-                {
-                    core.send_message(peer_id, msg);
-                    tracing::debug!("已向 {} 发送 ML-KEM 公钥交换消息", peer_id);
-                }
-            }
         }
 
         // 连接关闭
@@ -639,58 +624,6 @@ async fn handle_incoming_request(
     // 从消息中提取发送方的 ML-DSA 公钥
     let sender_mldsa_pubkey_hex = hex::encode(&request.sender_public_key);
 
-    // === MlkemKeyExchange 消息特殊处理 ===
-    // ML-KEM 公钥交换消息在连接建立时发送，数据是明文的 hex 字符串。
-    // 它必须绕过常规的消息处理流程（DHT 验证 + 解密），因为：
-    //   1. 连接已建立，peer_id 已知，不需要 DHT 身份绑定验证
-    //   2. 数据是明文 hex，不需要解密（此时双方还没有对方的 ML-KEM 公钥）
-    //   3. DHT 查询可能超时（NAT 后的节点），导致密钥交换失败
-    if request.msgtype == ChatMessageType::MlkemKeyExchange {
-        // 先验证签名（确保消息确实来自声称的发送方）
-        match request.verify() {
-            Ok(true) => {
-                tracing::info!(
-                    "ML-KEM 公钥交换消息签名验证通过 from {}..",
-                    &sender_mldsa_pubkey_hex[..16]
-                );
-            }
-            Ok(false) => {
-                tracing::warn!("ML-KEM 公钥交换消息签名验证失败 from {}", peer);
-                send_response(core, channel);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("ML-KEM 公钥交换消息签名验证出错 from {}: {}", peer, e);
-                send_response(core, channel);
-                return;
-            }
-        }
-
-        // 获取当前身份的 identity_id
-        let owner_identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
-            Some(id) => id,
-            None => {
-                tracing::warn!("未找到当前身份，无法处理 ML-KEM 公钥交换消息");
-                send_response(core, channel);
-                return;
-            }
-        };
-
-        // 直接处理 ML-KEM 公钥交换（跳过解密和 DHT 验证）
-        // 传入 peer 参数，以便缓存发送方的 PeerID 绑定到 DHT 本地数据库
-        handle_mlkem_key_exchange(
-            core,
-            pool,
-            &request,
-            &sender_mldsa_pubkey_hex,
-            &owner_identity_id,
-            &peer,
-        )
-        .await;
-        send_response(core, channel);
-        return;
-    }
-
     // 获取当前身份的 identity_id
     let owner_identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
         Some(id) => id,
@@ -964,34 +897,18 @@ async fn handle_message_verification(
 async fn handle_decrypted_message(
     core: &mut ChatCore,
     pool: &sqlx::Pool<sqlx::Sqlite>,
-    peer: libp2p::PeerId,
+    _peer: libp2p::PeerId,
     request: &ChatMessage,
     sender_mldsa_pubkey_hex: &str,
 ) {
-    // 获取当前身份的 identity_id
-    let identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
+    // 获取当前身份的 identity_id（保留用于后续可能的用途）
+    let _identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
         Some(id) => id,
         None => {
             tracing::warn!("未找到当前身份");
             return;
         }
     };
-
-    // === MlkemKeyExchange 消息特殊处理 ===
-    // ML-KEM 公钥交换消息在连接建立时发送，数据是明文的 hex 字符串（非加密数据）。
-    // 因为此时双方还没有对方的 ML-KEM 公钥，无法加密，所以必须跳过解密步骤。
-    if request.msgtype == ChatMessageType::MlkemKeyExchange {
-        handle_mlkem_key_exchange(
-            core,
-            pool,
-            request,
-            sender_mldsa_pubkey_hex,
-            &identity_id,
-            &peer,
-        )
-        .await;
-        return;
-    }
 
     // 使用 ChatCore 中缓存的 DecapsulationKey 对象解密消息
     // 注意：不能通过序列化/反序列化私钥字节来重建 DecapsulationKey，
@@ -1025,33 +942,6 @@ async fn handle_decrypted_message(
                 &sender_mldsa_pubkey_hex[..16],
                 e
             );
-            let msg = format!(
-                "解密来自 {} 的消息失败: {}。对方的 ML-KEM 公钥可能已过期（双方重启后密钥会更新），正在尝试发送当前 ML-KEM 公钥给对方以修复旧密钥...",
-                &sender_mldsa_pubkey_hex[..16],
-                e
-            );
-            tracing::warn!("{}", msg);
-            core.send_warning_mpsc(msg).await;
-
-            if let Some(ref mlkem_hex) = core.mlkem_pubkey_hex {
-                match core
-                    .build_signed_message(
-                        ChatMessageType::MlkemKeyExchange,
-                        mlkem_hex.as_bytes().to_vec(),
-                    )
-                    .await
-                {
-                    Ok(exchange_msg) => {
-                        core.send_message(peer, exchange_msg);
-                        tracing::info!("向 {} 发送 ML-KEM 公钥交换消息以修复可能的旧密钥", peer);
-                    }
-                    Err(err) => {
-                        tracing::warn!("构建 ML-KEM 公钥交换消息失败: {}", err);
-                    }
-                }
-            } else {
-                tracing::warn!("当前本地 ML-KEM 公钥不可用，无法发送 ML-KEM 公钥交换消息");
-            }
             return;
         }
     };
@@ -1072,82 +962,6 @@ async fn handle_decrypted_message(
         }
         ChatMessageType::DeliveryReceipt => {
             handle_delivery_receipt(core, pool, decrypted_data).await;
-        }
-        ChatMessageType::MlkemKeyExchange => {
-            // 不会执行到这里，已在函数开头提前处理
-            unreachable!("MlkemKeyExchange 应在函数开头提前处理");
-        }
-    }
-}
-
-/// 处理 ML-KEM 公钥交换消息（明文数据，无需解密）
-///
-/// 除了更新 ML-KEM 公钥外，还会将发送方的 PeerID 绑定缓存到 DHT 本地数据库，
-/// 这样后续 send_text_impl 可以直接从本地数据库找到对方的 PeerID，
-/// 无需再次发起 DHT 网络查询。
-async fn handle_mlkem_key_exchange(
-    core: &mut ChatCore,
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    request: &ChatMessage,
-    sender_mldsa_pubkey_hex: &str,
-    identity_id: &str,
-    peer: &libp2p::PeerId,
-) {
-    let data = &request.data;
-    tracing::info!(
-        "收到 ML-KEM 公钥交换消息 from {}.., data_len={}, peer={}",
-        &sender_mldsa_pubkey_hex[..16],
-        data.len(),
-        peer
-    );
-
-    // === 缓存发送方的 PeerID 绑定到 DHT 本地数据库 ===
-    // 这是关键修复：当收到 MlkemKeyExchange 消息时，连接已建立，peer 已知。
-    // 将 peer->pubkey 绑定缓存到 DHT 本地数据库，后续 send_text_impl
-    // 可以直接从本地数据库找到对方的 PeerID，无需 DHT 网络查询。
-    if let Ok(store) = core.get_dht_store() {
-        let _ = store.set_pubkey_peerid(sender_mldsa_pubkey_hex, peer);
-        tracing::info!(
-            "已缓存 {}.. 的 PeerID 绑定: {}（通过 ML-KEM 密钥交换）",
-            &sender_mldsa_pubkey_hex[..16],
-            peer
-        );
-    }
-
-    // ML-KEM 公钥交换消息的数据是明文的 hex 字符串
-    match String::from_utf8(data.clone()) {
-        Ok(mlkem_hex) => {
-            tracing::info!(
-                "ML-KEM 公钥交换消息内容: {}..",
-                &mlkem_hex[..std::cmp::min(16, mlkem_hex.len())]
-            );
-            // 解码 ML-KEM 公钥
-            if let Ok(mlkem_bytes) = hex::decode(&mlkem_hex) {
-                // 更新 contacts 表
-                let _ = storage::update_contact_mlkem_pubkey(
-                    pool,
-                    identity_id,
-                    sender_mldsa_pubkey_hex,
-                    &mlkem_bytes,
-                )
-                .await;
-                // 更新 DHT 本地数据库
-                if let Ok(store) = core.get_dht_store() {
-                    let _ = store.set_mlkem_pubkey(sender_mldsa_pubkey_hex, &mlkem_hex);
-                }
-                tracing::info!(
-                    "已更新联系人 {}.. 的 ML-KEM 公钥（通过连接建立时的密钥交换）",
-                    &sender_mldsa_pubkey_hex[..16]
-                );
-            } else {
-                tracing::warn!(
-                    "ML-KEM 公钥交换消息内容不是合法 hex: {}..",
-                    &mlkem_hex[..std::cmp::min(16, mlkem_hex.len())]
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!("ML-KEM 公钥交换消息不是合法 UTF-8: {}", e);
         }
     }
 }

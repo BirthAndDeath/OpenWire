@@ -26,8 +26,6 @@ pub enum ChatMessageType {
     FileDownloadRequest = 3,
     /// 消息送达回执
     DeliveryReceipt = 4,
-    /// ML-KEM 公钥交换（连接建立时自动交换最新的临时加密公钥）
-    MlkemKeyExchange = 5,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
