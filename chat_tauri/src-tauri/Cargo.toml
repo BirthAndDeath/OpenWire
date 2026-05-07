@@ -1,7 +1,7 @@
 [package]
-name = "chat"
+name = "openwire"
 version = "0.1.0"
-description = "A Tauri App"
+description = "OpenWire - P2P Chat Application"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "chat_lib"
+name = "openwire_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -19,7 +19,7 @@ tauri-build = { version = "2.5.6", features = ["isolation"] }
 
 [dependencies]
 tokio = { workspace = true }
-chat_core = { workspace = true }
+openwire_core = { workspace = true }
 rootcell = { workspace = true }
 tracing = { workspace = true }
 tauri = { version = "2.11.1", features = ["isolation"] }

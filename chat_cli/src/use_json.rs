@@ -1,7 +1,7 @@
 use crate::App;
 use crate::error::CliError;
-use chat_core::storage;
-use chat_core::{IncomingMessage, MessageEvent, validate_mldsa_pubkey_hex};
+use openwire_core::storage;
+use openwire_core::{IncomingMessage, MessageEvent, validate_mldsa_pubkey_hex};
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;

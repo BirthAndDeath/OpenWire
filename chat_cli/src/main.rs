@@ -1,9 +1,9 @@
-use chat_cli::App;
-use chat_cli::error::CliResult;
-use chat_cli::notui::no_tui_run;
-use chat_cli::tui::tui_run;
-use chat_cli::use_json::json_run;
 use clap::Parser;
+use openwire_cli::App;
+use openwire_cli::error::CliResult;
+use openwire_cli::notui::no_tui_run;
+use openwire_cli::tui::tui_run;
+use openwire_cli::use_json::json_run;
 
 #[derive(Parser)]
 #[command(version="0.1.0", author="BAD and deepseekv4", about="a chat cli app", long_about = None)]

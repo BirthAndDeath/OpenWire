@@ -1,12 +1,12 @@
 [package]
-name = "chat_cli"
+name = "openwire_cli"
 version = "0.1.0"
 edition = "2024"
 
 
 [dependencies]
 thiserror = "2"
-chat_core = { workspace = true }
+openwire_core = { workspace = true }
 tokio = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"

@@ -1053,77 +1053,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chat"
-version = "0.1.0"
-dependencies = [
- "chat_core",
- "hex",
- "postcard",
- "rootcell",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-store",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "chat_cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "chat_core",
- "chrono",
- "clap",
- "crossterm",
- "etcetera 0.11.0",
- "futures",
- "hex",
- "ratatui",
- "rootcell",
- "rpassword",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "chat_core"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-compression",
- "aws-lc-rs",
- "blake3",
- "futures",
- "hex",
- "keyring",
- "libp2p",
- "lru 0.18.0",
- "postcard",
- "quinn",
- "rand 0.10.1",
- "redb",
- "rootcell",
- "serde",
- "sha2 0.11.0",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5337,6 +5266,77 @@ dependencies = [
  "openssl-src",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "openwire"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "openwire_core",
+ "postcard",
+ "rootcell",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-store",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "openwire_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "chrono",
+ "clap",
+ "crossterm",
+ "etcetera 0.11.0",
+ "futures",
+ "hex",
+ "openwire_core",
+ "ratatui",
+ "rootcell",
+ "rpassword",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "openwire_core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-compression",
+ "aws-lc-rs",
+ "blake3",
+ "futures",
+ "hex",
+ "keyring",
+ "libp2p",
+ "lru 0.18.0",
+ "postcard",
+ "quinn",
+ "rand 0.10.1",
+ "redb",
+ "rootcell",
+ "serde",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

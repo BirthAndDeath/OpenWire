@@ -2,12 +2,12 @@
 #![doc = include_str!("../../README.md")]
 use std::collections::HashMap;
 
-use chat_core::ChatCore;
-use chat_core::IncomingMessage;
-use chat_core::MessageEvent;
-use chat_core::storage::{self, Contact, Identity, list_contacts, list_identities, pool};
 use error::CliError;
 use etcetera::BaseStrategy;
+use openwire_core::ChatCore;
+use openwire_core::IncomingMessage;
+use openwire_core::MessageEvent;
+use openwire_core::storage::{self, Contact, Identity, list_contacts, list_identities, pool};
 use ratatui::widgets::ListState;
 pub mod error;
 pub mod notui;
@@ -30,7 +30,7 @@ pub struct App {
 
     should_quit: bool,
     core: Option<ChatCore>,
-    core_handle: chat_core::corehandle::CoreHandle,
+    core_handle: openwire_core::corehandle::CoreHandle,
     contacts: Vec<Contact>, // 联系人列表
     // --- 身份管理 ---
     identities: Vec<Identity>,
@@ -126,20 +126,23 @@ impl App {
         if let Some(raw_password) = password {
             let key_hex =
                 rootcell::identity::PrivateKeyHandle::derive_key_from_password(raw_password);
-            let mut cfg = chat_core::CoreConfig::new(
+            let mut cfg = openwire_core::CoreConfig::new(
                 data_dir.clone(),
                 Some(log_path.clone()),
                 Some(log_level),
             );
             cfg.passwd = Some(key_hex);
-            let core = chat_core::ChatCore::try_init(cfg).await?;
+            let core = openwire_core::ChatCore::try_init(cfg).await?;
             return Self::build_app(core, data_dir).await;
         }
 
         // 先尝试无密码初始化（Keyring 可用的情况）
-        let cfg =
-            chat_core::CoreConfig::new(data_dir.clone(), Some(log_path.clone()), Some(log_level));
-        match chat_core::ChatCore::try_init(cfg).await {
+        let cfg = openwire_core::CoreConfig::new(
+            data_dir.clone(),
+            Some(log_path.clone()),
+            Some(log_level),
+        );
+        match openwire_core::ChatCore::try_init(cfg).await {
             Ok(core) => {
                 return Self::build_app(core, data_dir).await;
             }
@@ -178,13 +181,13 @@ impl App {
                 // 立即清零密码内存
                 drop(password);
 
-                let mut cfg = chat_core::CoreConfig::new(
+                let mut cfg = openwire_core::CoreConfig::new(
                     data_dir.clone(),
                     Some(log_path.clone()),
                     Some(log_level),
                 );
                 cfg.passwd = Some(key_hex);
-                match chat_core::ChatCore::try_init(cfg).await {
+                match openwire_core::ChatCore::try_init(cfg).await {
                     Ok(core) => {
                         eprintln!("✅ 密码派生密钥初始化成功（安全性低于 Keyring）\n");
                         return Self::build_app(core, data_dir).await;
@@ -217,9 +220,14 @@ impl App {
         // 加载历史消息（按联系人分组）
         let mut messages_by_contact: HashMap<String, Vec<String>> = HashMap::new();
         for contact in &contacts {
-            if let Ok(msgs) =
-                chat_core::storage::get_messages(pool, &owner, &contact.mldsa_pubkey_hex, None, 50)
-                    .await
+            if let Ok(msgs) = openwire_core::storage::get_messages(
+                pool,
+                &owner,
+                &contact.mldsa_pubkey_hex,
+                None,
+                50,
+            )
+            .await
             {
                 let entry = messages_by_contact
                     .entry(contact.mldsa_pubkey_hex.clone())

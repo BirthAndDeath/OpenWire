@@ -1,5 +1,5 @@
-use chat_core::storage;
-use chat_core::{ChatCommand, ChatMessageType, IncomingMessage, MessageEvent};
+use openwire_core::storage;
+use openwire_core::{ChatCommand, ChatMessageType, IncomingMessage, MessageEvent};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -114,7 +114,7 @@ async fn send_file(
     }
 
     // 计算文件 hash（SHA256）
-    let file_hash = chat_core::transfer::compute_file_hash(&path)
+    let file_hash = openwire_core::transfer::compute_file_hash(&path)
         .await
         .map_err(|e| format!("计算文件 hash 失败: {}", e))?;
 
@@ -131,7 +131,8 @@ async fn send_file(
         .to_string();
 
     // 构建 FileHashInfo
-    let file_info = chat_core::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
+    let file_info =
+        openwire_core::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
     let file_info_bytes = postcard::to_allocvec(&file_info)
         .map_err(|e| format!("序列化 FileHashInfo 失败: {}", e))?;
 
@@ -731,7 +732,7 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
         (data_dir, passwd)
     };
 
-    let cfg = chat_core::CoreConfig {
+    let cfg = openwire_core::CoreConfig {
         data_dir,
         path_to_log: None,
         log_level: Some("info".to_string()),
@@ -739,7 +740,7 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
         passwd,
     };
 
-    match chat_core::ChatCore::try_init(cfg.clone()).await {
+    match openwire_core::ChatCore::try_init(cfg.clone()).await {
         Ok(mut chat_core_instance) => {
             // 更新 AppData
             {
@@ -856,8 +857,8 @@ fn create_placeholder_appdata() -> AppData {
 ///
 /// 此函数被 `run()` 中的初始化闭包调用，避免代码重复。
 async fn setup_core_and_event_loop(
-    mut chat_core_instance: chat_core::ChatCore,
-    cfg: chat_core::CoreConfig,
+    mut chat_core_instance: openwire_core::ChatCore,
+    cfg: openwire_core::CoreConfig,
     apphandle: tauri::AppHandle,
 ) {
     // 用真实的 AppData 替换占位状态
@@ -968,10 +969,11 @@ pub fn run() {
                 let passwd = app_data_state.inner.read().await.passwd.clone();
                 drop(app_data_state);
 
-                let mut cfg = chat_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
+                let mut cfg =
+                    openwire_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
                 cfg.passwd = passwd;
 
-                match chat_core::ChatCore::try_init(cfg.clone()).await {
+                match openwire_core::ChatCore::try_init(cfg.clone()).await {
                     Ok(chat_core_instance) => {
                         setup_core_and_event_loop(chat_core_instance, cfg, apphandle).await;
                     }
@@ -1022,7 +1024,7 @@ pub fn run() {
                                 if !still_needed && passwd.is_some() {
                                     tracing::info!("密码已设置，重试 Core 初始化...");
                                     cfg.passwd = passwd;
-                                    match chat_core::ChatCore::try_init(cfg.clone()).await {
+                                    match openwire_core::ChatCore::try_init(cfg.clone()).await {
                                         Ok(chat_core_instance) => {
                                             setup_core_and_event_loop(
                                                 chat_core_instance,
@@ -1109,7 +1111,7 @@ fn cleanup(app: &AppHandle) {
     };
 
     // 使用 try_send 发送关闭命令，避免在退出时可能死锁
-    if let Err(e) = cmd_tx.try_send(chat_core::ChatCommand::Shutdown) {
+    if let Err(e) = cmd_tx.try_send(openwire_core::ChatCommand::Shutdown) {
         tracing::error!("Error sending shutdown command: {}", e);
         app.emit("warning", format!("Error sending shutdown command: {e}"))
             .ok();

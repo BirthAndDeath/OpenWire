@@ -31,11 +31,11 @@ pub enum CliError {
     #[error("JSON 序列化失败: {0}")]
     JsonError(#[from] serde_json::Error),
 
-    #[error("chat_core 错误: {0}")]
-    CoreError(#[from] chat_core::error::CoreError),
+    #[error("openwire_core 错误: {0}")]
+    CoreError(#[from] openwire_core::error::CoreError),
 
     #[error("存储错误: {0}")]
-    StorageError(#[from] chat_core::error::StorageError),
+    StorageError(#[from] openwire_core::error::StorageError),
 }
 
 /// chat_cli 的便捷 Result 类型别名

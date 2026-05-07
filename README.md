@@ -1,4 +1,4 @@
-# Chat / 聊天
+# OpenWire / 开源通信
 
 跳转： [English](#english) | [中文](#中文)
 
@@ -6,7 +6,7 @@
 
 ## English
 
-Chat is a cross-platform application currently in a very early stage of development. This project aims to provide a high-performance, low-resource communication tool.
+OpenWire is a cross-platform P2P chat application currently in a very early stage of development. This project aims to provide a high-performance, low-resource, privacy-first communication tool.
 
 ***Demo only, use at your own risk***
 
@@ -110,6 +110,7 @@ Contributions are welcome. Unless explicitly stated otherwise, contributions are
 
 Build the basic framework.
 Future ideas:
+
 - Compute sharing?
 - Web-based P2P transport layer?
 
@@ -121,7 +122,7 @@ Future ideas:
 
 ## 中文
 
-Chat是一个跨平台应用程序，目前处于非常早期的开发阶段。本项目旨在提供一个高性能、低资源占用的通用通信工具。
+OpenWire 是一个跨平台 P2P 聊天应用程序，目前处于非常早期的开发阶段。本项目旨在提供一个高性能、低资源占用、隐私优先的通信工具。
 
 ***仅演示，生产自负***
 
@@ -225,6 +226,7 @@ npm tauri build
 
 搭建基础框架 ing
 未来展望：
+
 - 算力共享？
 - 实现 p2p 传输层的网页？
 

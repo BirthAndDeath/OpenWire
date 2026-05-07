@@ -1,9 +1,9 @@
 use crate::App;
 use crate::error::CliError;
-use chat_core::IncomingMessage;
-use chat_core::MessageEvent;
-use chat_core::storage;
-use chat_core::validate_mldsa_pubkey_hex;
+use openwire_core::IncomingMessage;
+use openwire_core::MessageEvent;
+use openwire_core::storage;
+use openwire_core::validate_mldsa_pubkey_hex;
 
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;

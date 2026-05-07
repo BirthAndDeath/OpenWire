@@ -120,7 +120,7 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
                 let pubkey_hex = app.input.trim().to_string();
                 if !pubkey_hex.is_empty() {
                     // 验证公钥格式
-                    if !chat_core::validate_mldsa_pubkey_hex(&pubkey_hex) {
+                    if !openwire_core::validate_mldsa_pubkey_hex(&pubkey_hex) {
                         app.push_message(
                             "错误: ML-DSA 公钥格式不正确（应为3904字符的hex编码）".to_string(),
                         );
@@ -288,14 +288,14 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
                         app.refresh_identities().await;
                         app.messages_by_contact.clear();
                         // 重新加载历史消息
-                        if let Some(pool) = chat_core::storage::pool() {
-                            let owner = chat_core::storage::get_current_identity(pool)
+                        if let Some(pool) = openwire_core::storage::pool() {
+                            let owner = openwire_core::storage::get_current_identity(pool)
                                 .await
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
                             for contact in &app.contacts.clone() {
-                                if let Ok(msgs) = chat_core::storage::get_messages(
+                                if let Ok(msgs) = openwire_core::storage::get_messages(
                                     pool,
                                     &owner,
                                     &contact.mldsa_pubkey_hex,
