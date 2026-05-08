@@ -115,7 +115,7 @@ impl App {
         let data_dir = etcetera::choose_base_strategy()
             .map_err(|_| CliError::BaseStrategyFailed)?
             .config_dir()
-            .join("chat");
+            .join("openwire");
         let log_path = data_dir.join("log");
         #[cfg(debug_assertions)]
         let log_level = "debug";

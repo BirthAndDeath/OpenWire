@@ -24,7 +24,7 @@ updates:
     versioning-strategy: "auto"
 
   - package-ecosystem: "npm"
-    directory: "/chat_tauri"
+    directory: "/openwire"
     schedule:
       interval: "weekly"
       day: "monday"

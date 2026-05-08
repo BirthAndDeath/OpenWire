@@ -646,6 +646,18 @@ async fn handle_incoming_request(
         return;
     }
 
+    // === 修复：收到消息后，将发送方的 (ML-DSA 公钥 → PeerID) 映射缓存到本地 DHT 数据库 ===
+    // 这样当回复消息时，dht_lookup_peerid 的步骤 1（connected_peers 反向查找）能直接命中，
+    // 无需等待 DHT 网络查询完成，解决两个在线节点之间 DHT 记录尚未传播时的通信问题。
+    if let Ok(store) = core.get_dht_store() {
+        let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
+        tracing::debug!(
+            "已缓存发送方身份绑定: {}.. -> PeerID={}",
+            &sender_mldsa_pubkey_hex[..16],
+            peer
+        );
+    }
+
     // 验证消息签名
     if !handle_message_verification(core, &request, &peer).await {
         return;

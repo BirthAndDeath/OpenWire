@@ -58,23 +58,23 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: |
-            . -> chat_tauri/src-tauri/target
-            chat_core
+            . -> openwire/src-tauri/target
+            openwire_core
             rootcell
-            chat_cli
+            openwire_cli
           cache-targets: "true"
           cache-all-crates: "true"
           cache-bin: "true"
           cache-on-failure: "true"
 
       - name: install frontend dependencies
-        working-directory: ./chat_tauri
+        working-directory: ./openwire
         run: npm install
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: "./chat_tauri"
+          projectPath: "./openwire/src-tauri"
           tagName: "app-v__VERSION__" # the action automatically replaces \_\_VERSION\_\_ with the app version.
           releaseName: "App v__VERSION__"
           releaseBody: "See the assets to download this version and install."
