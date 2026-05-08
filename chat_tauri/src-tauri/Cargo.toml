@@ -22,7 +22,7 @@ tokio = { workspace = true }
 chat_core = { workspace = true }
 rootcell = { workspace = true }
 tracing = { workspace = true }
-tauri = { version = "2.10.1", features = ["isolation"] }
+tauri = { version = "2.11.1", features = ["isolation"] }
 tauri-plugin-opener = "2.5.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
