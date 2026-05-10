@@ -4,15 +4,16 @@ use crate::{core::ChatCore, crypto, error::CoreError, message::ChatMessageType, 
 
 impl ChatCore {
     /// send_text 的公开入口
+    ///
+    /// 返回发送的消息的 hash（hex 编码），供调用方（如 command_handler）通知前端
     pub(crate) async fn send_text(
         &mut self,
         mldsa_pubkey_hex: &str,
         msgtype: ChatMessageType,
         data: Vec<u8>,
-    ) -> Result<(), CoreError> {
+    ) -> Result<String, CoreError> {
         self.send_text_impl(mldsa_pubkey_hex, msgtype, data, false)
-            .await?;
-        Ok(())
+            .await
     }
 
     /// send_text 内部实现，is_retry=true 时跳过 save_pending_message 避免重复
@@ -52,16 +53,19 @@ impl ChatCore {
                     peer_id
                 }
                 Ok(None) => {
-                    // 本地 DHT 未找到 PeerID 时，先通过 DHT 查询或已建立的连接查找
+                    // 本地 DHT 未找到 PeerID 时，先通过已建立的连接或本地数据库查找
                     tracing::info!(
                         "PeerID not found locally for {}, performing DHT lookup...",
                         pubkey_short
                     );
 
-                    match self.dht_lookup_peerid(mldsa_pubkey_hex).await {
+                    // dht_lookup_peerid 是纯本地查询（检查 connected_peers + 本地数据库），
+                    // 不阻塞事件循环。如果本地未找到，会发起非阻塞 GetProviders 网络查询，
+                    // 查询结果通过 events.rs 自动缓存到本地数据库并触发重试。
+                    match self.dht_lookup_peerid(mldsa_pubkey_hex) {
                         Some(peer_id) => {
                             tracing::info!(
-                                "通过 DHT 查询/已建立连接找到 {} 的 PeerID: {}",
+                                "通过已建立连接找到 {} 的 PeerID: {}",
                                 pubkey_short,
                                 peer_id
                             );
@@ -77,6 +81,7 @@ impl ChatCore {
                                 self.save_pending_message(mldsa_pubkey_hex, msgtype, &data)
                                     .await;
                             }
+                            // 发起非阻塞 DHT 发现（通过命令队列，不阻塞事件循环）
                             let _ = self.core_handle.cmd_tx.try_send(
                                 crate::command::ChatCommand::DiscoverContact {
                                     mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
@@ -137,6 +142,17 @@ impl ChatCore {
 
         // 发送消息到网络
         self.send_message(recipient_peer_id, message);
+
+        // 首次发送成功后标记为已发送，避免 retry 时重复发送
+        // 注意：retry 路径（is_retry=true）由 retry_pending_messages 负责调用 mark_sent
+        if !is_retry {
+            if let Some(pool) = storage::pool() {
+                if let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await {
+                    tracing::warn!("标记消息 {}.. 为已发送失败: {}", &message_hash[..16], e);
+                }
+            }
+        }
+
         Ok(message_hash)
     }
 
@@ -205,8 +221,6 @@ impl ChatCore {
                 // 后台异步发起 DHT 网络查询以验证公钥是否最新
                 let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
                 let key = libp2p::kad::RecordKey::new(&mlkem_key);
-                let query_id = format!("mlkem_{}", mldsa_pubkey_hex);
-                let _rx = crate::p2p::register_mlkem_query_callback(query_id);
                 let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                 return hex::decode(&mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
             }
@@ -231,8 +245,6 @@ impl ChatCore {
         }
         let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
         let key = libp2p::kad::RecordKey::new(&mlkem_key);
-        let query_id = format!("mlkem_{}", mldsa_pubkey_hex);
-        let _rx = crate::p2p::register_mlkem_query_callback(query_id);
         let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
         Err(CoreError::MlKemKeyNotCached(format!(
             "联系人 {} 的 ML-KEM 公钥未缓存，消息已保存到离线队列，后台正在通过 DHT 网络查询",
@@ -493,7 +505,21 @@ impl ChatCore {
     ///   2. 如果未找到，发起 DHT 网络查询获取对方的 PeerID 绑定记录
     ///
     /// 当本地 DHT 数据库中没有对方的 PeerID 缓存时使用此方法。
-    async fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
+    ///
+    /// 注意：此方法在事件循环的 cmd 分支中调用，因此需要主动处理 swarm 事件
+    /// 来驱动 DHT 查询完成。使用 tokio::select! 同时处理 swarm 事件和超时。
+    /// 查找 ML-DSA 公钥对应的 PeerID（仅本地查询，不阻塞事件循环）
+    ///
+    /// 查询顺序：
+    /// 1. 遍历 connected_peers，反向查找已连接 PeerID 对应的 ML-DSA 公钥
+    /// 2. 查询本地 DHT 数据库
+    ///
+    /// 如果本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞），
+    /// 查询结果会通过 events.rs 中的事件处理自动缓存到本地数据库，
+    /// 并触发 retry_pending_messages 重试。
+    ///
+    /// 此函数不会 await 网络查询结果，确保不阻塞事件循环。
+    fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
         // === 步骤 1：检查已建立的连接 ===
         // 遍历 connected_peers，通过 DHT 本地数据库反向查找每个已连接 PeerID
         // 对应的 ML-DSA 公钥，看是否匹配目标公钥
@@ -513,63 +539,33 @@ impl ChatCore {
                     _ => continue,
                 }
             }
-            tracing::debug!(
-                "dht_lookup_peerid: connected_peers 中未找到 {}..，继续 DHT 网络查询",
-                &mldsa_pubkey_hex[..16]
-            );
+
+            // === 步骤 2：查询本地 DHT 数据库 ===
+            match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
+                Ok(Some(peer_id)) => {
+                    tracing::info!(
+                        "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
+                        &mldsa_pubkey_hex[..16],
+                        peer_id
+                    );
+                    return Some(peer_id);
+                }
+                _ => {}
+            }
         }
 
-        // === 步骤 2：发起 DHT 网络查询 ===
-        let record_key = format!("peerid:{}", mldsa_pubkey_hex);
-        let key = libp2p::kad::RecordKey::new(&record_key);
-        let rx = crate::p2p::register_dht_query_callback(mldsa_pubkey_hex.to_string());
-        let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+        // === 步骤 3：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
+        // 查询结果会通过 events.rs 中的 GetProvidersOk::FoundProviders 事件处理
+        // 自动缓存到本地数据库，并触发 retry_pending_messages 重试待发送消息
+        let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex.to_string());
+        let _query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
 
         tracing::debug!(
-            "dht_lookup_peerid: 已发起 DHT 网络查询 {}..，等待结果...",
+            "dht_lookup_peerid: 本地未找到 {}..，已发起非阻塞 GetProviders 查询",
             &mldsa_pubkey_hex[..16]
         );
 
-        // 等待 DHT 查询结果（超时 8 秒，比 handle_message_verification 稍短）
-        let dht_result = tokio::time::timeout(std::time::Duration::from_secs(8), rx).await;
-
-        // 清理回调（防止泄漏）
-        let _ = crate::p2p::dht_query_callbacks()
-            .lock()
-            .unwrap()
-            .remove(mldsa_pubkey_hex);
-
-        match dht_result {
-            Ok(Ok(Some(peer_id))) => {
-                tracing::info!(
-                    "dht_lookup_peerid: DHT 查询成功: {}.. -> PeerID={}",
-                    &mldsa_pubkey_hex[..16],
-                    peer_id
-                );
-                Some(peer_id)
-            }
-            Ok(Ok(None)) => {
-                tracing::debug!(
-                    "dht_lookup_peerid: DHT 未找到 {}.. 的记录",
-                    &mldsa_pubkey_hex[..16]
-                );
-                None
-            }
-            Ok(Err(_)) => {
-                tracing::debug!(
-                    "dht_lookup_peerid: DHT 查询 {}.. 的回调已关闭",
-                    &mldsa_pubkey_hex[..16]
-                );
-                None
-            }
-            Err(_) => {
-                tracing::debug!(
-                    "dht_lookup_peerid: DHT 查询 {}.. 超时",
-                    &mldsa_pubkey_hex[..16]
-                );
-                None
-            }
-        }
+        None
     }
 }
 

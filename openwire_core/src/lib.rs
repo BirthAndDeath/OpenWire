@@ -1,9 +1,11 @@
+pub mod actor;
 pub mod command;
 pub mod compression;
 pub mod core;
 mod coreconfig;
 pub mod corehandle;
 pub mod crypto;
+pub mod diagnostics;
 pub mod error;
 pub mod identity;
 mod log;
@@ -20,11 +22,7 @@ pub use identity::{
     load_or_generate_complete_identity,
 };
 pub use message::{ChatMessage, ChatMessageType, ChatResponse};
-pub use p2p::{
-    RecordValidator, RecordValidatorConfig, lookup_peerid_by_pubkey,
-    lookup_peerid_by_pubkey_network, verify_identity_binding,
-};
+pub use p2p::lookup_peerid_by_pubkey;
 pub use signature::{
-    DhtRecordSignature, generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_hex,
-    verify_signature,
+    generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_hex, verify_signature,
 };

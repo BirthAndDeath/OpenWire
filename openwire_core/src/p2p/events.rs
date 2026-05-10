@@ -147,15 +147,23 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         // 连接建立 - 触发离线消息重试并更新在线状态
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             tracing::info!("Connection established with {}", peer_id);
-            // 更新在线连接计数
+            // 更新在线连接集合
             core.connected_peers.insert(peer_id);
-            let count = core.connected_peers.len();
-            core.send_online_status(count).await;
+            // 尝试从 DHT 反向查找该 PeerID 对应的 ML-DSA 公钥并缓存到内存
+            if !core.peerid_to_pubkey.contains_key(&peer_id) {
+                if let Ok(store) = core.get_dht_store() {
+                    if let Ok(Some(pubkey_hex)) = store.get_pubkey_by_peerid(&peer_id) {
+                        core.peerid_to_pubkey.insert(peer_id, pubkey_hex);
+                    }
+                }
+            }
+            // 发送在线状态更新（包含每个在线联系人的 ML-DSA 公钥 hex）
+            core.send_online_status().await;
             // 有新连接建立时，尝试重发待发送消息
             let cmd_tx = core.core_handle.cmd_tx.clone();
             let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
 
-            // === 修复：连接建立后主动发布身份到 DHT ===
+            // === 连接建立后主动发布身份到 DHT ===
             // 确保对方能通过 DHT 查询到我们的最新 PeerID，避免因 DHT 注册延迟导致消息进入离线队列
             if let (Some(pubkey), Some(pid)) = (core.mldsa_pubkey_hex.clone(), core.current_peer_id)
             {
@@ -172,8 +180,10 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             tracing::info!("Connection closed with {}", peer_id);
             core.connected_peers.remove(&peer_id);
-            let count = core.connected_peers.len();
-            core.send_online_status(count).await;
+            // 清理内存缓存（保留 DHT 持久化映射，下次连接时可重新加载）
+            core.peerid_to_pubkey.remove(&peer_id);
+            // 发送在线状态更新（包含每个在线联系人的 ML-DSA 公钥 hex）
+            core.send_online_status().await;
 
             // === Re-dial on connection closed ===
             // Look up known multiaddrs from DHT and attempt to re-establish the connection.
@@ -284,7 +294,59 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
             result: QueryResult::GetProviders(result),
             ..
         } => match result {
-            Ok(ok) => tracing::debug!("Found providers: {:?}", ok),
+            Ok(kad::GetProvidersOk::FoundProviders { key, providers }) => {
+                // GetProviders 成功：缓存 provider 的 PeerID
+                // provider key 是 ML-DSA 公钥 hex
+                let key_str = std::str::from_utf8(key.as_ref()).unwrap_or("");
+                if !key_str.is_empty() && !providers.is_empty() {
+                    tracing::debug!(
+                        "GetProviders: found {} providers for key {}..",
+                        providers.len(),
+                        &key_str[..16.min(key_str.len())]
+                    );
+                    if let Some(store) = open_dht_store(core) {
+                        for provider in &providers {
+                            let _ = store.set_pubkey_peerid(key_str, provider);
+                        }
+                    }
+                    // 通过 oneshot channel 通知等待的 dht_lookup_peerid
+                    if let Ok(mut callbacks) = crate::p2p::DHT_PROVIDER_CALLBACKS.lock() {
+                        if let Some(sender) = callbacks.remove(key_str) {
+                            // 发送第一个找到的 provider
+                            if let Some(first_provider) = providers.iter().next() {
+                                let _ = sender.send(*first_provider);
+                            }
+                        }
+                    }
+                    // === 自动连接：对每个找到的 provider 主动 dial ===
+                    // 当 DHT 查询成功找到 provider 时，说明对方在线。
+                    // 主动 dial 建立连接，这样后续的 RetryPendingMessages 可以直接发送消息。
+                    // dial 失败是正常的（可能对方暂时不可达，或已建立连接），不影响后续重试。
+                    // 直接 dial PeerID，libp2p 会通过 Kademlia routing table 查找地址。
+                    for provider in &providers {
+                        let dial_result = core.swarm.dial(*provider);
+                        match dial_result {
+                            Ok(()) => tracing::debug!(
+                                "自动连接: 正在 dial provider {}..",
+                                &key_str[..16.min(key_str.len())]
+                            ),
+                            Err(e) => tracing::debug!(
+                                "自动连接: dial provider {}.. 失败: {}（可能已连接或正在连接）",
+                                &key_str[..16.min(key_str.len())],
+                                e
+                            ),
+                        }
+                    }
+                    // === 触发离线消息重试 ===
+                    // 本地数据库已缓存 pubkey→PeerID 映射，且已发起 dial，
+                    // 触发 RetryPendingMessages 重试之前进入离线队列的消息。
+                    let cmd_tx = core.core_handle.cmd_tx.clone();
+                    let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
+                }
+            }
+            Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
+                tracing::trace!("GetProviders finished with no additional record");
+            }
             Err(e) => tracing::warn!("Get providers query failed: {:?}", e),
         },
 
@@ -312,6 +374,9 @@ fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
 }
 
 /// 处理 GetRecord 查询结果
+///
+/// 只处理 `mlkem:{pubkey_hex}` 格式的记录。
+/// PeerID 发现已改用 Kademlia 原生 provider 机制（GetProviders），不再使用 GetRecord。
 fn handle_get_record_result(
     result: Result<kad::GetRecordOk, kad::GetRecordError>,
     core: &mut ChatCore,
@@ -320,271 +385,69 @@ fn handle_get_record_result(
         Ok(GetRecordOk::FoundRecord(record)) => {
             let record_key_str = std::str::from_utf8(record.record.key.as_ref()).unwrap_or("");
 
-            if handle_peerid_record(record_key_str, &record.record, core) {
-                return;
-            }
-            if handle_mlkem_record(record_key_str, &record.record, core) {
-                return;
-            }
+            // 只处理 mlkem: 前缀的记录
+            if let Some(pubkey_hex) = record_key_str.strip_prefix("mlkem:") {
+                // ML-KEM 记录直接存储（无 SignedIdentityRecord 包装）
+                let mlkem_hex = match std::str::from_utf8(&record.record.value) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => {
+                        tracing::warn!(
+                            "DHT GetRecord: ML-KEM value is not valid UTF-8 for pubkey {}",
+                            &pubkey_hex[..16]
+                        );
+                        return;
+                    }
+                };
 
-            // 非 pubkey->PeerID/ML-KEM 查询，走签名验证逻辑
-            handle_signed_record(&record.record, core);
+                tracing::info!(
+                    "DHT GetRecord: found ML-KEM pubkey for pubkey {}",
+                    &pubkey_hex[..16]
+                );
+
+                // 写入本地数据库缓存
+                if let Some(store) = open_dht_store(core) {
+                    let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
+                }
+
+                // ML-KEM 公钥已缓存，触发离线消息重试
+                // 注意：如果之前消息发送失败是因为缺少 ML-KEM 公钥（而非 PeerID），
+                // 现在密钥已缓存，可以重试发送
+                let cmd_tx = core.core_handle.cmd_tx.clone();
+                let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
+
+                // 异步更新 contacts 表（确保下次发送消息时使用最新密钥）
+                let pubkey_hex_owned = pubkey_hex.to_string();
+                tokio::spawn(async move {
+                    if let Some(pool) = storage::pool() {
+                        if let Ok(Some(identity_id)) = storage::get_current_identity(pool).await {
+                            if let Ok(mlkem_bytes) = hex::decode(&mlkem_hex) {
+                                let _ = storage::update_contact_mlkem_pubkey(
+                                    pool,
+                                    &identity_id,
+                                    &pubkey_hex_owned,
+                                    &mlkem_bytes,
+                                )
+                                .await;
+                                tracing::debug!(
+                                    "DHT ML-KEM 记录已同步到 contacts 表: {}..",
+                                    &pubkey_hex_owned[..16]
+                                );
+                            }
+                        }
+                    }
+                });
+            } else {
+                tracing::trace!(
+                    "DHT GetRecord: ignoring non-ML-KEM record: {}",
+                    record_key_str
+                );
+            }
         }
         Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
             tracing::debug!("DHT query finished with no additional records");
         }
         Err(e) => tracing::warn!("DHT get record query failed: {:?}", e),
     }
-}
-
-/// 处理 "peerid:{pubkey}" 格式的 DHT 记录
-///
-/// 记录值使用 postcard 序列化的 SignedIdentityRecord，
-/// 验证签名通过后才信任该记录。
-fn handle_peerid_record(key_str: &str, record: &libp2p::kad::Record, core: &ChatCore) -> bool {
-    let Some(pubkey_hex) = key_str.strip_prefix("peerid:") else {
-        return false;
-    };
-
-    // 反序列化 SignedIdentityRecord
-    let signed: crate::signature::SignedIdentityRecord = match postcard::from_bytes(&record.value) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: failed to deserialize signed PeerID record for pubkey {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            super::complete_dht_query(pubkey_hex, None);
-            return false;
-        }
-    };
-
-    // 验证签名
-    let mldsa_pubkey_bytes = match hex::decode(pubkey_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: invalid pubkey hex for {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            super::complete_dht_query(pubkey_hex, None);
-            return false;
-        }
-    };
-    let publisher: libp2p::PeerId = match signed.publisher.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: invalid publisher PeerID in signed record for pubkey {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            super::complete_dht_query(pubkey_hex, None);
-            return false;
-        }
-    };
-    match signed.verify(
-        &mldsa_pubkey_bytes,
-        key_str.as_bytes(),
-        &publisher,
-        3_600_000,
-    ) {
-        Ok(true) => {} // 签名验证通过
-        Ok(false) | Err(_) => {
-            tracing::warn!(
-                "DHT GetRecord: signature verification failed for PeerID record of pubkey {}",
-                &pubkey_hex[..16]
-            );
-            super::complete_dht_query(pubkey_hex, None);
-            return false;
-        }
-    }
-
-    // 解析 PeerID 值
-    match signed.value.parse::<libp2p::PeerId>().ok() {
-        Some(peer_id) => {
-            tracing::info!(
-                "DHT GetRecord: found signed PeerID {} for pubkey {}",
-                peer_id,
-                &pubkey_hex[..16]
-            );
-            if let Some(store) = open_dht_store(core) {
-                let _ = store.set_pubkey_peerid(pubkey_hex, &peer_id);
-            }
-            super::complete_dht_query(pubkey_hex, Some(peer_id));
-        }
-        None => {
-            tracing::warn!(
-                "DHT GetRecord: invalid PeerID value in signed record for pubkey {}",
-                &pubkey_hex[..16]
-            );
-            super::complete_dht_query(pubkey_hex, None);
-        }
-    }
-    true
-}
-
-/// 处理 "mlkem:{pubkey}" 格式的 DHT 记录
-///
-/// 记录值使用 postcard 序列化的 SignedIdentityRecord，
-/// 验证签名通过后才信任该记录。
-fn handle_mlkem_record(key_str: &str, record: &libp2p::kad::Record, core: &ChatCore) -> bool {
-    let Some(pubkey_hex) = key_str.strip_prefix("mlkem:") else {
-        return false;
-    };
-
-    // 反序列化 SignedIdentityRecord
-    let signed: crate::signature::SignedIdentityRecord = match postcard::from_bytes(&record.value) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: failed to deserialize signed ML-KEM record for pubkey {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            complete_mlkem_callback(pubkey_hex, None);
-            return false;
-        }
-    };
-
-    // 验证签名
-    let mldsa_pubkey_bytes = match hex::decode(pubkey_hex) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: invalid pubkey hex for {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            complete_mlkem_callback(pubkey_hex, None);
-            return false;
-        }
-    };
-    let publisher: libp2p::PeerId = match signed.publisher.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(
-                "DHT GetRecord: invalid publisher PeerID in signed ML-KEM record for pubkey {}: {}",
-                &pubkey_hex[..16],
-                e
-            );
-            complete_mlkem_callback(pubkey_hex, None);
-            return false;
-        }
-    };
-    match signed.verify(
-        &mldsa_pubkey_bytes,
-        key_str.as_bytes(),
-        &publisher,
-        3_600_000,
-    ) {
-        Ok(true) => {} // 签名验证通过
-        Ok(false) | Err(_) => {
-            tracing::warn!(
-                "DHT GetRecord: signature verification failed for ML-KEM record of pubkey {}",
-                &pubkey_hex[..16]
-            );
-            complete_mlkem_callback(pubkey_hex, None);
-            return false;
-        }
-    }
-
-    tracing::info!(
-        "DHT GetRecord: found signed ML-KEM pubkey for pubkey {}",
-        &pubkey_hex[..16]
-    );
-    // 先通过 oneshot channel 发送 ML-KEM hex 值，消除竞态条件
-    // 调用方可以直接使用该值，无需等待数据库写入完成
-    complete_mlkem_callback(pubkey_hex, Some(&signed.value));
-    // 再写入本地数据库缓存（供后续离线查询使用）
-    if let Some(store) = open_dht_store(core) {
-        let _ = store.set_mlkem_pubkey(pubkey_hex, &signed.value);
-    }
-    // 异步更新 contacts 表（确保下次发送消息时使用最新密钥）
-    let mlkem_hex = signed.value.clone();
-    let pubkey_hex_owned = pubkey_hex.to_string();
-    tokio::spawn(async move {
-        if let Some(pool) = storage::pool() {
-            if let Ok(Some(identity_id)) = storage::get_current_identity(pool).await {
-                if let Ok(mlkem_bytes) = hex::decode(&mlkem_hex) {
-                    let _ = storage::update_contact_mlkem_pubkey(
-                        pool,
-                        &identity_id,
-                        &pubkey_hex_owned,
-                        &mlkem_bytes,
-                    )
-                    .await;
-                    tracing::debug!(
-                        "DHT ML-KEM 记录已同步到 contacts 表: {}..",
-                        &pubkey_hex_owned[..16]
-                    );
-                }
-            }
-        }
-    });
-    true
-}
-
-/// 完成 ML-KEM 查询回调
-fn complete_mlkem_callback(pubkey_hex: &str, mlkem_hex: Option<&str>) {
-    // 兼容 lookup_peerid_by_pubkey_network 的回调
-    super::complete_dht_query(pubkey_hex, None);
-
-    let query_id = format!("mlkem_{}", pubkey_hex);
-    if let Some(tx) = crate::p2p::mlkem_query_callbacks()
-        .lock()
-        .unwrap()
-        .remove(&query_id)
-    {
-        let _ = tx.send(mlkem_hex.map(|s| s.to_string()));
-    }
-}
-
-/// 处理带签名的 DHT 记录（签名验证）
-fn handle_signed_record(record: &libp2p::kad::Record, core: &mut ChatCore) {
-    let Some(publisher) = &record.publisher else {
-        return;
-    };
-
-    let sig_meta = core
-        .swarm
-        .behaviour_mut()
-        .kademlia
-        .store_mut()
-        .inner()
-        .get_record_signature(&record.key);
-
-    let sig = match sig_meta {
-        Some(s) => s,
-        None => {
-            tracing::warn!(
-                "DHT record from {} has no signature metadata, rejecting",
-                publisher
-            );
-            return;
-        }
-    };
-
-    let mut validator = core.validator.write().unwrap();
-    if !validator.validate_dht_record(crate::p2p::validator::DhtRecordValidationParams {
-        publisher,
-        key: &record.key,
-        record_value: &record.value,
-        signature: &sig.signature,
-        timestamp: sig.timestamp,
-        salt: &sig.salt,
-    }) {
-        tracing::warn!("Rejected DHT record from {}: validation failed", publisher);
-        return;
-    }
-
-    tracing::debug!(
-        "Validated DHT record from {} (size: {} bytes)",
-        publisher,
-        record.value.len()
-    );
 }
 
 // ========== 消息接收处理 ==========
@@ -646,11 +509,14 @@ async fn handle_incoming_request(
         return;
     }
 
-    // === 修复：收到消息后，将发送方的 (ML-DSA 公钥 → PeerID) 映射缓存到本地 DHT 数据库 ===
+    // === 收到消息后，将发送方的 (ML-DSA 公钥 → PeerID) 映射缓存到本地 DHT 数据库 ===
     // 这样当回复消息时，dht_lookup_peerid 的步骤 1（connected_peers 反向查找）能直接命中，
     // 无需等待 DHT 网络查询完成，解决两个在线节点之间 DHT 记录尚未传播时的通信问题。
     if let Ok(store) = core.get_dht_store() {
         let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
+        // 同步更新内存缓存，如果该 PeerID 已连接则触发在线状态刷新
+        core.update_peerid_pubkey_mapping(peer, sender_mldsa_pubkey_hex.clone())
+            .await;
         tracing::debug!(
             "已缓存发送方身份绑定: {}.. -> PeerID={}",
             &sender_mldsa_pubkey_hex[..16],
@@ -728,14 +594,18 @@ async fn handle_incoming_request(
     }
 }
 
-/// 验证消息签名、新鲜度以及 DHT 身份绑定
+/// 验证消息签名和新鲜度
 ///
-/// 使用 verify_with_identity_binding() 进行完整验证链路：
+/// 验证链路：
 /// 1. 消息新鲜度（防止重放攻击）
 /// 2. 数据完整性（Hash 匹配）
 /// 3. ML-DSA 签名有效性
-/// 4. sender_public_key 在 DHT 中的身份绑定记录
-/// 5. 消息来源 PeerID 与 DHT 绑定一致
+///
+/// 注意：不再验证 DHT 身份绑定（verify_with_identity_binding 已删除）。
+/// 身份绑定验证在消息发送时通过 Kademlia provider 机制隐式完成：
+/// - 发送方通过 start_providing(pubkey_hex) 发布自己的 PeerID
+/// - 接收方通过 get_providers(pubkey_hex) 查询发送方的 PeerID
+/// - 如果攻击者冒充，其 ML-DSA 签名会验证失败（没有发送方的私钥）
 ///
 /// 返回 true 表示所有验证通过，false 表示任一验证失败
 async fn handle_message_verification(
@@ -743,162 +613,27 @@ async fn handle_message_verification(
     request: &ChatMessage,
     peer: &libp2p::PeerId,
 ) -> bool {
-    // 获取 DHT store 进行身份绑定验证
-    let store = match core.get_dht_store() {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("获取 DHT store 失败，无法验证消息身份绑定: {}", e);
-            tracing::warn!("{}", msg);
-            core.send_warning_mpsc(msg).await;
-            return false;
-        }
-    };
-
     let sender_pubkey_hex = hex::encode(&request.sender_public_key);
 
-    match request.verify_with_identity_binding(&store, Some(peer)) {
+    // 验证消息签名、哈希和新鲜度
+    match request.verify() {
         Ok(true) => {
             tracing::debug!(
                 "消息验证通过: sender={}.., peer={}",
                 &sender_pubkey_hex[..16],
                 peer
             );
-            return true;
+            true
         }
-        Ok(false) => {
-            // 基础验证（签名/哈希）可能已通过，但 DHT 身份绑定未找到。
-            // 不立即拒绝，而是尝试通过 DHT 网络查询对方的身份绑定记录。
-            tracing::info!(
-                "消息验证初次失败（可能 DHT 绑定未同步），尝试通过 DHT 网络查询 sender={}.. 的身份绑定",
-                &sender_pubkey_hex[..16]
-            );
-        }
-        Err(e) => {
-            let msg = format!("验证来自 {} 的消息时出错: {}", peer, e);
-            tracing::warn!("{}", msg);
-            core.send_warning_mpsc(msg).await;
-            return false;
-        }
-    }
-
-    // === 修复：DHT 绑定未找到时，发起网络查询并重试 ===
-    // 先检查签名本身是否有效（如果签名无效，DHT 查询也无意义）
-    match request.verify() {
-        Ok(true) => {} // 签名有效，继续
         Ok(false) => {
             let msg = format!("来自 {} 的消息签名验证失败，已忽略", peer);
             tracing::warn!("{}", msg);
             core.send_warning_mpsc(msg).await;
-            return false;
+            false
         }
         Err(e) => {
             let msg = format!("验证来自 {} 的消息签名时出错: {}", peer, e);
             tracing::warn!("{}", msg);
-            core.send_warning_mpsc(msg).await;
-            return false;
-        }
-    }
-
-    // 发起 DHT 网络查询，获取发送方的 PeerID 绑定记录
-    let record_key = format!("peerid:{}", sender_pubkey_hex);
-    let key = libp2p::kad::RecordKey::new(&record_key);
-    let rx = super::register_dht_query_callback(sender_pubkey_hex.clone());
-    let _query_id = core.swarm.behaviour_mut().kademlia.get_record(key);
-
-    tracing::info!(
-        "已发起 DHT 网络查询 sender={}.. 的身份绑定，等待结果...",
-        &sender_pubkey_hex[..16]
-    );
-
-    // 等待 DHT 查询结果（超时 10 秒）
-    let dht_result = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
-
-    // 清理回调（防止泄漏）
-    let _ = super::dht_query_callbacks()
-        .lock()
-        .unwrap()
-        .remove(&sender_pubkey_hex);
-
-    match dht_result {
-        Ok(Ok(Some(found_peer_id))) => {
-            tracing::info!(
-                "DHT 网络查询成功: sender={}.. -> PeerID={}",
-                &sender_pubkey_hex[..16],
-                found_peer_id
-            );
-
-            // 验证查询到的 PeerID 是否与消息来源一致
-            if &found_peer_id != peer {
-                tracing::warn!(
-                    "DHT 查询到的 PeerID {} 与消息来源 {} 不匹配，消息验证失败",
-                    found_peer_id,
-                    peer
-                );
-                let msg = format!("来自 {} 的消息验证失败：DHT 身份绑定与消息来源不匹配", peer);
-                core.send_warning_mpsc(msg).await;
-                return false;
-            }
-
-            // 重新获取 DHT store 并再次验证（此时本地已有缓存）
-            match core.get_dht_store() {
-                Ok(store2) => match request.verify_with_identity_binding(&store2, Some(peer)) {
-                    Ok(true) => {
-                        tracing::info!(
-                            "DHT 查询后重试验证通过: sender={}.., peer={}",
-                            &sender_pubkey_hex[..16],
-                            peer
-                        );
-                        true
-                    }
-                    Ok(false) => {
-                        tracing::warn!(
-                            "DHT 查询后重试验证仍然失败: sender={}..",
-                            &sender_pubkey_hex[..16]
-                        );
-                        let msg = format!("来自 {} 的消息验证失败（DHT 绑定不一致），已忽略", peer);
-                        core.send_warning_mpsc(msg).await;
-                        false
-                    }
-                    Err(e) => {
-                        tracing::warn!("DHT 查询后重试验证出错: {}", e);
-                        let msg = format!("验证来自 {} 的消息时出错: {}", peer, e);
-                        core.send_warning_mpsc(msg).await;
-                        false
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!("DHT 查询后获取 store 失败: {}", e);
-                    false
-                }
-            }
-        }
-        Ok(Ok(None)) => {
-            tracing::warn!(
-                "DHT 网络查询未找到 sender={}.. 的身份绑定记录",
-                &sender_pubkey_hex[..16]
-            );
-            let msg = format!(
-                "来自 {} 的消息验证失败：DHT 网络中未找到发送方的身份绑定记录",
-                peer
-            );
-            core.send_warning_mpsc(msg).await;
-            false
-        }
-        Ok(Err(_)) => {
-            tracing::warn!(
-                "DHT 网络查询 sender={}.. 的回调通道已关闭",
-                &sender_pubkey_hex[..16]
-            );
-            let msg = format!("来自 {} 的消息验证失败：DHT 查询被取消", peer);
-            core.send_warning_mpsc(msg).await;
-            false
-        }
-        Err(_) => {
-            tracing::warn!(
-                "DHT 网络查询 sender={}.. 超时（10秒），消息验证失败",
-                &sender_pubkey_hex[..16]
-            );
-            let msg = format!("来自 {} 的消息验证失败：DHT 网络查询超时", peer);
             core.send_warning_mpsc(msg).await;
             false
         }
@@ -1290,9 +1025,6 @@ async fn handle_file_download_request(
         };
 
         // 发送 FileStream 消息
-        // 注意：FileStreamChunk.chunk_data 已经是压缩后的数据（在 from_file() 中压缩）
-        // 整个 FileStreamChunk 序列化后发送，prepare_data 对 FileStream 类型不再压缩
-        // （避免双重压缩：chunk_data 已压缩，外层不应再压缩）
         if let Err(e) = core
             .send_text(
                 sender_mldsa_pubkey_hex,
@@ -1332,7 +1064,6 @@ async fn handle_file_download_request(
     );
 
     // 清理 file_path_map 中的条目，防止内存泄漏
-    // 文件发送完成后，不再需要保留文件路径映射
     core.file_path_map.remove(&chunk_response.file_id);
 }
 

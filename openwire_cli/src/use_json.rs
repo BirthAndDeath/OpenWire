@@ -69,12 +69,27 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             "timestamp": chrono::Utc::now().to_rfc3339()
                         })
                     }
+                    IncomingMessage::MessageSent {
+                        message_hash,
+                        peer_id,
+                    } => {
+                        json!({
+                            "type": "message",
+                            "subtype": "message_sent",
+                            "data": {
+                                "message_hash": message_hash,
+                                "peer_id": peer_id,
+                            },
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        })
+                    }
                 },
-                MessageEvent::OnlineStatus { count } => {
+                MessageEvent::OnlineStatus { online_contacts } => {
                     json!({
                         "type": "online_status",
                         "data": {
-                            "count": count,
+                            "count": online_contacts.len(),
+                            "online_contacts": online_contacts,
                         },
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     })

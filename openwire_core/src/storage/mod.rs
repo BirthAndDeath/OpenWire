@@ -16,5 +16,5 @@ pub use message::{
     Message, add_message, add_message_with_hash, add_messages_batch, delete_message,
     delete_messages_batch, delete_messages_by_peer, get_last_message, get_message, get_messages,
     list_failed, list_pending, mark_failed, mark_pending, mark_sent, mark_sent_batch,
-    update_message_hash,
+    mark_sent_by_hash, update_message_hash,
 };

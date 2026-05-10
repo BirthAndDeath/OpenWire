@@ -284,6 +284,17 @@ pub async fn mark_failed(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool
     Ok(rows > 0)
 }
 
+/// 通过 message_hash 标记消息为已发送（用于首次发送成功后标记）
+pub async fn mark_sent_by_hash(pool: &Pool<Sqlite>, message_hash: &str) -> StorageResult<bool> {
+    let rows =
+        sqlx::query("UPDATE messages SET pending = 0 WHERE message_hash = ? AND pending = 1")
+            .bind(message_hash)
+            .execute(pool)
+            .await?
+            .rows_affected();
+    Ok(rows > 0)
+}
+
 /// 更新消息的 message_hash 字段（用于重发后修正 hash）
 pub async fn update_message_hash(
     pool: &Pool<Sqlite>,

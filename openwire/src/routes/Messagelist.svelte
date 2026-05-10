@@ -23,6 +23,8 @@
         mldsa_pubkey_hex: string;
         // 消息发送状态: true = 待确认（未收到送达回执）, false = 已送达
         pending?: boolean;
+        // 消息哈希（用于匹配送达回执）
+        message_hash?: string;
     }
 
     // 文件传输进度信息
@@ -127,6 +129,7 @@
         sender_mldsa_pubkey_hex?: string,
         mldsa_pubkey_hex?: string,
         pending?: boolean,
+        message_hash?: string,
     ) {
         // 如果指定了 mldsa_pubkey_hex 且与当前选中的联系人不同，则忽略此消息
         if (mldsa_pubkey_hex && contactId && mldsa_pubkey_hex !== contactId) {
@@ -143,6 +146,7 @@
             sender_mldsa_pubkey_hex,
             mldsa_pubkey_hex: mldsa_pubkey_hex || contactId || "",
             pending,
+            message_hash,
         };
         // 去重：如果消息 ID 已存在则跳过
         if (loadedMsgIds.has(newMsg.id)) return;
@@ -155,14 +159,35 @@
 
     // 更新消息发送状态（从 pending 变为 sent）
     export function markSent(messageHash: string) {
-        // 通过消息哈希找到对应的 pending 消息并标记为已送达
-        // 由于前端没有存储哈希，我们遍历所有 pending 消息
-        // 找到最近一条 pending 消息标记为已送达
+        // 通过消息哈希精确匹配对应的 pending 消息并标记为已送达
+        // 优先按 message_hash 精确匹配
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            const msg = msgs[i];
+            if (msg.me && msg.message_hash === messageHash) {
+                msg.pending = false;
+                return;
+            }
+        }
+        // 如果未找到精确匹配（例如历史消息没有存储 hash），
+        // 则标记最近一条 pending 消息
         for (let i = msgs.length - 1; i >= 0; i--) {
             const msg = msgs[i];
             if (msg.me && msg.pending === true) {
                 msg.pending = false;
-                break; // 只标记最近一条
+                return;
+            }
+        }
+    }
+
+    // 更新最近一条 pending 消息的 message_hash 字段
+    // 由后端发送 message-sent 事件时调用，用于后续送达回执精确匹配
+    export function updateMessageHash(messageHash: string) {
+        // 从后往前找最近一条没有 message_hash 的 pending 消息
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            const msg = msgs[i];
+            if (msg.me && msg.pending === true && !msg.message_hash) {
+                msg.message_hash = messageHash;
+                return;
             }
         }
     }

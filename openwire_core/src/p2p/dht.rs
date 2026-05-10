@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::{DhtError, DhtResult};
-use crate::p2p::validator::RecordValidator;
-use crate::signature::DhtRecordSignature;
 
 const RECORDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("records");
 const PROVIDERS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("providers");
@@ -18,242 +16,21 @@ const PEER_MULTIADDRS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new
 const PUBKEY_PEERID_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pubkey_peerid");
 const PUBKEY_MLKEM_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pubkey_mlkem");
 
-/// 默认每个节点的最大记录数
-pub const DEFAULT_MAX_RECORDS_PER_PEER: usize = 1000;
-/// 默认总存储大小限制（100MB）
-pub const DEFAULT_MAX_TOTAL_SIZE: usize = 100 * 1024 * 1024;
-
 #[derive(Serialize, Deserialize)]
 struct StoredRecord {
     value: Vec<u8>,
     publisher: Option<String>,
-    expires: Option<u64>,       // unix timestamp
-    signature: Option<Vec<u8>>, // ML-DSA/Ed25519 签名
-    timestamp: Option<u64>,     // 记录创建时间戳（毫秒）
-    salt: Option<[u8; 32]>,     // 防重放盐值
+    expires: Option<u64>, // unix timestamp
 }
 
 #[derive(Serialize, Deserialize)]
 struct StoredProvider {
     provider: String,
     expires: Option<u64>,
-    signature: Option<Vec<u8>>, // ML-DSA/Ed25519 签名
-    timestamp: Option<u64>,     // 提供者注册时间戳（毫秒）
-    salt: Option<[u8; 32]>,     // 防重放盐值
 }
 
 pub struct RedbRecordStore {
     db: Arc<Database>,
-}
-
-/// 资源限制配置
-#[derive(Debug, Clone)]
-pub struct ResourceLimits {
-    /// 每个节点的最大记录数
-    pub max_records_per_peer: usize,
-    /// 总存储大小限制（字节）
-    pub max_total_size: usize,
-    /// 是否启用资源限制
-    pub enabled: bool,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            max_records_per_peer: DEFAULT_MAX_RECORDS_PER_PEER,
-            max_total_size: DEFAULT_MAX_TOTAL_SIZE,
-            enabled: true,
-        }
-    }
-}
-
-/// 节点存储统计信息（用于 ResourceLimitedRecordStore 的资源限制跟踪）
-/// 注意：此结构与 validator.rs 中的 PeerStats 不同，后者用于签名验证统计
-#[derive(Debug, Clone)]
-struct PeerStats {
-    records_count: usize,
-    total_size: usize,
-    last_updated: SystemTime,
-}
-
-impl Default for PeerStats {
-    fn default() -> Self {
-        Self {
-            records_count: 0,
-            total_size: 0,
-            last_updated: SystemTime::now(),
-        }
-    }
-}
-
-/// 带资源限制和签名验证的记录存储
-pub struct ResourceLimitedRecordStore {
-    inner: RedbRecordStore,
-    limits: ResourceLimits,
-    peer_stats: std::sync::RwLock<std::collections::HashMap<PeerId, PeerStats>>,
-    total_size: std::sync::atomic::AtomicUsize,
-    /// 可选的签名验证器，用于在 put() 时验证记录签名
-    validator: Option<std::sync::Arc<std::sync::RwLock<RecordValidator>>>,
-}
-
-impl ResourceLimitedRecordStore {
-    /// 创建带资源限制的存储
-    pub fn new(db: Arc<Database>, limits: ResourceLimits) -> Self {
-        Self {
-            inner: RedbRecordStore::new(db),
-            limits,
-            peer_stats: std::sync::RwLock::new(std::collections::HashMap::new()),
-            total_size: std::sync::atomic::AtomicUsize::new(0),
-            validator: None,
-        }
-    }
-
-    /// 设置签名验证器（用于在 put() 时验证记录签名）
-    pub fn set_validator(&mut self, validator: std::sync::Arc<std::sync::RwLock<RecordValidator>>) {
-        self.validator = Some(validator);
-    }
-
-    /// 获取签名验证器引用
-    pub fn get_validator(&self) -> Option<std::sync::Arc<std::sync::RwLock<RecordValidator>>> {
-        self.validator.clone()
-    }
-
-    /// 检查节点是否超过资源限制
-    pub fn check_peer_quota(&self, peer_id: &PeerId, record_size: usize) -> bool {
-        if !self.limits.enabled {
-            return true;
-        }
-
-        let stats = self.peer_stats.read().unwrap();
-        if let Some(peer_stats) = stats.get(peer_id) {
-            // 检查记录数量限制
-            if peer_stats.records_count >= self.limits.max_records_per_peer {
-                return false;
-            }
-
-            // 检查总大小限制
-            let current_total = self.total_size.load(std::sync::atomic::Ordering::Relaxed);
-            if current_total + record_size > self.limits.max_total_size {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    /// 更新节点统计信息
-    pub fn update_peer_stats(&self, peer_id: &PeerId, record_size: usize, increment: bool) {
-        let mut stats = self.peer_stats.write().unwrap();
-        let peer_stats = stats.entry(*peer_id).or_default();
-
-        if increment {
-            peer_stats.records_count += 1;
-            peer_stats.total_size += record_size;
-            self.total_size
-                .fetch_add(record_size, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            peer_stats.records_count = peer_stats.records_count.saturating_sub(1);
-            peer_stats.total_size = peer_stats.total_size.saturating_sub(record_size);
-            self.total_size
-                .fetch_sub(record_size, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        peer_stats.last_updated = SystemTime::now();
-    }
-
-    /// 清理过期记录的统计信息（需要在外部定期调用）
-    pub fn cleanup_expired_stats(&self, active_peers: &std::collections::HashSet<PeerId>) {
-        let mut stats = self.peer_stats.write().unwrap();
-        stats.retain(|peer_id, _| active_peers.contains(peer_id));
-    }
-
-    /// 获取内部存储（用于需要直接访问的场景）
-    pub fn inner(&self) -> &RedbRecordStore {
-        &self.inner
-    }
-
-    /// 获取内部存储的可变引用
-    pub fn inner_mut(&mut self) -> &mut RedbRecordStore {
-        &mut self.inner
-    }
-}
-
-// 为 ResourceLimitedRecordStore 实现 RecordStore trait
-impl libp2p::kad::store::RecordStore for ResourceLimitedRecordStore {
-    type RecordsIter<'a> = std::vec::IntoIter<std::borrow::Cow<'a, libp2p::kad::Record>>;
-    type ProvidedIter<'a> = std::vec::IntoIter<std::borrow::Cow<'a, libp2p::kad::ProviderRecord>>;
-
-    fn put(&mut self, record: libp2p::kad::Record) -> Result<(), libp2p::kad::store::Error> {
-        // 检查资源限制
-        if let Some(publisher) = &record.publisher
-            && !self.check_peer_quota(publisher, record.value.len())
-        {
-            return Err(libp2p::kad::store::Error::MaxRecords);
-        }
-
-        // 注意：libp2p 的 Record 类型不包含自定义签名元数据（signature/timestamp/salt），
-        // 因此无法在此处验证传入记录的签名。签名验证在应用层完成：
-        //
-        // 1. 当本地节点发布记录时，使用 put_signed_record() 方法存储带签名的记录
-        // 2. 当从 DHT 查询到记录时，在 events.rs::handle_kademlia_event() 中
-        //    从存储中提取签名元数据并调用 validator.validate_dht_record() 验证
-        //
-        // 此处的 validator 字段保留供未来扩展使用（例如在 put() 中验证
-        // 记录发布者的身份），当前不执行签名验证。
-
-        // 调用内部存储的 put 方法
-        let result = self.inner.put(record.clone());
-
-        // 如果成功，更新统计信息
-        if result.is_ok()
-            && let Some(publisher) = &record.publisher
-        {
-            self.update_peer_stats(publisher, record.value.len(), true);
-        }
-
-        result
-    }
-
-    fn get(
-        &self,
-        key: &libp2p::kad::RecordKey,
-    ) -> Option<std::borrow::Cow<'_, libp2p::kad::Record>> {
-        self.inner.get(key)
-    }
-
-    fn remove(&mut self, key: &libp2p::kad::RecordKey) {
-        // 先获取记录以更新统计信息
-        if let Some(record) = self.inner.get(key)
-            && let Some(publisher) = record.publisher
-        {
-            self.update_peer_stats(&publisher, record.value.len(), false);
-        }
-
-        self.inner.remove(key);
-    }
-
-    fn records(&self) -> Self::RecordsIter<'_> {
-        self.inner.records()
-    }
-
-    fn add_provider(
-        &mut self,
-        record: libp2p::kad::ProviderRecord,
-    ) -> Result<(), libp2p::kad::store::Error> {
-        self.inner.add_provider(record)
-    }
-
-    fn providers(&self, key: &libp2p::kad::RecordKey) -> Vec<libp2p::kad::ProviderRecord> {
-        self.inner.providers(key)
-    }
-
-    fn provided(&self) -> Self::ProvidedIter<'_> {
-        self.inner.provided()
-    }
-
-    fn remove_provider(&mut self, key: &libp2p::kad::RecordKey, provider: &PeerId) {
-        self.inner.remove_provider(key, provider)
-    }
 }
 
 impl RedbRecordStore {
@@ -306,6 +83,7 @@ impl RedbRecordStore {
     }
 
     /// 在写事务中执行操作（针对 libp2p kad store Error 类型）
+    #[allow(dead_code)]
     fn with_write_txn_kad<T>(
         &self,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<T, libp2p::kad::store::Error>,
@@ -319,149 +97,6 @@ impl RedbRecordStore {
             .commit()
             .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
         Ok(result)
-    }
-
-    /// 存储带签名的 DHT 记录
-    /// 签名元数据（signature/timestamp/salt）由 DhtRecordSignature 提供
-    pub fn put_signed_record(
-        &self,
-        record: Record,
-        sig: DhtRecordSignature,
-    ) -> Result<(), libp2p::kad::store::Error> {
-        let key_str = std::str::from_utf8(record.key.as_ref())
-            .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-
-        let stored = StoredRecord {
-            value: record.value,
-            publisher: record.publisher.map(|p| p.to_string()),
-            expires: record
-                .expires
-                .map(|i| i.elapsed().as_secs() + Self::now_unix()),
-            signature: Some(sig.signature),
-            timestamp: Some(sig.timestamp),
-            salt: Some(sig.salt),
-        };
-        let serialized =
-            postcard::to_allocvec(&stored).map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-
-        self.with_write_txn_kad(|write_txn| {
-            let mut table = write_txn
-                .open_table(RECORDS_TABLE)
-                .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-            table
-                .insert(key_str, serialized.as_slice())
-                .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-            Ok(())
-        })
-    }
-
-    /// 存储带签名的 Provider 记录
-    pub fn add_signed_provider(
-        &self,
-        record: ProviderRecord,
-        sig: DhtRecordSignature,
-    ) -> Result<(), libp2p::kad::store::Error> {
-        let key_str = std::str::from_utf8(record.key.as_ref())
-            .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-
-        let new_stored = StoredProvider {
-            provider: record.provider.to_string(),
-            expires: record
-                .expires
-                .map(|i| i.elapsed().as_secs() + Self::now_unix()),
-            signature: Some(sig.signature),
-            timestamp: Some(sig.timestamp),
-            salt: Some(sig.salt),
-        };
-
-        self.with_write_txn_kad(|write_txn| {
-            let mut table = write_txn
-                .open_table(PROVIDERS_TABLE)
-                .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-
-            let mut providers: Vec<StoredProvider> = {
-                let existing = table.get(key_str).ok().flatten();
-                if let Some(data) = existing {
-                    match postcard::from_bytes(data.value()) {
-                        Ok(parsed) => parsed,
-                        Err(e) => {
-                            tracing::warn!(
-                                "DHT 提供者记录解析失败 (key={:?}), 将重置为空: {}",
-                                key_str,
-                                e
-                            );
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    Vec::new()
-                }
-            };
-
-            if let Some(existing_provider) = providers
-                .iter_mut()
-                .find(|p| p.provider == new_stored.provider)
-            {
-                existing_provider.expires = new_stored.expires;
-                existing_provider.signature = new_stored.signature;
-                existing_provider.timestamp = new_stored.timestamp;
-                existing_provider.salt = new_stored.salt;
-            } else {
-                providers.push(new_stored);
-            }
-
-            let serialized = postcard::to_allocvec(&providers)
-                .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-            table
-                .insert(key_str, serialized.as_slice())
-                .map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
-            Ok(())
-        })
-    }
-
-    /// 获取记录的签名元数据（如果存在）
-    pub fn get_record_signature(&self, key: &RecordKey) -> Option<DhtRecordSignature> {
-        let key_str = std::str::from_utf8(key.as_ref()).ok()?;
-        let read_txn = self.db.as_ref().begin_read().ok()?;
-        let table = read_txn.open_table(RECORDS_TABLE).ok()?;
-        let data = table.get(key_str).ok()??;
-        let stored: StoredRecord = postcard::from_bytes(data.value()).ok()?;
-        let signature = stored.signature?;
-        let timestamp = stored.timestamp?;
-        let salt = stored.salt?;
-        Some(DhtRecordSignature {
-            timestamp,
-            salt,
-            signature,
-        })
-    }
-
-    /// 获取 Provider 记录的签名元数据（如果存在）
-    pub fn get_provider_signature(
-        &self,
-        key: &RecordKey,
-        provider: &PeerId,
-    ) -> Option<DhtRecordSignature> {
-        let key_str = std::str::from_utf8(key.as_ref()).ok()?;
-        let provider_str = provider.to_string();
-        let read_txn = self.db.as_ref().begin_read().ok()?;
-        let table = read_txn.open_table(PROVIDERS_TABLE).ok()?;
-        let data = table.get(key_str).ok()??;
-        let providers: Vec<StoredProvider> = postcard::from_bytes(data.value()).ok()?;
-        providers.into_iter().find_map(|p| {
-            if p.provider == provider_str {
-                let signature = p.signature?;
-                let timestamp = p.timestamp?;
-                let salt = p.salt?;
-                Some(DhtRecordSignature {
-                    timestamp,
-                    salt,
-                    signature,
-                })
-            } else {
-                None
-            }
-        })
     }
 
     // Multiaddr management
@@ -638,123 +273,6 @@ impl RedbRecordStore {
         })
     }
 
-    /// 删除过期的 pubkey->PeerID 缓存条目
-    ///
-    /// 保留自身身份的映射（由 `own_pubkey_hex` 指定），删除所有其他联系人的缓存。
-    /// 因为 PeerID 是临时传输层标识（每次启动重新生成），
-    /// 本地缓存的他人 PeerID 可能已过期，需要定期清理以触发网络重新查询获取最新值。
-    ///
-    /// # 参数
-    /// - `own_pubkey_hex`: 自身 ML-DSA 公钥 hex，此条目不删除
-    pub fn clear_expired_pubkey_peerid_cache(&self, own_pubkey_hex: &str) -> DhtResult<()> {
-        self.with_write_txn(|write_txn| {
-            let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
-            // 收集需要删除的键（redb 4.0 不支持在迭代时删除，先收集再删除）
-            let stale_keys: Vec<String> = table
-                .iter()?
-                .filter_map(|r| r.ok())
-                .map(|(k, _)| k.value().to_string())
-                .filter(|k| k != own_pubkey_hex)
-                .collect();
-            let count = stale_keys.len();
-            for key in stale_keys {
-                table.remove(key.as_str())?;
-            }
-            if count > 0 {
-                tracing::debug!("Cleared {} stale pubkey->PeerID cache entries", count);
-            }
-            Ok(())
-        })
-    }
-
-    /// 删除过期的 ML-KEM 公钥缓存条目
-    ///
-    /// 保留自身身份的映射（由 `own_pubkey_hex` 指定），删除所有其他联系人的缓存。
-    /// ML-KEM 公钥是临时会话密钥，每次启动都会变化，
-    /// 本地缓存的他人 ML-KEM 公钥已不可用，需要定期清理。
-    ///
-    /// # 参数
-    /// - `own_pubkey_hex`: 自身 ML-DSA 公钥 hex，此条目不删除
-    pub fn clear_expired_mlkem_pubkey_cache(&self, own_pubkey_hex: &str) -> DhtResult<()> {
-        self.with_write_txn(|write_txn| {
-            let mut table = write_txn.open_table(PUBKEY_MLKEM_TABLE)?;
-            let stale_keys: Vec<String> = table
-                .iter()?
-                .filter_map(|r| r.ok())
-                .map(|(k, _)| k.value().to_string())
-                .filter(|k| k != own_pubkey_hex)
-                .collect();
-            let count = stale_keys.len();
-            for key in stale_keys {
-                table.remove(key.as_str())?;
-            }
-            if count > 0 {
-                tracing::debug!("Cleared {} stale ML-KEM pubkey cache entries", count);
-            }
-            Ok(())
-        })
-    }
-
-    /// 验证身份绑定：检查给定的 ML-DSA 公钥 hex 是否与 PeerID 和 ML-KEM 公钥一致
-    pub fn verify_identity_binding(
-        &self,
-        mldsa_pubkey_hex: &str,
-        expected_peer_id: Option<&PeerId>,
-        expected_mlkem_pubkey_hex: Option<&str>,
-    ) -> DhtResult<bool> {
-        if let Some(expected_pid) = expected_peer_id {
-            match self.get_peerid_by_pubkey(mldsa_pubkey_hex)? {
-                Some(stored_pid) => {
-                    if &stored_pid != expected_pid {
-                        tracing::warn!(
-                            "Identity binding mismatch: ML-DSA {} -> PeerID {} (expected {})",
-                            &mldsa_pubkey_hex[..16],
-                            stored_pid,
-                            expected_pid
-                        );
-                        return Ok(false);
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        "Identity binding not found: ML-DSA {} has no PeerID mapping",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                    return Ok(false);
-                }
-            }
-        }
-
-        if let Some(expected_mlkem) = expected_mlkem_pubkey_hex {
-            match self.get_mlkem_pubkey(mldsa_pubkey_hex)? {
-                Some(stored_mlkem) => {
-                    if stored_mlkem != expected_mlkem {
-                        tracing::warn!(
-                            "ML-KEM binding mismatch for ML-DSA {}: stored {} != expected {}",
-                            &mldsa_pubkey_hex[..16],
-                            &stored_mlkem[..16],
-                            &expected_mlkem[..16]
-                        );
-                        return Ok(false);
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        "ML-KEM binding not found for ML-DSA {}",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                    return Ok(false);
-                }
-            }
-        }
-
-        tracing::info!(
-            "Identity binding verified for ML-DSA {}",
-            &mldsa_pubkey_hex[..16]
-        );
-        Ok(true)
-    }
-
     /// 批量清理过期记录
     ///
     /// 此方法会清理所有过期的DHT记录和提供者记录。
@@ -854,9 +372,6 @@ impl RecordStore for RedbRecordStore {
             expires: record
                 .expires
                 .map(|i| i.elapsed().as_secs() + Self::now_unix()),
-            signature: None,
-            timestamp: None,
-            salt: None,
         };
         let serialized =
             postcard::to_allocvec(&stored).map_err(|_| libp2p::kad::store::Error::MaxRecords)?;
@@ -968,9 +483,6 @@ impl RecordStore for RedbRecordStore {
             expires: record
                 .expires
                 .map(|i| i.elapsed().as_secs() + Self::now_unix()),
-            signature: None, // 无签名（libp2p 标准 ProviderRecord 不带签名元数据）
-            timestamp: None, // 使用 add_signed_provider() 存储带签名的提供者记录
-            salt: None,
         };
 
         let write_txn = self

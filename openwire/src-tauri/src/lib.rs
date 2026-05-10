@@ -789,9 +789,12 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
                                 app_handle_for_events.emit("chat-message", json).ok();
                             }
                         }
-                        MessageEvent::OnlineStatus { count } => {
-                            // 在线状态更新作为独立事件发送，不混入消息历史
-                            app_handle_for_events.emit("online-status", count).ok();
+                        MessageEvent::OnlineStatus { online_contacts } => {
+                            // 在线状态更新：发送在线联系人 ML-DSA 公钥 hex 列表
+                            // 前端据此更新每个联系人的 online 状态指示器
+                            app_handle_for_events
+                                .emit("online-status", online_contacts)
+                                .ok();
                         }
                         MessageEvent::Warning(data) => {
                             app_handle_for_events.emit("warning", data).ok();
@@ -903,15 +906,33 @@ async fn setup_core_and_event_loop(
                     app_handle_for_events
                         .emit("delivery-receipt", message_hash)
                         .ok();
+                } else if let IncomingMessage::MessageSent {
+                    ref message_hash,
+                    ref peer_id,
+                } = msg
+                {
+                    // MessageSent 是消息已发送通知，包含消息哈希，
+                    // 前端用此哈希更新对应消息的 message_hash 字段，
+                    // 以便后续送达回执能精确匹配
+                    let payload = serde_json::json!({
+                        "message_hash": message_hash,
+                        "peer_id": peer_id,
+                    });
+                    app_handle_for_events
+                        .emit("message-sent", payload.to_string())
+                        .ok();
                 } else {
                     // 将其他 IncomingMessage 枚举序列化为 JSON 字符串发送给前端
                     let json = serde_json::to_string(&msg).unwrap_or_default();
                     app_handle_for_events.emit("chat-message", json).ok();
                 }
             }
-            MessageEvent::OnlineStatus { count } => {
-                // 在线状态更新作为独立事件发送，不混入消息历史
-                app_handle_for_events.emit("online-status", count).ok();
+            MessageEvent::OnlineStatus { online_contacts } => {
+                // 在线状态更新：发送在线联系人 ML-DSA 公钥 hex 列表
+                // 前端据此更新每个联系人的 online 状态指示器
+                app_handle_for_events
+                    .emit("online-status", online_contacts)
+                    .ok();
             }
             MessageEvent::Warning(data) => {
                 app_handle_for_events.emit("warning", data).ok();

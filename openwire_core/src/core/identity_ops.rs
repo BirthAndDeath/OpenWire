@@ -147,20 +147,18 @@ impl ChatCore {
         let peer_id = keypair.public().to_peer_id();
 
         let dht_db = self.dht_db.clone().unwrap();
-        let p2p::SwarmWithValidator { swarm, validator } =
-            match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
-                Ok(sv) => sv,
-                Err(e) => {
-                    tracing::error!("Failed to reinitialize swarm: {e}");
-                    self.send_warning_mpsc(format!("切换身份失败：无法重建网络连接: {}", e))
-                        .await;
-                    return;
-                }
-            };
+        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to reinitialize swarm: {e}");
+                self.send_warning_mpsc(format!("切换身份失败：无法重建网络连接: {}", e))
+                    .await;
+                return;
+            }
+        };
 
         // 5. 更新 ChatCore 字段
         self.swarm = swarm;
-        self.validator = validator;
         self.identity_keypair = keypair;
         self.mldsa_pubkey_hex = Some(mldsa_pubkey_hex.clone());
         self.current_peer_id = Some(peer_id);
@@ -243,9 +241,8 @@ impl ChatCore {
             Ok(keypair) => {
                 let peer_id = keypair.public().to_peer_id();
                 match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
-                    Ok(p2p::SwarmWithValidator { swarm, validator }) => {
+                    Ok(swarm) => {
                         self.swarm = swarm;
-                        self.validator = validator;
                         self.identity_keypair = keypair;
                         self.current_peer_id = Some(peer_id);
                         tracing::info!("Swarm reinitialized, PeerID={}", peer_id);

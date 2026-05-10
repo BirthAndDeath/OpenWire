@@ -1,5 +1,4 @@
 use crate::crypto::constant_time_compare;
-use libp2p::PeerId;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -190,66 +189,6 @@ impl ChatMessage {
                     e.to_string(),
                 )))
             })
-    }
-
-    /// 验证消息签名、哈希、新鲜度，以及 DHT 身份绑定
-    ///
-    /// 在 verify() 的基础上，额外验证：
-    /// 4. sender_public_key（ML-DSA 公钥）是否在 DHT 中有合法的身份绑定记录
-    /// 5. 如果提供了 expected_peer_id，验证其是否与 DHT 绑定一致
-    ///
-    /// 这是完整的消息验证链路，防止攻击者使用自己的密钥对签名消息但冒充他人身份。
-    ///
-    /// # 参数
-    /// - `store`: DHT 记录存储，用于查询身份绑定
-    /// - `expected_peer_id`: 期望的发送方 PeerID（如果为 None 则跳过 PeerID 匹配检查）
-    ///
-    /// # 返回
-    /// - `Ok(true)`: 所有验证通过
-    /// - `Ok(false)`: 任一验证失败
-    /// - `Err(e)`: 验证过程中发生错误（如数据库错误）
-    pub fn verify_with_identity_binding(
-        &self,
-        store: &crate::p2p::dht::RedbRecordStore,
-        expected_peer_id: Option<&PeerId>,
-    ) -> crate::error::MessageResult<bool> {
-        // 1-3. 基础验证（签名、哈希、新鲜度）
-        if !self.verify()? {
-            return Ok(false);
-        }
-
-        // 4. DHT 身份绑定验证
-        // 检查 sender_public_key 是否在 DHT 中有合法的身份绑定记录
-        let sender_pubkey_hex = hex::encode(&self.sender_public_key);
-        match store.get_peerid_by_pubkey(&sender_pubkey_hex)? {
-            Some(dht_peer_id) => {
-                // 5. 如果提供了期望的 PeerID，验证是否匹配
-                if let Some(expected) = expected_peer_id
-                    && &dht_peer_id != expected
-                {
-                    tracing::warn!(
-                        "身份绑定验证失败: ML-DSA {} 的 DHT PeerID {} 与消息来源 PeerID {} 不匹配",
-                        &sender_pubkey_hex[..16],
-                        dht_peer_id,
-                        expected
-                    );
-                    return Ok(false);
-                }
-                tracing::debug!(
-                    "身份绑定验证通过: ML-DSA {} -> PeerID {}",
-                    &sender_pubkey_hex[..16],
-                    dht_peer_id
-                );
-                Ok(true)
-            }
-            None => {
-                tracing::warn!(
-                    "身份绑定验证失败: ML-DSA {} 在 DHT 中无身份绑定记录",
-                    &sender_pubkey_hex[..16]
-                );
-                Ok(false)
-            }
-        }
     }
 
     pub fn is_fresh(&self) -> bool {

@@ -143,6 +143,14 @@ pub enum IncomingMessage {
         /// 发送方的 ML-DSA 公钥 hex
         peer_id: String,
     },
+    /// 消息已发送通知（包含消息哈希，用于前端匹配送达回执）
+    #[serde(rename = "message_sent")]
+    MessageSent {
+        /// 已发送消息的哈希
+        message_hash: String,
+        /// 接收方的 ML-DSA 公钥 hex
+        peer_id: String,
+    },
 }
 
 /// 消息事件类型：用于向外部（UI）通知状态
@@ -154,9 +162,12 @@ pub enum MessageEvent {
     /// 收到新消息（结构化数据，上层负责序列化）
     ReceiveMessage(IncomingMessage),
     /// 在线状态更新（独立事件，不混入消息历史）
+    ///
+    /// 包含当前所有在线联系人的 ML-DSA 公钥 hex 列表，
+    /// 上层据此更新每个联系人的在线/离线状态指示器。
     OnlineStatus {
-        /// 当前在线连接数
-        count: usize,
+        /// 当前在线联系人的 ML-DSA 公钥 hex 列表
+        online_contacts: Vec<String>,
     },
     /// 发生错误
     Error(String),

@@ -54,9 +54,23 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
                         println!("[系统] 消息已送达 ✓ (from: {})", peer_id);
                     }
+                    IncomingMessage::MessageSent { .. } => {
+                        // 消息已发送通知，notui 模式不需要额外输出
+                    }
                 },
-                MessageEvent::OnlineStatus { count } => {
-                    println!("[系统] 当前在线: {} 个连接", count);
+                MessageEvent::OnlineStatus { online_contacts } => {
+                    println!("[系统] 当前在线: {} 个连接", online_contacts.len());
+                    if !online_contacts.is_empty() {
+                        println!("[系统] 在线联系人:");
+                        for pubkey in &online_contacts {
+                            let short = if pubkey.len() > 16 {
+                                format!("{}...", &pubkey[..16])
+                            } else {
+                                pubkey.clone()
+                            };
+                            println!("  ● {}", short);
+                        }
+                    }
                 }
                 MessageEvent::Log(data) => {
                     println!("[日志] {data}");

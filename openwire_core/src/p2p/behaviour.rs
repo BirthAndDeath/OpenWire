@@ -13,7 +13,7 @@ pub struct MyBehaviour {
     /// mDNS 协议：局域网内自动发现对等节点
     pub mdns: mdns::tokio::Behaviour,
     /// Kademlia 协议：分布式哈希表，用于节点定位和路由
-    pub kademlia: kad::Behaviour<super::dht::ResourceLimitedRecordStore>,
+    pub kademlia: kad::Behaviour<super::dht::RedbRecordStore>,
     //Ping 协议（连接保活/延迟检测）
     pub ping: ping::Behaviour,
     // Identify 协议（地址/协议交换）

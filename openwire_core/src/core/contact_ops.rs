@@ -1,4 +1,4 @@
-use crate::{core::ChatCore, p2p, storage};
+use crate::{core::ChatCore, storage};
 
 impl ChatCore {
     pub(crate) async fn add_contact(
@@ -7,43 +7,6 @@ impl ChatCore {
         mlkem_public_key: Vec<u8>,
         name: Option<String>,
     ) -> bool {
-        // 验证身份绑定：检查 DHT 中是否存在该 ML-DSA 身份的绑定记录
-        if !mlkem_public_key.is_empty() {
-            let mlkem_pubkey_hex = hex::encode(&mlkem_public_key);
-            match p2p::verify_identity_binding(
-                &self.data_dir,
-                &mldsa_pubkey_hex,
-                None,
-                Some(&mlkem_pubkey_hex),
-                self.dht_db.clone(),
-            ) {
-                Ok(true) => {
-                    tracing::info!(
-                        "Identity binding verified for contact {} (ML-KEM matches DHT)",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                }
-                Ok(false) => {
-                    tracing::warn!(
-                        "Identity binding verification failed for contact {}: ML-KEM mismatch or not found in DHT",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                    let msg = format!(
-                        "警告：无法验证联系人 {} 的身份绑定（DHT 中未找到对应的 ML-KEM 公钥记录），请确认公钥来源可靠",
-                        &mldsa_pubkey_hex[..16]
-                    );
-                    self.send_warning_mpsc(msg).await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Identity binding check error for contact {}: {}",
-                        &mldsa_pubkey_hex[..16],
-                        e
-                    );
-                }
-            }
-        }
-
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
 
         if let Some(pool) = storage::pool() {
@@ -92,9 +55,23 @@ impl ChatCore {
     }
 
     /// 通过 DHT 网络发现联系人（非阻塞版本）
+    ///
+    /// 如果是首次发现（联系人尚未在数据库中），会调用 add_contact 并发送日志。
+    /// 如果联系人已存在，则只刷新 DHT 查询，不重复添加和输出日志。
     pub(crate) async fn discover_contact(&mut self, mldsa_pubkey_hex: &str, name: Option<String>) {
         let pubkey_short = &mldsa_pubkey_hex[..16];
         tracing::info!("Discovering contact {} via DHT network", pubkey_short);
+
+        // 检查联系人是否已在数据库中（避免重复添加和日志输出）
+        let is_existing_contact = match self.mldsa_identity_id.as_ref() {
+            Some(owner_id) => match storage::pool() {
+                Some(pool) => storage::is_contact_exists(pool, owner_id, mldsa_pubkey_hex)
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            },
+            None => false,
+        };
 
         let store = self.get_dht_store();
         let (has_local_peerid, has_local_mlkem) = match store {
@@ -113,28 +90,38 @@ impl ChatCore {
             Err(_) => (false, false),
         };
 
-        // 如果本地已有完整信息，直接添加联系人
+        // 如果本地已有完整信息
         if has_local_peerid && has_local_mlkem {
-            tracing::info!(
-                "DHT discovery: contact {} already cached locally, adding directly",
-                pubkey_short
-            );
-            let mlkem_key = self.get_cached_mlkem_bytes(mldsa_pubkey_hex);
-            self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
-                .await;
-            let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
-            self.send_log_mpsc(msg).await;
+            if is_existing_contact {
+                // 已存在的联系人：只刷新 DHT 查询，不重复添加
+                tracing::debug!(
+                    "DHT discovery: contact {} already exists, refreshing DHT query",
+                    pubkey_short
+                );
+                // 发起 GetProviders 以刷新在线状态
+                let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex);
+                let _query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
+            } else {
+                // 新联系人：直接添加
+                tracing::info!(
+                    "DHT discovery: contact {} already cached locally, adding directly",
+                    pubkey_short
+                );
+                let mlkem_key = self.get_cached_mlkem_bytes(mldsa_pubkey_hex);
+                self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
+                    .await;
+                let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
+                self.send_log_mpsc(msg).await;
+            }
             return;
         }
 
         // 本地没有缓存，发起网络 DHT 查询但不阻塞等待
         if !has_local_peerid {
-            let record_key = format!("peerid:{}", mldsa_pubkey_hex);
-            let key = libp2p::kad::RecordKey::new(&record_key);
-            let _rx = p2p::register_dht_query_callback(mldsa_pubkey_hex.to_string());
-            let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+            let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex);
+            let _query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
             tracing::debug!(
-                "DHT discovery: initiated PeerID query for {} (non-blocking)",
+                "DHT discovery: initiated GetProviders for {} (non-blocking)",
                 pubkey_short
             );
         }
@@ -142,8 +129,6 @@ impl ChatCore {
         if !has_local_mlkem {
             let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
             let key = libp2p::kad::RecordKey::new(&mlkem_key);
-            let query_id = format!("mlkem_{}", mldsa_pubkey_hex);
-            let _rx = p2p::register_mlkem_query_callback(query_id);
             let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
             tracing::debug!(
                 "DHT discovery: initiated ML-KEM query for {} (non-blocking)",
@@ -151,17 +136,26 @@ impl ChatCore {
             );
         }
 
-        // 如果本地已有部分信息，也尝试添加联系人
+        // 如果本地已有部分信息
         if has_local_peerid || has_local_mlkem {
-            let mlkem_key = if has_local_mlkem {
-                self.get_cached_mlkem_bytes(mldsa_pubkey_hex)
+            if is_existing_contact {
+                // 已存在的联系人：只刷新 DHT 查询，不重复添加
+                tracing::debug!(
+                    "DHT discovery: contact {} already exists, refreshing DHT query",
+                    pubkey_short
+                );
             } else {
-                Vec::new()
-            };
-            self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
-                .await;
-            let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
-            self.send_log_mpsc(msg).await;
+                // 新联系人：尝试添加
+                let mlkem_key = if has_local_mlkem {
+                    self.get_cached_mlkem_bytes(mldsa_pubkey_hex)
+                } else {
+                    Vec::new()
+                };
+                self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
+                    .await;
+                let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
+                self.send_log_mpsc(msg).await;
+            }
         } else {
             tracing::info!(
                 "DHT discovery: no cached data for contact {}, initiated network queries (results will arrive via swarm events)",

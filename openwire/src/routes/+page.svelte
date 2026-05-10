@@ -126,6 +126,8 @@
     let unlistenNeedPassword: (() => void) | undefined;
     let unlistenCoreReady: (() => void) | undefined;
     let unlistenDeliveryReceipt: (() => void) | undefined;
+    let unlistenOnlineStatus: (() => void) | undefined;
+    let unlistenMessageSent: (() => void) | undefined;
     let pollingTimer: ReturnType<typeof setInterval> | undefined;
 
     (async () => {
@@ -206,6 +208,30 @@
         );
       });
 
+      // 监听在线状态事件：更新每个联系人的 online 字段
+      unlistenOnlineStatus = await listen<string[]>("online-status", (e) => {
+        const onlinePubkeys = new Set(e.payload);
+        contacts = contacts.map((c) => ({
+          ...c,
+          online: onlinePubkeys.has(c.pubkey_hex),
+        }));
+      });
+
+      // 监听消息已发送事件：更新对应消息的 message_hash 字段
+      // 这样后续送达回执能通过 message_hash 精确匹配
+      unlistenMessageSent = await listen<string>("message-sent", (e) => {
+        try {
+          const payload = JSON.parse(e.payload);
+          const messageHash = payload.message_hash;
+          const peerId = payload.peer_id;
+          if (messageHash) {
+            msgListRef?.updateMessageHash(messageHash);
+          }
+        } catch (err) {
+          console.error("解析 message-sent 事件失败:", err);
+        }
+      });
+
       // 监听文件传输进度事件
       unlistenFileProgress = await listen<string>(
         "file-transfer-progress",
@@ -249,6 +275,8 @@
       unlistenNeedPassword?.();
       unlistenCoreReady?.();
       unlistenDeliveryReceipt?.();
+      unlistenOnlineStatus?.();
+      unlistenMessageSent?.();
     };
   });
 

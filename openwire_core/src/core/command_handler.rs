@@ -9,8 +9,19 @@ impl ChatCore {
                 msgtype,
                 data,
             } => match self.send_text(&mldsa_pubkey_hex, msgtype, data).await {
-                Ok(_) => {
-                    tracing::info!("{:?} message sent to {}", msgtype, &mldsa_pubkey_hex[..16])
+                Ok(message_hash) => {
+                    tracing::info!(
+                        "{:?} message sent to {}, hash={}..",
+                        msgtype,
+                        &mldsa_pubkey_hex[..16],
+                        &message_hash[..16]
+                    );
+                    // 通知前端消息已发送，附带消息哈希用于匹配送达回执
+                    self.send_message_mpsc(crate::command::IncomingMessage::MessageSent {
+                        message_hash,
+                        peer_id: mldsa_pubkey_hex.clone(),
+                    })
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!("Failed to send {:?} message: {e}", msgtype);

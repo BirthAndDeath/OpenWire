@@ -1,7 +1,7 @@
-use std::sync::Arc;
-
+use crate::actor::RUNTIME as rt;
 use futures::StreamExt;
 use redb::Database;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -10,16 +10,6 @@ use crate::{command::ChatCommand, core::ChatCore, p2p, storage};
 impl ChatCore {
     /// 启动核心事件循环（使用独立的 Tokio 运行时）
     pub fn run(mut self) -> std::thread::JoinHandle<()> {
-        let worker_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()
-            .expect("Failed to build tokio runtime");
-
         let handle = rt.handle().clone();
         std::thread::spawn(move || {
             rt.block_on(async move {
@@ -70,6 +60,14 @@ impl ChatCore {
         routing_table_save_interval.tick().await; // 跳过首次立即触发
         let cache_path = self.data_dir.join("routing_table.cache");
 
+        // === 主动连接维护间隔：每 30 秒对所有联系人发起 DHT GetProviders 查询 ===
+        // 这是关键设计：系统主动维护连接状态，而不是等到用户发消息时才查询。
+        // 当 GetProviders 找到 provider 时，events.rs 会自动缓存 PeerID 并 dial 建立连接。
+        // 这样用户发消息时，连接已经建立，消息可以立即发送。
+        let mut connection_maintenance_interval =
+            tokio::time::interval(std::time::Duration::from_secs(30));
+        connection_maintenance_interval.tick().await; // 跳过首次立即触发（启动时已调用 discover_all_contacts）
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
@@ -95,6 +93,17 @@ impl ChatCore {
                 }
                 _ = routing_table_save_interval.tick() => {
                     p2p::save_routing_table(&mut self.swarm, &cache_path);
+                }
+                _ = connection_maintenance_interval.tick() => {
+                    // 定期对所有联系人发起 DHT GetProviders 查询
+                    // 这是非阻塞的：get_providers 只是发起网络查询，不等待结果
+                    // 结果通过 events.rs 中的 GetProvidersOk::FoundProviders 事件处理
+                    self.discover_all_contacts(&dht_reg_cmd_tx).await;
+                    // 连接维护后触发离线消息重试
+                    // 如果 GetProviders 成功找到了 provider，events.rs 会自动缓存 PeerID 并 dial，
+                    // 此时重试消息可以成功发送。如果尚未找到，重试会再次触发 DiscoverContact 命令，
+                    // 形成持续的重试循环直到成功。
+                    let _ = dht_reg_cmd_tx.try_send(ChatCommand::RetryPendingMessages);
                 }
                 else => break,
             }

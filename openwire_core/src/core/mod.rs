@@ -39,8 +39,6 @@ pub mod message_ops;
 pub struct ChatCore {
     /// libp2p 网络 swarm，管理所有连接和协议
     pub(crate) swarm: Swarm<p2p::MyBehaviour>,
-    /// DHT 记录验证器（基于签名验证）
-    pub(crate) validator: Arc<std::sync::RwLock<p2p::RecordValidator>>,
     /// 临时传输层 PeerID 密钥对（Ed25519，每次启动重新生成）
     #[allow(dead_code)]
     pub(crate) identity_keypair: libp2p::identity::Keypair,
@@ -77,6 +75,12 @@ pub struct ChatCore {
     pub(crate) dht_db: Option<std::sync::Arc<redb::Database>>,
     /// 已建立连接的 PeerID 集合（用于在线状态计数）
     pub(crate) connected_peers: std::collections::HashSet<PeerId>,
+    /// PeerID → ML-DSA 公钥 hex 的内存缓存
+    ///
+    /// 在 ConnectionEstablished 时从 DHT 反向查找并缓存，
+    /// 在 handle_incoming_request 中 set_pubkey_peerid 后更新。
+    /// 避免因 DHT 写入延迟导致在线状态无法正确显示。
+    pub(crate) peerid_to_pubkey: HashMap<PeerId, String>,
     /// 当前会话的 ML-KEM 解封装密钥对象（缓存，避免序列化/反序列化问题）
     ///
     /// # 设计说明
@@ -166,9 +170,8 @@ impl ChatCore {
             Some(Arc::new(db))
         };
 
-        let p2p::SwarmWithValidator { swarm, validator } =
-            p2p::swarm_init(&cfg.data_dir, keypair.clone(), dht_db.clone().unwrap())
-                .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
+        let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), dht_db.clone().unwrap())
+            .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -200,7 +203,6 @@ impl ChatCore {
 
         Ok(ChatCore {
             swarm,
-            validator,
             identity_keypair: keypair,
             tx_message: tx,
             rx_message: Some(rx),
@@ -221,6 +223,7 @@ impl ChatCore {
             file_path_map: HashMap::new(),
             dht_db,
             connected_peers: std::collections::HashSet::new(),
+            peerid_to_pubkey: HashMap::new(),
             mlkem_decap_key: Some(mlkem_decap_key),
         })
     }
@@ -303,13 +306,64 @@ impl ChatCore {
     }
 
     /// 发送在线状态更新事件（独立事件，不混入消息历史）
-    pub(crate) async fn send_online_status(&mut self, count: usize) {
+    ///
+    /// 将当前所有已连接 PeerID 反向解析为 ML-DSA 公钥 hex，
+    /// 发送给上层 UI 以便显示每个联系人的在线/离线状态。
+    pub(crate) async fn send_online_status(&mut self) {
+        // 将 connected_peers (HashSet<PeerId>) 解析为 ML-DSA 公钥 hex 列表
+        let online_contacts = self.resolve_online_contacts();
         if let Err(e) = self
             .tx_message
-            .send(MessageEvent::OnlineStatus { count })
+            .send(MessageEvent::OnlineStatus { online_contacts })
             .await
         {
             tracing::error!("Failed to send online status event: {e}");
+        }
+    }
+
+    /// 解析当前所有已连接 PeerID 对应的 ML-DSA 公钥 hex
+    ///
+    /// 优先使用内存缓存 `peerid_to_pubkey`，如果缓存中没有则回退到 DHT 查询。
+    /// 找到后自动写入缓存，避免后续重复查询。
+    fn resolve_online_contacts(&self) -> Vec<String> {
+        let store = self.get_dht_store().ok();
+        let mut online = Vec::with_capacity(self.connected_peers.len());
+        for peer_id in &self.connected_peers {
+            // 1. 优先使用内存缓存
+            if let Some(pubkey_hex) = self.peerid_to_pubkey.get(peer_id) {
+                online.push(pubkey_hex.clone());
+                continue;
+            }
+            // 2. 回退到 DHT 查询
+            if let Some(ref store) = store {
+                match store.get_pubkey_by_peerid(peer_id) {
+                    Ok(Some(pubkey_hex)) => {
+                        online.push(pubkey_hex);
+                    }
+                    _ => {
+                        // PeerID 尚未关联到任何 ML-DSA 公钥
+                        tracing::trace!("Peer {peer_id} has no pubkey mapping yet");
+                    }
+                }
+            }
+        }
+        online
+    }
+
+    /// 更新 PeerID → ML-DSA 公钥 hex 的内存缓存
+    ///
+    /// 当 `set_pubkey_peerid` 被调用时（如收到入站请求后），
+    /// 同步更新内存缓存，确保后续在线状态查询能立即反映新映射。
+    /// 如果该 PeerID 当前已连接，则触发一次在线状态刷新。
+    pub(crate) async fn update_peerid_pubkey_mapping(
+        &mut self,
+        peer_id: PeerId,
+        pubkey_hex: String,
+    ) {
+        let is_new = self.peerid_to_pubkey.insert(peer_id, pubkey_hex).is_none();
+        // 如果这是新映射且该 PeerID 当前已连接，刷新在线状态
+        if is_new && self.connected_peers.contains(&peer_id) {
+            self.send_online_status().await;
         }
     }
 }

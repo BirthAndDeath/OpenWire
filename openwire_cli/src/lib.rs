@@ -1,6 +1,6 @@
 // 定义应用状态（Model）
 #![doc = include_str!("../../README.md")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use error::CliError;
 use etcetera::BaseStrategy;
@@ -38,6 +38,8 @@ pub struct App {
     status_message: String, // 状态提示信息
     /// 在线联系人数量（通过 libp2p 连接事件更新）
     online_peers: usize,
+    /// 在线联系人的 ML-DSA 公钥 hex 集合（用于 per-contact 在线指示器）
+    online_contacts: HashSet<String>,
     /// 文件发送模式：为 true 时，按 Enter 将输入框内容作为文件路径发送
     file_send_mode: bool,
     /// 添加联系人模式：为 true 时，按 Ctrl+Enter 将输入框内容作为公钥添加联系人
@@ -259,6 +261,7 @@ impl App {
             identity_list_state: ListState::default(),
             status_message: String::new(),
             online_peers: 0,
+            online_contacts: HashSet::new(),
             file_send_mode: false,
             add_contact_mode: false,
             clipboard: None,
@@ -324,6 +327,9 @@ impl App {
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
                         self.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
                     }
+                    IncomingMessage::MessageSent { .. } => {
+                        // 消息已发送通知，CLI 不需要额外处理
+                    }
                 }
                 // 更新选中状态到最新消息
                 let msg_count = self.current_messages().len();
@@ -331,8 +337,9 @@ impl App {
                     self.message_list_state.select(Some(msg_count - 1));
                 }
             }
-            MessageEvent::OnlineStatus { count } => {
-                self.online_peers = count;
+            MessageEvent::OnlineStatus { online_contacts } => {
+                self.online_peers = online_contacts.len();
+                self.online_contacts = online_contacts.into_iter().collect();
             }
             MessageEvent::FileTransferProgress(progress) => {
                 self.push_message(format!(

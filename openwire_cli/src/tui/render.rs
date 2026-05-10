@@ -17,7 +17,15 @@ fn getcontacts(app: &App, contacts_list: &mut Vec<ListItem>) {
             } else {
                 c.mldsa_pubkey_hex.clone()
             };
-            ListItem::new(Text::from(format!("{} ({})", name, short_pk)))
+            let online_mark = if app.online_contacts.contains(&c.mldsa_pubkey_hex) {
+                " ●"
+            } else {
+                ""
+            };
+            ListItem::new(Text::from(format!(
+                "{}{} ({})",
+                online_mark, name, short_pk
+            )))
         })
         .collect::<Vec<ListItem>>();
 }

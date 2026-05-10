@@ -30,8 +30,52 @@ async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
         }
         KeyCode::Enter => {
             if let Some(i) = app.contact_list_state.selected()
-                && i < list_len
+                && let Some(contact) = app.contacts.get(i)
             {
+                // 切换到输入框前，确保该联系人的最新消息已加载到内存
+                if !app
+                    .messages_by_contact
+                    .contains_key(&contact.mldsa_pubkey_hex)
+                {
+                    if let Some(pool) = openwire_core::storage::pool() {
+                        let owner = openwire_core::storage::get_current_identity(pool)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        if let Ok(msgs) = openwire_core::storage::get_messages(
+                            pool,
+                            &owner,
+                            &contact.mldsa_pubkey_hex,
+                            None,
+                            50,
+                        )
+                        .await
+                        {
+                            let entry = app
+                                .messages_by_contact
+                                .entry(contact.mldsa_pubkey_hex.clone())
+                                .or_default();
+                            let name = contact.name.as_deref().unwrap_or("(未命名)");
+                            entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                            for msg in msgs.iter().rev() {
+                                let prefix = if msg.is_outgoing == 1 {
+                                    "[我]"
+                                } else {
+                                    "[对方]"
+                                };
+                                entry.push(format!("{} {}", prefix, msg.content));
+                            }
+                        }
+                    }
+                }
+                // 每次切换联系人都滚动到最新消息
+                if let Some(msgs) = app.messages_by_contact.get(&contact.mldsa_pubkey_hex) {
+                    let msg_count = msgs.len();
+                    if msg_count > 0 {
+                        app.message_list_state.select(Some(msg_count - 1));
+                    }
+                }
                 app.current_focus = Focus::Input;
             }
         }

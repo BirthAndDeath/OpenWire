@@ -27,10 +27,8 @@
         sending = true;
         err = "";
         try {
-            await invoke("send", {
-                mldsaPubkeyHex: mldsaPubkeyHex,
-                message: text.trim(),
-            });
+            // 不再在此处调用 invoke("send")，由父组件的 send() 统一处理
+            // 父组件会调用 invoke("send") 并管理消息列表
             onsend?.(text.trim());
             text = "";
             ok = true;

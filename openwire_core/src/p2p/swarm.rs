@@ -13,7 +13,6 @@ use std::time::Duration;
 use super::behaviour::MyBehaviour;
 use super::bootstrap;
 use super::dht;
-use super::validator::{RecordValidator, RecordValidatorConfig};
 use crate::error::{P2pError, P2pResult};
 use crate::{ChatMessage, ChatResponse};
 
@@ -79,25 +78,8 @@ const KAD_PROVIDER_TTL_SECS: u64 = 24 * 60 * 60;
 /// Kademlia 发布间隔（秒）- 1小时
 const KAD_PUBLICATION_INTERVAL_SECS: u64 = 60 * 60;
 
-// ============================================================================
-// DHT 存储限制
-// ============================================================================
-
-/// 每个节点最大记录数
-///
-/// 防止单个 peer 通过发布大量 DHT 记录耗尽存储资源。
-const MAX_RECORDS_PER_PEER: usize = 500;
-/// 签名最大允许年龄（毫秒）
-const MAX_SIGNATURE_AGE_MS: u64 = 60000;
-
 /// 路由表缓存文件名
 const ROUTING_TABLE_CACHE_FILE: &str = "routing_table.cache";
-
-/// Swarm 初始化结果，包含 swarm 和 validator
-pub struct SwarmWithValidator {
-    pub swarm: Swarm<MyBehaviour>,
-    pub validator: Arc<std::sync::RwLock<RecordValidator>>,
-}
 
 /// 初始化 libp2p Swarm
 ///
@@ -112,17 +94,7 @@ pub fn swarm_init(
     data_dir: &Path,
     keypair: libp2p::identity::Keypair,
     dht_db: Arc<Database>,
-) -> P2pResult<SwarmWithValidator> {
-    // 创建记录验证器（基于签名验证）
-    let validator_config = RecordValidatorConfig {
-        max_records_per_peer: MAX_RECORDS_PER_PEER,
-        strict_validation: true,
-        max_signature_age_ms: MAX_SIGNATURE_AGE_MS,
-    };
-    let validator = Arc::new(std::sync::RwLock::new(RecordValidator::new(
-        validator_config,
-    )));
-
+) -> P2pResult<Swarm<MyBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         // QUIC 传输层：内置 TLS 1.3，0-RTT，更好 NAT 穿透
@@ -153,13 +125,8 @@ pub fn swarm_init(
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
                     .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
-            // 创建 Kademlia 行为实例（传入共享的 DHT 数据库连接和 validator）
-            let kademlia = create_kademlia_with_validator(
-                peer_id,
-                dht_db.clone(),
-                validator.clone(),
-                data_dir,
-            )?;
+            // 创建 Kademlia 行为实例（传入共享的 DHT 数据库连接）
+            let kademlia = create_kademlia(peer_id, dht_db.clone(), data_dir)?;
             let identify_config =
                 identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
                     .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
@@ -202,28 +169,18 @@ pub fn swarm_init(
         })?)
         .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
 
-    Ok(SwarmWithValidator { swarm, validator })
+    Ok(swarm)
 }
 
-/// 创建 Kademlia 行为（带签名验证器）
+/// 创建 Kademlia 行为
 ///
 /// 使用调用方传入的共享 `Arc<Database>`，避免重复打开导致文件锁冲突。
-fn create_kademlia_with_validator(
+fn create_kademlia(
     peer_id: PeerId,
     db: Arc<Database>,
-    validator: Arc<std::sync::RwLock<RecordValidator>>,
     data_dir: &Path,
-) -> P2pResult<kad::Behaviour<dht::ResourceLimitedRecordStore>> {
-    // 配置资源限制
-    let limits = dht::ResourceLimits {
-        max_records_per_peer: MAX_RECORDS_PER_PEER,
-        max_total_size: dht::DEFAULT_MAX_TOTAL_SIZE,
-        enabled: true,
-    };
-
-    let mut store = dht::ResourceLimitedRecordStore::new(db, limits);
-    // 将验证器注入存储，使 put() 能验证签名
-    store.set_validator(validator);
+) -> P2pResult<kad::Behaviour<dht::RedbRecordStore>> {
+    let store = dht::RedbRecordStore::new(db);
 
     // 配置Kademlia网络参数
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
@@ -343,7 +300,7 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
 /// 返回成功加载的 peer 数量。
 /// 如果缓存文件不存在或格式错误，返回 0。
 fn load_routing_table(
-    kademlia: &mut kad::Behaviour<dht::ResourceLimitedRecordStore>,
+    kademlia: &mut kad::Behaviour<dht::RedbRecordStore>,
     cache_path: &Path,
 ) -> usize {
     if !cache_path.exists() {
