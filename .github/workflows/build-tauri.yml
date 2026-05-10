@@ -42,7 +42,7 @@ jobs:
       - name: setup node
         uses: actions/setup-node@v6
         with:
-          cache-dependency-path: "./chat_tauri/package-lock.json"
+          cache-dependency-path: "./openwire/package-lock.json"
           node-version: lts/*
           cache: "npm"
 
