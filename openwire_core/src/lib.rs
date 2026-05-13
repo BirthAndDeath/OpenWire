@@ -14,6 +14,7 @@ pub mod p2p;
 pub mod signature;
 pub mod storage;
 pub mod transfer;
+pub use actor::{Actor, ActorHandle, RUNTIME};
 pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
