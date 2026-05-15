@@ -1,14 +1,19 @@
+use libp2p::gossipsub;
 use libp2p::kad::{self, GetRecordOk, QueryResult};
 use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identify, mdns};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::behaviour::MyBehaviourEvent;
 use super::dht::RedbRecordStore;
 use crate::error::{P2pError, P2pResult};
-use crate::{ChatCommand, ChatCore, ChatMessage, ChatMessageType, ChatResponse, crypto, storage};
+use crate::{
+    ChatCommand, ChatCore, ChatMessage, ChatMessageType, ChatResponse, MessageEvent, crypto,
+    message::OnlineStatusPayload, storage,
+};
 
 const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -79,6 +84,15 @@ pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCor
             ..
         })) => {
             tracing::debug!("响应已发送");
+        }
+
+        // --- Gossipsub 事件：收到在线状态通知 ---
+        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source: _,
+            message_id: _,
+            message,
+        })) => {
+            handle_gossipsub_message(core, message).await;
         }
 
         // --- mDNS 发现 ---
@@ -710,6 +724,10 @@ async fn handle_decrypted_message(
         ChatMessageType::DeliveryReceipt => {
             handle_delivery_receipt(core, pool, decrypted_data).await;
         }
+        ChatMessageType::OnlineStatus => {
+            // OnlineStatus 消息通过 gossipsub 协议传输，不会通过 request-response 到达这里
+            tracing::debug!("OnlineStatus 消息通过 request-response 到达，忽略");
+        }
     }
 }
 
@@ -1144,6 +1162,124 @@ async fn handle_delivery_receipt(
         }
         Err(e) => {
             tracing::warn!("送达回执数据不是合法 UTF-8: {}", e);
+        }
+    }
+}
+
+/// 处理 gossipsub 在线状态消息
+///
+/// 验证流程：
+/// 1. 反序列化 ChatMessage（包含 ML-DSA 签名）
+/// 2. 验证 ChatMessage 的签名和完整性
+/// 3. 反序列化 OnlineStatusPayload
+/// 4. 检查发送者是否在联系人列表中（白名单验证）
+/// 5. 更新在线状态
+async fn handle_gossipsub_message(core: &mut ChatCore, message: gossipsub::Message) {
+    // 1. 反序列化 ChatMessage
+    let chat_msg: ChatMessage = match postcard::from_bytes(&message.data) {
+        Ok(msg) => msg,
+        Err(e) => {
+            tracing::warn!("Gossipsub 消息反序列化失败: {}", e);
+            return;
+        }
+    };
+
+    // 2. 验证消息类型必须为 OnlineStatus
+    if chat_msg.msgtype != ChatMessageType::OnlineStatus {
+        tracing::debug!("Gossipsub 消息类型不是 OnlineStatus，忽略");
+        return;
+    }
+
+    // 3. 验证 ChatMessage 的 ML-DSA 签名和完整性
+    match chat_msg.verify() {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!("Gossipsub 在线状态消息签名验证失败，已忽略");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("Gossipsub 在线状态消息验证出错: {}", e);
+            return;
+        }
+    }
+
+    // 4. 反序列化 OnlineStatusPayload
+    let payload: OnlineStatusPayload = match postcard::from_bytes(&chat_msg.data) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("OnlineStatusPayload 反序列化失败: {}", e);
+            return;
+        }
+    };
+
+    // 5. 检查发送者的 ML-DSA 公钥是否在联系人列表中（白名单验证）
+    let is_contact = match storage::pool() {
+        Some(pool) => {
+            if let Some(owner_id) = core.mldsa_identity_id.as_ref() {
+                storage::is_contact_exists(pool, owner_id, &payload.mldsa_pubkey_hex)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
+
+    if !is_contact {
+        tracing::debug!(
+            "收到非联系人的在线状态通知，已忽略: {}",
+            payload.mldsa_pubkey_hex
+        );
+        return;
+    }
+
+    // 6. 更新在线状态
+    tracing::info!(
+        "在线状态更新: pubkey={}, online={}, peer_id={}",
+        payload.mldsa_pubkey_hex,
+        payload.online,
+        payload.peer_id
+    );
+
+    // 通过 command channel 发送在线状态事件到 UI
+    let event = MessageEvent::ContactOnlineStatus {
+        mldsa_pubkey_hex: payload.mldsa_pubkey_hex.clone(),
+        online: payload.online,
+    };
+    if let Err(e) = core.tx_message.send(event).await {
+        tracing::error!("发送在线状态事件失败: {}", e);
+    }
+
+    // 如果对方上线，尝试建立双向连接
+    if payload.online {
+        if let Ok(peer_id) = libp2p::PeerId::from_str(&payload.peer_id) {
+            // 缓存 peer_id -> pubkey 映射
+            if let Ok(store) = core.get_dht_store() {
+                let _ = store.set_pubkey_peerid(&payload.mldsa_pubkey_hex, &peer_id);
+            }
+            core.peerid_to_pubkey
+                .insert(peer_id, payload.mldsa_pubkey_hex.clone());
+
+            // 尝试 dial 对方提供的监听地址
+            for addr_str in &payload.listen_addrs {
+                if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                    let dial_addr = addr.clone().with_p2p(peer_id).unwrap_or_else(|_| addr);
+                    match core.swarm.dial(dial_addr) {
+                        Ok(()) => {
+                            tracing::info!("通过在线状态通知拨号: {}", peer_id);
+                            break; // 成功拨号一个地址即可
+                        }
+                        Err(e) => {
+                            tracing::debug!("拨号失败 {}: {}", peer_id, e);
+                        }
+                    }
+                }
+            }
+
+            // 自己也发布一次在线状态，让对方知道我也在线，从而建立双向连接
+            // 这样双方都能在 connected_peers 中看到对方
+            core.publish_online_status(true).await;
         }
     }
 }

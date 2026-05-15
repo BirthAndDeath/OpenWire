@@ -520,7 +520,20 @@ impl ChatCore {
     ///
     /// 此函数不会 await 网络查询结果，确保不阻塞事件循环。
     fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
-        // === 步骤 1：检查已建立的连接 ===
+        // === 步骤 1：检查内存缓存 peerid_to_pubkey ===
+        // gossipsub 在线状态通知和 identify 协议会更新此缓存，比 DHT 数据库更快
+        for (peer_id, pubkey_hex) in &self.peerid_to_pubkey {
+            if pubkey_hex == mldsa_pubkey_hex {
+                tracing::info!(
+                    "dht_lookup_peerid: 通过内存缓存找到 {}.. -> PeerID={}",
+                    &mldsa_pubkey_hex[..16],
+                    peer_id
+                );
+                return Some(*peer_id);
+            }
+        }
+
+        // === 步骤 2：检查已建立的连接 ===
         // 遍历 connected_peers，通过 DHT 本地数据库反向查找每个已连接 PeerID
         // 对应的 ML-DSA 公钥，看是否匹配目标公钥
         if let Ok(store) = self.get_dht_store() {
@@ -540,7 +553,7 @@ impl ChatCore {
                 }
             }
 
-            // === 步骤 2：查询本地 DHT 数据库 ===
+            // === 步骤 3：查询本地 DHT 数据库 ===
             match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
                 Ok(Some(peer_id)) => {
                     tracing::info!(
@@ -554,7 +567,7 @@ impl ChatCore {
             }
         }
 
-        // === 步骤 3：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
+        // === 步骤 4：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
         // 查询结果会通过 events.rs 中的 GetProvidersOk::FoundProviders 事件处理
         // 自动缓存到本地数据库，并触发 retry_pending_messages 重试待发送消息
         let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex.to_string());

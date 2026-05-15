@@ -359,6 +359,18 @@ impl App {
             MessageEvent::Error(data) => {
                 self.push_message(format!("[错误] {}", data));
             }
+            MessageEvent::ContactOnlineStatus {
+                mldsa_pubkey_hex,
+                online,
+            } => {
+                let short = if mldsa_pubkey_hex.len() > 16 {
+                    format!("{}...", &mldsa_pubkey_hex[..16])
+                } else {
+                    mldsa_pubkey_hex.clone()
+                };
+                let status = if online { "在线" } else { "离线" };
+                self.push_message(format!("[在线状态] {} {}", short, status));
+            }
         }
     }
 }

@@ -10,6 +10,7 @@
     "core:window:allow-set-content-protected",
     "opener:default",
     "store:default",
+    "core:path:default",
     {
       "identifier": "store:allow-load",
       "allow": [

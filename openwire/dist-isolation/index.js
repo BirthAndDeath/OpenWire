@@ -17,7 +17,7 @@ const ALLOWED_COMMANDS = new Set([
     'plugin:window|set_content_protected'
 ]);
 
-const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|'];
+const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|', 'plugin:path|'];
 
 const SENSITIVE_COMMANDS = new Set([
     'send', 'send_file', 'delete_identity', 'select_identity',

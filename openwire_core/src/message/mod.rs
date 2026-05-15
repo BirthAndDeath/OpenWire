@@ -25,6 +25,8 @@ pub enum ChatMessageType {
     FileDownloadRequest = 3,
     /// 消息送达回执
     DeliveryReceipt = 4,
+    /// 在线状态通知（通过 gossipsub 发布/订阅）
+    OnlineStatus = 5,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -202,4 +204,24 @@ impl ChatMessage {
             Err(_) => false,
         }
     }
+}
+
+// ========== OnlineStatusPayload ==========
+
+/// 在线状态通知负载
+///
+/// 通过 gossipsub 协议发布/订阅，用于实时通知好友自己的在线状态变化。
+/// 该结构体被序列化后放入 ChatMessage.data 字段，利用 ChatMessage 的 ML-DSA 签名机制保证安全性。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OnlineStatusPayload {
+    /// 发送者的 ML-DSA 公钥（hex 编码）
+    pub mldsa_pubkey_hex: String,
+    /// 是否在线
+    pub online: bool,
+    /// 状态变化时间戳（ms since UNIX_EPOCH）
+    pub timestamp: u64,
+    /// 当前 PeerID（Base58 编码）
+    pub peer_id: String,
+    /// 当前监听地址列表
+    pub listen_addrs: Vec<String>,
 }

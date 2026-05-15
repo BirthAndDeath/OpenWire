@@ -169,6 +169,13 @@ pub enum MessageEvent {
         /// 当前在线联系人的 ML-DSA 公钥 hex 列表
         online_contacts: Vec<String>,
     },
+    /// 单个联系人的在线状态变更通知（来自 gossipsub）
+    ContactOnlineStatus {
+        /// 联系人 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 是否在线
+        online: bool,
+    },
     /// 发生错误
     Error(String),
     /// 日志信息（连接状态等）

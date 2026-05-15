@@ -1,10 +1,11 @@
+use libp2p::gossipsub;
 use libp2p::kad::{self};
 use libp2p::request_response::cbor;
 use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour};
 
 use crate::{ChatMessage, ChatResponse};
 
-/// libp2p 网络行为组合：rr+ mDNS（局域网发现）
+/// libp2p 网络行为组合：rr+ mDNS（局域网发现）+ gossipsub（在线状态广播）
 
 #[derive(NetworkBehaviour)]
 pub struct MyBehaviour {
@@ -22,4 +23,6 @@ pub struct MyBehaviour {
     pub relay: relay::Behaviour,
     // DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,
+    /// Gossipsub 协议：发布/订阅，用于在线状态广播通知
+    pub gossipsub: gossipsub::Behaviour,
 }

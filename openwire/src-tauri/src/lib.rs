@@ -660,18 +660,31 @@ async fn set_download_dir(state: tauri::State<'_, AppData>, path: &str) -> Resul
 }
 
 /// 获取当前下载目录
+///
+/// 优先返回用户设置的下载目录，否则 fallback 到系统下载文件夹。
 #[tauri::command]
-async fn get_download_dir(state: tauri::State<'_, AppData>) -> Result<String, String> {
+async fn get_download_dir(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppData>,
+) -> Result<String, String> {
     let inner = state.inner.read().await;
-    // 优先返回用户设置的下载目录，否则使用默认值
+    // 优先返回用户设置的下载目录
     if let Some(ref download_dir) = inner.download_dir {
-        Ok(download_dir.to_string_lossy().to_string())
-    } else {
-        let data_dir = inner.data_dir.clone();
-        drop(inner);
-        // 默认下载目录为 data_dir/downloads
-        let default_download_dir = data_dir.join("downloads");
-        Ok(default_download_dir.to_string_lossy().to_string())
+        return Ok(download_dir.to_string_lossy().to_string());
+    }
+    drop(inner);
+
+    // Fallback: 使用系统下载文件夹
+    match app_handle.path().download_dir() {
+        Ok(dir) => Ok(dir.to_string_lossy().to_string()),
+        Err(e) => {
+            tracing::warn!("获取系统下载文件夹失败: {}, 回退到 data_dir/downloads", e);
+            let inner = state.inner.read().await;
+            let data_dir = inner.data_dir.clone();
+            drop(inner);
+            let default_download_dir = data_dir.join("downloads");
+            Ok(default_download_dir.to_string_lossy().to_string())
+        }
     }
 }
 
@@ -805,6 +818,18 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
                         MessageEvent::FileTransferProgress(progress) => {
                             app_handle_for_events
                                 .emit("file-transfer-progress", progress)
+                                .ok();
+                        }
+                        MessageEvent::ContactOnlineStatus {
+                            mldsa_pubkey_hex,
+                            online,
+                        } => {
+                            let payload = serde_json::json!({
+                                "mldsa_pubkey_hex": mldsa_pubkey_hex,
+                                "online": online,
+                            });
+                            app_handle_for_events
+                                .emit("contact-online-status", payload.to_string())
                                 .ok();
                         }
                     }
@@ -943,6 +968,18 @@ async fn setup_core_and_event_loop(
             MessageEvent::FileTransferProgress(progress) => {
                 app_handle_for_events
                     .emit("file-transfer-progress", progress)
+                    .ok();
+            }
+            MessageEvent::ContactOnlineStatus {
+                mldsa_pubkey_hex,
+                online,
+            } => {
+                let payload = serde_json::json!({
+                    "mldsa_pubkey_hex": mldsa_pubkey_hex,
+                    "online": online,
+                });
+                app_handle_for_events
+                    .emit("contact-online-status", payload.to_string())
                     .ok();
             }
         }

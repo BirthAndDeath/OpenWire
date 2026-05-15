@@ -90,6 +90,18 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                         progress.status,
                     );
                 }
+                MessageEvent::ContactOnlineStatus {
+                    mldsa_pubkey_hex,
+                    online,
+                } => {
+                    let short = if mldsa_pubkey_hex.len() > 16 {
+                        format!("{}...", &mldsa_pubkey_hex[..16])
+                    } else {
+                        mldsa_pubkey_hex.clone()
+                    };
+                    let status = if online { "在线" } else { "离线" };
+                    println!("[在线状态] {} {}", short, status);
+                }
             }
         }
     });

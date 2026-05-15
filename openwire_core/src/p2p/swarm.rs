@@ -1,6 +1,8 @@
+use libp2p::gossipsub;
 use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, ping, relay};
+use sha2::Digest;
 
 use redb::Database;
 use std::num::NonZero;
@@ -136,6 +138,31 @@ pub fn swarm_init(
             let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
 
+            // --- Gossipsub 配置 ---
+            // 消息 ID 函数：使用 SHA256 哈希作为消息 ID，避免重复消息
+            let message_id_fn = |message: &gossipsub::Message| {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&message.data);
+                hasher.update(&message.topic.to_string().into_bytes());
+                gossipsub::MessageId::from(hasher.finalize().to_vec())
+            };
+
+            // 使用默认配置，但自定义消息 ID 函数
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .message_id_fn(message_id_fn)
+                // 心跳间隔：1 秒，快速传播
+                .heartbeat_interval(Duration::from_secs(1))
+                // 支持的消息长度上限：256KB
+                .max_transmit_size(256 * 1024)
+                .build()
+                .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
+
             Ok(MyBehaviour {
                 rr_msg,
                 mdns,
@@ -144,6 +171,7 @@ pub fn swarm_init(
                 identify,
                 relay,
                 dcutr,
+                gossipsub,
             })
         })
         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?

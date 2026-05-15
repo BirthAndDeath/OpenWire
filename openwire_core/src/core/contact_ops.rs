@@ -23,6 +23,8 @@ impl ChatCore {
                     tracing::info!("Successfully added contact: {}", &mldsa_pubkey_hex[..16]);
                     let msg = format!("好友 {} 添加成功", &mldsa_pubkey_hex[..16]);
                     self.send_log_mpsc(msg).await;
+                    // 订阅该联系人的在线状态 topic
+                    self.subscribe_to_contact_topic(&mldsa_pubkey_hex);
                     true
                 }
                 Err(e) => {
@@ -110,6 +112,8 @@ impl ChatCore {
                 let mlkem_key = self.get_cached_mlkem_bytes(mldsa_pubkey_hex);
                 self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
                     .await;
+                // 订阅该联系人的在线状态 topic
+                self.subscribe_to_contact_topic(mldsa_pubkey_hex);
                 let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
                 self.send_log_mpsc(msg).await;
             }
@@ -153,6 +157,8 @@ impl ChatCore {
                 };
                 self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
                     .await;
+                // 订阅该联系人的在线状态 topic
+                self.subscribe_to_contact_topic(mldsa_pubkey_hex);
                 let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
                 self.send_log_mpsc(msg).await;
             }

@@ -129,6 +129,19 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     })
                 }
+                MessageEvent::ContactOnlineStatus {
+                    mldsa_pubkey_hex,
+                    online,
+                } => {
+                    json!({
+                        "type": "contact_online_status",
+                        "data": {
+                            "mldsa_pubkey_hex": mldsa_pubkey_hex,
+                            "online": online,
+                        },
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    })
+                }
             };
             let json_str = serde_json::to_string(&json_output)
                 .unwrap_or_else(|_| r#"{"type":"error","data":"序列化失败"}"#.to_string());

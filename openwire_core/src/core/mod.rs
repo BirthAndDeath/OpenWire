@@ -1,8 +1,10 @@
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
 
 use aws_lc_rs::kem::DecapsulationKey;
+use libp2p::gossipsub;
 use libp2p::{PeerId, Swarm};
 use lru::LruCache;
+use sha2::Digest;
 use tokio::sync::mpsc;
 use tokio::try_join;
 use tokio_util::sync::CancellationToken;
@@ -15,6 +17,9 @@ const MDNS_CACHE_SIZE: usize = 2000;
 /// DHT 定期注册间隔（秒）- 5分钟
 pub(crate) const DHT_REGISTRATION_INTERVAL_SECS: u64 = 300;
 
+/// Gossipsub 在线状态 topic 前缀
+const GOSSIPSUB_TOPIC_PREFIX: &str = "online-status";
+
 use crate::{
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
     coreconfig::CoreConfig,
@@ -22,7 +27,7 @@ use crate::{
     error::{CoreError, CoreResult},
     identity,
     log::init_logger,
-    message::{ChatMessage, ChatMessageType},
+    message::{ChatMessage, ChatMessageType, OnlineStatusPayload},
     p2p, storage,
     transfer::FileTransferState,
 };
@@ -364,6 +369,178 @@ impl ChatCore {
         // 如果这是新映射且该 PeerID 当前已连接，刷新在线状态
         if is_new && self.connected_peers.contains(&peer_id) {
             self.send_online_status().await;
+        }
+    }
+
+    // ========== Gossipsub 在线状态发布/订阅 ==========
+
+    /// 构建联系人对应的 gossipsub topic
+    ///
+    /// topic 格式: `online-status/{sha256(mldsa_pubkey_hex)}`
+    /// 使用 SHA256 哈希避免 topic 名称泄露公钥信息。
+    fn contact_topic(mldsa_pubkey_hex: &str) -> gossipsub::IdentTopic {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(mldsa_pubkey_hex.as_bytes());
+        let topic_hash = hex::encode(hasher.finalize());
+        gossipsub::IdentTopic::new(format!("{}/{}", GOSSIPSUB_TOPIC_PREFIX, topic_hash))
+    }
+
+    /// 订阅某个联系人的在线状态 topic
+    pub(crate) fn subscribe_to_contact_topic(&mut self, mldsa_pubkey_hex: &str) {
+        let topic = Self::contact_topic(mldsa_pubkey_hex);
+        match self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+            Ok(true) => {
+                tracing::info!("已订阅联系人在线状态 topic: {}", topic);
+            }
+            Ok(false) => {
+                tracing::debug!("已订阅过 topic: {}", topic);
+            }
+            Err(e) => {
+                tracing::warn!("订阅 topic {} 失败: {}", topic, e);
+            }
+        }
+    }
+
+    /// 取消订阅某个联系人的在线状态 topic
+    #[allow(dead_code)]
+    pub(crate) fn unsubscribe_from_contact_topic(&mut self, mldsa_pubkey_hex: &str) {
+        let topic = Self::contact_topic(mldsa_pubkey_hex);
+        if self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
+            tracing::info!("已取消订阅联系人在线状态 topic: {}", topic);
+        } else {
+            tracing::debug!("未订阅 topic: {}", topic);
+        }
+    }
+
+    /// 发布在线状态到自己的 topic
+    ///
+    /// 创建一个 ChatMessage::OnlineStatus 消息，包含 OnlineStatusPayload，
+    /// 使用 ML-DSA 签名后通过 gossipsub 发布。
+    pub(crate) async fn publish_online_status(&mut self, online: bool) {
+        let mldsa_pubkey_hex = match &self.mldsa_pubkey_hex {
+            Some(pk) => pk.clone(),
+            None => {
+                tracing::warn!("ML-DSA 公钥未初始化，无法发布在线状态");
+                return;
+            }
+        };
+
+        let peer_id = match &self.current_peer_id {
+            Some(pid) => pid.to_string(),
+            None => {
+                tracing::warn!("PeerID 未初始化，无法发布在线状态");
+                return;
+            }
+        };
+
+        // 收集当前监听地址
+        let listen_addrs: Vec<String> = self
+            .swarm
+            .listeners()
+            .map(|addr| addr.to_string())
+            .collect();
+
+        let payload = OnlineStatusPayload {
+            mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
+            online,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            peer_id,
+            listen_addrs,
+        };
+
+        let payload_data = match postcard::to_allocvec(&payload) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("序列化 OnlineStatusPayload 失败: {}", e);
+                return;
+            }
+        };
+
+        // 使用 ML-DSA 签名创建 ChatMessage
+        let private_key = match &self.mldsa_private_key {
+            Some(k) => k,
+            None => {
+                tracing::warn!("ML-DSA 私钥未初始化，无法签名在线状态消息");
+                return;
+            }
+        };
+        let public_key = match crate::identity::extract_public_key_from_private(private_key, true) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!("从私钥提取 ML-DSA 公钥失败: {}", e);
+                return;
+            }
+        };
+
+        let chat_msg = match ChatMessage::new_signed(
+            ChatMessageType::OnlineStatus,
+            payload_data,
+            private_key,
+            &public_key,
+        ) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!("创建在线状态 ChatMessage 失败: {}", e);
+                return;
+            }
+        };
+
+        let msg_data = match postcard::to_allocvec(&chat_msg) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("序列化 ChatMessage 失败: {}", e);
+                return;
+            }
+        };
+
+        // 发布到自己的 topic
+        let topic = Self::contact_topic(&mldsa_pubkey_hex);
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, msg_data)
+        {
+            Ok(msg_id) => {
+                tracing::info!("已发布在线状态: online={}, msg_id={:?}", online, msg_id);
+            }
+            Err(e) => {
+                tracing::warn!("发布在线状态失败: {}", e);
+            }
+        }
+    }
+
+    /// 启动时订阅所有已知联系人的 topic
+    pub(crate) async fn subscribe_to_all_contacts(&mut self) {
+        let pool = match storage::pool() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("数据库连接池未初始化，无法订阅联系人 topic");
+                return;
+            }
+        };
+
+        let owner_id = match &self.mldsa_identity_id {
+            Some(id) => id.clone(),
+            None => {
+                tracing::warn!("身份 ID 未初始化，无法订阅联系人 topic");
+                return;
+            }
+        };
+
+        match storage::list_contacts(pool, &owner_id).await {
+            Ok(contacts) => {
+                for contact in &contacts {
+                    self.subscribe_to_contact_topic(&contact.mldsa_pubkey_hex);
+                }
+                tracing::info!("已订阅 {} 个联系人的在线状态 topic", contacts.len());
+            }
+            Err(e) => {
+                tracing::warn!("查询联系人列表失败: {}", e);
+            }
         }
     }
 }

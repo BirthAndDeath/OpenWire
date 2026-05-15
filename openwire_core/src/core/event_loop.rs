@@ -46,6 +46,12 @@ impl ChatCore {
         // 启动后对所有已添加的联系人发起 DHT 发现（非阻塞）
         self.discover_all_contacts(&dht_reg_cmd_tx).await;
 
+        // === Gossipsub 在线状态初始化 ===
+        // 订阅所有已知联系人的在线状态 topic
+        self.subscribe_to_all_contacts().await;
+        // 发布上线通知到自己的 topic
+        self.publish_online_status(true).await;
+
         // 主事件循环：处理网络事件和控制命令
         // 注意：消息重试仅在 ConnectionEstablished 事件中触发（events.rs），
         // 不在定时器中重试，避免对方离线时频繁无效查询。
@@ -60,12 +66,11 @@ impl ChatCore {
         routing_table_save_interval.tick().await; // 跳过首次立即触发
         let cache_path = self.data_dir.join("routing_table.cache");
 
-        // === 主动连接维护间隔：每 30 秒对所有联系人发起 DHT GetProviders 查询 ===
-        // 这是关键设计：系统主动维护连接状态，而不是等到用户发消息时才查询。
-        // 当 GetProviders 找到 provider 时，events.rs 会自动缓存 PeerID 并 dial 建立连接。
-        // 这样用户发消息时，连接已经建立，消息可以立即发送。
+        // === 主动连接维护间隔：每 5 分钟对所有联系人发起 DHT GetProviders 查询 ===
+        // 引入 gossipsub 后，在线状态主要通过 Pub/Sub 实时通知，
+        // DHT 查询降级为备份发现机制，频率从 30 秒降低到 300 秒。
         let mut connection_maintenance_interval =
-            tokio::time::interval(std::time::Duration::from_secs(30));
+            tokio::time::interval(std::time::Duration::from_secs(300));
         connection_maintenance_interval.tick().await; // 跳过首次立即触发（启动时已调用 discover_all_contacts）
 
         loop {
@@ -76,6 +81,8 @@ impl ChatCore {
                 Some(cmd) = self.rx_cmd.recv() => {
                     if matches!(cmd, ChatCommand::Shutdown) {
                         tracing::info!("P2P core shutting down...");
+                        // 发布离线通知到自己的 gossipsub topic
+                        self.publish_online_status(false).await;
                         // 退出前保存路由表
                         p2p::save_routing_table(&mut self.swarm, &cache_path);
                         break;

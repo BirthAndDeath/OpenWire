@@ -1,4 +1,4 @@
-use crate::{command::ChatCommand, core::ChatCore};
+use crate::{command::ChatCommand, core::ChatCore, error::CoreError};
 
 impl ChatCore {
     /// 处理单个控制命令
@@ -24,9 +24,24 @@ impl ChatCore {
                     .await;
                 }
                 Err(e) => {
-                    tracing::error!("Failed to send {:?} message: {e}", msgtype);
-                    let err_msg = format!("发送消息失败: {}", e);
-                    self.send_warning_mpsc(err_msg).await;
+                    // 如果错误是"联系人离线"或"ML-KEM 未缓存"，消息已由 send_text_impl
+                    // 自动保存到离线队列并发送了 Log 事件，这里不再重复发送 Warning。
+                    // 只对真正的错误（如数据库不可用、加密失败）发送 Warning。
+                    match &e {
+                        CoreError::ContactOffline(_) | CoreError::MlKemKeyNotCached(_) => {
+                            tracing::info!(
+                                "{:?} message queued for {}: {}",
+                                msgtype,
+                                &mldsa_pubkey_hex[..16],
+                                e
+                            );
+                        }
+                        _ => {
+                            tracing::error!("Failed to send {:?} message: {e}", msgtype);
+                            let err_msg = format!("发送消息失败: {}", e);
+                            self.send_warning_mpsc(err_msg).await;
+                        }
+                    }
                 }
             },
             ChatCommand::RetryPendingMessages => {

@@ -13,6 +13,10 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { invoke } from "@tauri-apps/api/core";
+  import {
+    downloadDir as getSystemDownloadDir,
+    documentDir as getSystemDocumentDir,
+  } from "@tauri-apps/api/path";
   import PasswordInput from "../../lib/PasswordInput.svelte";
 
   // 语言选项
@@ -77,24 +81,44 @@
         keyringCheckDone = true;
       }
 
-      // 获取下载目录（前端持久化存储）
+      // 获取下载目录（前端持久化存储，未设置时 fallback 到系统下载文件夹）
       try {
         const saved = await getSetting<string>("download_dir");
         if (saved) {
           downloadDir = saved;
+        } else {
+          // 未设置时 fallback 到系统下载文件夹
+          downloadDir = await getSystemDownloadDir();
+          // 同步到后端核心，确保首次使用时下载目录正确
+          try {
+            await invoke("set_download_dir", { path: downloadDir });
+          } catch (e) {
+            console.error("同步默认下载目录到后端失败:", e);
+          }
         }
       } catch (e) {
         console.error("获取下载目录失败:", e);
+        // 极端 fallback
+        try {
+          downloadDir = await getSystemDownloadDir();
+        } catch {}
       }
 
-      // 获取上传文件搜寻目录（前端持久化存储）
+      // 获取上传文件搜寻目录（前端持久化存储，未设置时 fallback 到系统文档文件夹）
       try {
         const saved = await getSetting<string>("upload_dir");
         if (saved) {
           uploadDir = saved;
+        } else {
+          // 未设置时 fallback 到系统文档文件夹
+          uploadDir = await getSystemDocumentDir();
         }
       } catch (e) {
         console.error("获取上传目录失败:", e);
+        // 极端 fallback
+        try {
+          uploadDir = await getSystemDocumentDir();
+        } catch {}
       }
 
       // 获取截屏保护设置
@@ -135,9 +159,15 @@
         title: "选择下载目录",
       });
       if (selected) {
-        // 持久化到前端设置存储（与 upload_dir 方式一致）
+        // 持久化到前端设置存储
         await setSetting("download_dir", selected);
         downloadDir = selected;
+        // 同步到后端核心，确保文件下载使用正确的目录
+        try {
+          await invoke("set_download_dir", { path: selected });
+        } catch (e) {
+          console.error("同步下载目录到后端失败:", e);
+        }
       }
     } catch (e) {
       console.error("选择下载目录失败:", e);
