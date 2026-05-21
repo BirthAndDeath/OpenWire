@@ -21,7 +21,9 @@ libp2p = { version = "0.56.0", features = [
     "kad",
     "secp256k1",
     "ed25519",
-    "gossipsub",
+    "tcp",
+    "noise",
+    "yamux",
 ] }
 tracing = "0.1.44"
 [profile.dev]
