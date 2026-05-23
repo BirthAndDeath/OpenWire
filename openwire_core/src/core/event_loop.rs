@@ -1,11 +1,15 @@
 use crate::actor::RUNTIME as rt;
-use futures::StreamExt;
 use redb::Database;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{command::ChatCommand, core::ChatCore, p2p, storage};
+use crate::{
+    actor::p2p::{P2pCommand, P2pEvent},
+    command::ChatCommand,
+    core::ChatCore,
+    p2p, storage,
+};
 
 impl ChatCore {
     /// 启动核心事件循环（使用独立的 Tokio 运行时）
@@ -46,14 +50,8 @@ impl ChatCore {
         // 启动后对所有已添加的联系人发起 DHT 发现（非阻塞）
         self.discover_all_contacts(&dht_reg_cmd_tx).await;
 
-        // === Gossipsub 在线状态初始化 ===
-        // 订阅所有已知联系人的在线状态 topic
-        self.subscribe_to_all_contacts().await;
-        // 发布上线通知到自己的 topic
-        self.publish_online_status(true).await;
-
-        // 主事件循环：处理网络事件和控制命令
-        // 注意：消息重试仅在 ConnectionEstablished 事件中触发（events.rs），
+        // 主事件循环：处理 P2pActor 事件和控制命令
+        // 注意：消息重试仅在 ConnectionEstablished 事件中触发，
         // 不在定时器中重试，避免对方离线时频繁无效查询。
 
         // DHT 清理间隔：每小时清理一次过期记录
@@ -64,27 +62,28 @@ impl ChatCore {
         let mut routing_table_save_interval =
             tokio::time::interval(std::time::Duration::from_secs(300));
         routing_table_save_interval.tick().await; // 跳过首次立即触发
-        let cache_path = self.data_dir.join("routing_table.cache");
 
         // === 主动连接维护间隔：每 5 分钟对所有联系人发起 DHT GetProviders 查询 ===
-        // 引入 gossipsub 后，在线状态主要通过 Pub/Sub 实时通知，
-        // DHT 查询降级为备份发现机制，频率从 30 秒降低到 300 秒。
         let mut connection_maintenance_interval =
             tokio::time::interval(std::time::Duration::from_secs(300));
         connection_maintenance_interval.tick().await; // 跳过首次立即触发（启动时已调用 discover_all_contacts）
 
         loop {
             tokio::select! {
-                event = self.swarm.select_next_some() => {
-                    p2p::swarm_event(event, self).await;
+                // 从 P2pActor 接收网络事件
+                Some(event) = self.rx_p2p_event.recv() => {
+                    self.handle_p2p_event(event).await;
                 }
                 Some(cmd) = self.rx_cmd.recv() => {
                     if matches!(cmd, ChatCommand::Shutdown) {
                         tracing::info!("P2P core shutting down...");
-                        // 发布离线通知到自己的 gossipsub topic
-                        self.publish_online_status(false).await;
-                        // 退出前保存路由表
-                        p2p::save_routing_table(&mut self.swarm, &cache_path);
+                        // 通知 P2pActor 保存路由表并关闭
+                        let _ = self.p2p_handle.send(
+                            crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
+                        ).await;
+                        let _ = self.p2p_handle.send(
+                            crate::actor::ActorCommand::Custom(P2pCommand::Shutdown),
+                        ).await;
                         break;
                     }
                     // 处理身份切换：更新 DHT 注册循环的身份信息
@@ -99,20 +98,159 @@ impl ChatCore {
                     self.cleanup_expired_dht_records();
                 }
                 _ = routing_table_save_interval.tick() => {
-                    p2p::save_routing_table(&mut self.swarm, &cache_path);
+                    // 通知 P2pActor 保存路由表（使用 try_send 避免阻塞）
+                    let _ = self.p2p_handle.tx.try_send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
+                    );
                 }
                 _ = connection_maintenance_interval.tick() => {
                     // 定期对所有联系人发起 DHT GetProviders 查询
                     // 这是非阻塞的：get_providers 只是发起网络查询，不等待结果
-                    // 结果通过 events.rs 中的 GetProvidersOk::FoundProviders 事件处理
+                    // 结果通过 P2pEvent::GetProvidersResult 事件处理
                     self.discover_all_contacts(&dht_reg_cmd_tx).await;
                     // 连接维护后触发离线消息重试
-                    // 如果 GetProviders 成功找到了 provider，events.rs 会自动缓存 PeerID 并 dial，
-                    // 此时重试消息可以成功发送。如果尚未找到，重试会再次触发 DiscoverContact 命令，
-                    // 形成持续的重试循环直到成功。
                     let _ = dht_reg_cmd_tx.try_send(ChatCommand::RetryPendingMessages);
                 }
                 else => break,
+            }
+        }
+    }
+
+    /// 处理来自 P2pActor 的网络事件
+    async fn handle_p2p_event(&mut self, event: P2pEvent) {
+        match event {
+            P2pEvent::MessageReceived {
+                peer,
+                message,
+                channel,
+            } => {
+                // 处理入站消息（原有逻辑在 events.rs 中）
+                crate::p2p::handle_incoming_request(self, peer, channel, message).await;
+            }
+            P2pEvent::NetEventRequestReceived {
+                peer,
+                request,
+                channel,
+            } => {
+                // 处理 NetEvent 请求
+                tracing::info!("收到 NetEvent 请求: peer={}, request={:?}", peer, request);
+                // 简单响应确认（通过 P2pActor 发送 NetEvent 响应）
+                let _ = self.p2p_handle.send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::SendNetEventResponse {
+                        channel,
+                        response: crate::p2p::netevent::NetEventResponse::Ack,
+                    }),
+                ).await;
+            }
+            P2pEvent::ConnectionEstablished { peer_id } => {
+                tracing::info!("Connection established with {}", peer_id);
+                self.connected_peers.insert(peer_id);
+
+                // 从 DHT 反向查找该 PeerID 对应的 ML-DSA 公钥
+                if let Ok(store) = self.get_dht_store() {
+                    match store.get_pubkey_by_peerid(&peer_id) {
+                        Ok(Some(pubkey_hex)) => {
+                            self.peerid_to_pubkey.insert(peer_id, pubkey_hex);
+                        }
+                        _ => {
+                            // 如果本地 DHT 没有缓存，发起 GetProviders 查询
+                            let _ = self.p2p_handle.send(
+                                crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
+                                    key: peer_id.to_string(),
+                                }),
+                            ).await;
+                        }
+                    }
+                }
+
+                // 触发在线状态更新
+                self.send_online_status().await;
+
+                // 连接建立后重试待发送消息
+                self.retry_pending_messages().await;
+            }
+            P2pEvent::ConnectionClosed { peer_id } => {
+                tracing::info!("Connection closed with {}", peer_id);
+                self.connected_peers.remove(&peer_id);
+                self.peerid_to_pubkey.remove(&peer_id);
+                // 触发在线状态更新
+                self.send_online_status().await;
+            }
+            P2pEvent::MdnsDiscovered { peer_id, addr } => {
+                tracing::info!("mDNS discovered: {} at {}", peer_id, addr);
+                let _ = self.p2p_handle.send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress {
+                        peer_id,
+                        addr,
+                    }),
+                ).await;
+            }
+            P2pEvent::MdnsExpired { peer_id } => {
+                tracing::info!("mDNS expired: {}", peer_id);
+            }
+            P2pEvent::IdentifyReceived {
+                peer_id,
+                listen_addrs,
+            } => {
+                for addr in listen_addrs {
+                    let _ = self.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress {
+                            peer_id,
+                            addr,
+                        }),
+                    ).await;
+                }
+            }
+            P2pEvent::GetProvidersResult { key, providers } => {
+                tracing::debug!(
+                    "GetProviders result: key={}.., providers={:?}",
+                    &key[..16.min(key.len())],
+                    providers
+                );
+                // 缓存到本地 DHT 数据库
+                if let Ok(store) = self.get_dht_store() {
+                    for provider in &providers {
+                        let _ = store.set_pubkey_peerid(&key, provider);
+                        self.peerid_to_pubkey.insert(*provider, key.clone());
+                    }
+                }
+                // 如果有 provider，尝试拨号连接
+                if let Some(peer_id) = providers.first() {
+                    let _ = self.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::Dial {
+                            peer_id: *peer_id,
+                        }),
+                    ).await;
+                }
+                // 如果已连接的 PeerID 现在有了公钥映射，刷新在线状态
+                // 这解决了 ConnectionEstablished 触发时 peerid_to_pubkey 尚未建立映射
+                // 导致 send_online_status() 无法正确标记该联系人为在线的问题
+                for provider in &providers {
+                    if self.connected_peers.contains(provider) {
+                        self.send_online_status().await;
+                        break;
+                    }
+                }
+            }
+            P2pEvent::GetRecordResult { key, value } => {
+                tracing::debug!(
+                    "GetRecord result: key={}.., value_len={}",
+                    &key[..16.min(key.len())],
+                    value.len()
+                );
+                // 缓存到本地 DHT 数据库
+                if let Ok(store) = self.get_dht_store() {
+                    if key.starts_with("mlkem:") {
+                        let pubkey_hex = key.strip_prefix("mlkem:").unwrap_or("");
+                        if !pubkey_hex.is_empty() {
+                            let mlkem_hex = String::from_utf8_lossy(&value);
+                            let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
+                        }
+                    }
+                }
+            }
+            P2pEvent::Log(msg) => {
+                tracing::info!("P2pActor: {}", msg);
             }
         }
     }

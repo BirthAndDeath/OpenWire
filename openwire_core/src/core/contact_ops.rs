@@ -1,3 +1,4 @@
+use crate::actor::p2p::P2pCommand;
 use crate::{core::ChatCore, storage};
 
 impl ChatCore {
@@ -23,8 +24,18 @@ impl ChatCore {
                     tracing::info!("Successfully added contact: {}", &mldsa_pubkey_hex[..16]);
                     let msg = format!("好友 {} 添加成功", &mldsa_pubkey_hex[..16]);
                     self.send_log_mpsc(msg).await;
-                    // 订阅该联系人的在线状态 topic
-                    self.subscribe_to_contact_topic(&mldsa_pubkey_hex);
+                    // 添加联系人后，发起 DHT 查询以获取对方的最新信息
+                    let _ = self.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
+                            key: mldsa_pubkey_hex.clone(),
+                        }),
+                    ).await;
+                    let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
+                    let _ = self.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+                            key: mlkem_key,
+                        }),
+                    ).await;
                     true
                 }
                 Err(e) => {
@@ -100,9 +111,12 @@ impl ChatCore {
                     "DHT discovery: contact {} already exists, refreshing DHT query",
                     pubkey_short
                 );
-                // 发起 GetProviders 以刷新在线状态
-                let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex);
-                let _query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
+                // 通过 P2pActor 发起 GetProviders 以刷新在线状态
+                let _ = self.p2p_handle.send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
+                        key: mldsa_pubkey_hex.to_string(),
+                    }),
+                ).await;
             } else {
                 // 新联系人：直接添加
                 tracing::info!(
@@ -112,8 +126,6 @@ impl ChatCore {
                 let mlkem_key = self.get_cached_mlkem_bytes(mldsa_pubkey_hex);
                 self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
                     .await;
-                // 订阅该联系人的在线状态 topic
-                self.subscribe_to_contact_topic(mldsa_pubkey_hex);
                 let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
                 self.send_log_mpsc(msg).await;
             }
@@ -122,8 +134,11 @@ impl ChatCore {
 
         // 本地没有缓存，发起网络 DHT 查询但不阻塞等待
         if !has_local_peerid {
-            let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex);
-            let _query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
+            let _ = self.p2p_handle.send(
+                crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
+                    key: mldsa_pubkey_hex.to_string(),
+                }),
+            ).await;
             tracing::debug!(
                 "DHT discovery: initiated GetProviders for {} (non-blocking)",
                 pubkey_short
@@ -132,8 +147,11 @@ impl ChatCore {
 
         if !has_local_mlkem {
             let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-            let key = libp2p::kad::RecordKey::new(&mlkem_key);
-            let _query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
+            let _ = self.p2p_handle.send(
+                crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+                    key: mlkem_key,
+                }),
+            ).await;
             tracing::debug!(
                 "DHT discovery: initiated ML-KEM query for {} (non-blocking)",
                 pubkey_short
@@ -157,8 +175,6 @@ impl ChatCore {
                 };
                 self.add_contact(mldsa_pubkey_hex.to_string(), mlkem_key, name)
                     .await;
-                // 订阅该联系人的在线状态 topic
-                self.subscribe_to_contact_topic(mldsa_pubkey_hex);
                 let msg = format!("已通过 DHT 发现并添加联系人: {}..", pubkey_short);
                 self.send_log_mpsc(msg).await;
             }

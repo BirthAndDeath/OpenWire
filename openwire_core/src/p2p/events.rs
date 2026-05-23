@@ -1,475 +1,21 @@
-use libp2p::gossipsub;
-use libp2p::kad::{self, GetRecordOk, QueryResult};
-use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
-use libp2p::swarm::SwarmEvent;
-use libp2p::{identify, mdns};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use super::behaviour::MyBehaviourEvent;
-use super::dht::RedbRecordStore;
+use crate::actor::p2p::P2pCommand;
 use crate::error::{P2pError, P2pResult};
 use crate::{
-    ChatCommand, ChatCore, ChatMessage, ChatMessageType, ChatResponse, MessageEvent, crypto,
-    message::OnlineStatusPayload, storage,
+    ChatCore, ChatMessage, ChatMessageType, ChatResponse, crypto, storage,
 };
-
-const MDNS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// 处理 Swarm 网络事件
-///
-/// # 事件分类处理
-/// - mDNS：局域网节点发现/过期
-/// - 连接管理：建立、关闭、错误
-/// - Kademlia：DHT 记录验证和管理
-pub async fn swarm_event(event: SwarmEvent<MyBehaviourEvent>, core: &mut ChatCore) {
-    match event {
-        // Kademlia 事件处理
-        SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(kad_event)) => {
-            handle_kademlia_event(kad_event, core);
-        }
-
-        //request-response
-        // 收到请求
-        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
-            peer,
-            connection_id: _,
-            message:
-                RequestResponseMessage::Request {
-                    channel,
-                    request,
-                    request_id: _,
-                },
-        })) => {
-            handle_incoming_request(core, peer, channel, request).await;
-        }
-
-        // 收到响应（验证签名）
-        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
-            message: RequestResponseMessage::Response { response, .. },
-            ..
-        })) => match response.verify() {
-            Ok(true) => {
-                tracing::debug!("收到签名响应: timestamp={}", response.timestamp);
-            }
-            Ok(false) => {
-                tracing::warn!("收到无效签名的响应，已忽略");
-            }
-            Err(e) => {
-                tracing::warn!("验证响应签名时出错: {}", e);
-            }
-        },
-
-        // 请求发送失败
-        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::OutboundFailure {
-            peer,
-            error,
-            ..
-        })) => {
-            tracing::error!("向 {} 发送消息失败: {:?}", peer, error);
-        }
-
-        // 入站失败
-        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::InboundFailure {
-            peer,
-            error,
-            ..
-        })) => {
-            tracing::error!("来自 {} 的入站请求失败: {:?}", peer, error);
-        }
-
-        // 响应已发送
-        SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::ResponseSent {
-            ..
-        })) => {
-            tracing::debug!("响应已发送");
-        }
-
-        // --- Gossipsub 事件：收到在线状态通知 ---
-        SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-            propagation_source: _,
-            message_id: _,
-            message,
-        })) => {
-            handle_gossipsub_message(core, message).await;
-        }
-
-        // --- mDNS 发现 ---
-        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-            let now = Instant::now();
-            for (peer_id, multiaddr) in list {
-                match core.mdns_cache.get(&peer_id) {
-                    Some(last_seen) => {
-                        if now.duration_since(*last_seen) >= MDNS_REFRESH_INTERVAL {
-                            // 间隔足够，更新并处理
-                            core.mdns_cache.put(peer_id, now);
-                            core.swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .add_address(&peer_id, multiaddr);
-                        } else {
-                            continue;
-                        }
-                    }
-                    None => {
-                        // 首次发现，加入缓存
-                        core.mdns_cache.put(peer_id, now);
-                        core.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .add_address(&peer_id, multiaddr);
-                    }
-                }
-                tracing::info!("mDNS discovered: {peer_id}");
-            }
-        }
-
-        // mDNS 节点过期
-        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-            for (peer_id, _multiaddr) in list {
-                tracing::info!("mDNS expired: {peer_id}");
-                // 从去重缓存中移除，以便下次发现时重新处理
-                core.mdns_cache.pop(&peer_id);
-            }
-        }
-
-        // --- Identify 事件（获取 peer 信息）---
-        SwarmEvent::Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
-            peer_id,
-            info,
-            connection_id: _,
-        })) => {
-            for multiaddr in info.listen_addrs {
-                core.swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .add_address(&peer_id, multiaddr);
-            }
-            tracing::info!(
-                "Identified {} with {} protocols",
-                peer_id,
-                info.protocols.len()
-            );
-        }
-
-        // --- 网络状态 ---
-        SwarmEvent::NewListenAddr { address, .. } => {
-            tracing::info!("Listening on: {address}");
-        }
-
-        // 连接建立 - 触发离线消息重试并更新在线状态
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            tracing::info!("Connection established with {}", peer_id);
-            // 更新在线连接集合
-            core.connected_peers.insert(peer_id);
-            // 尝试从 DHT 反向查找该 PeerID 对应的 ML-DSA 公钥并缓存到内存
-            if !core.peerid_to_pubkey.contains_key(&peer_id) {
-                if let Ok(store) = core.get_dht_store() {
-                    if let Ok(Some(pubkey_hex)) = store.get_pubkey_by_peerid(&peer_id) {
-                        core.peerid_to_pubkey.insert(peer_id, pubkey_hex);
-                    }
-                }
-            }
-            // 发送在线状态更新（包含每个在线联系人的 ML-DSA 公钥 hex）
-            core.send_online_status().await;
-            // 有新连接建立时，尝试重发待发送消息
-            let cmd_tx = core.core_handle.cmd_tx.clone();
-            let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
-
-            // === 连接建立后主动发布身份到 DHT ===
-            // 确保对方能通过 DHT 查询到我们的最新 PeerID，避免因 DHT 注册延迟导致消息进入离线队列
-            if let (Some(pubkey), Some(pid)) = (core.mldsa_pubkey_hex.clone(), core.current_peer_id)
-            {
-                let mlkem = core.mlkem_pubkey_hex.clone().unwrap_or_default();
-                let _ = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
-                    mldsa_pubkey_hex: pubkey,
-                    peer_id: pid.to_string(),
-                    mlkem_pubkey_hex: mlkem,
-                });
-            }
-        }
-
-        // 连接关闭
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-            tracing::info!("Connection closed with {}", peer_id);
-            core.connected_peers.remove(&peer_id);
-            // 清理内存缓存（保留 DHT 持久化映射，下次连接时可重新加载）
-            core.peerid_to_pubkey.remove(&peer_id);
-            // 发送在线状态更新（包含每个在线联系人的 ML-DSA 公钥 hex）
-            core.send_online_status().await;
-
-            // === Re-dial on connection closed ===
-            // Look up known multiaddrs from DHT and attempt to re-establish the connection.
-            // If dial fails, just log and continue without blocking the event loop.
-            if let Ok(store) = core.get_dht_store()
-                && let Ok(addrs) = store.get_multiaddrs(&peer_id)
-                && !addrs.is_empty()
-            {
-                tracing::info!(
-                    "连接关闭：尝试重拨 {}，发现 {} 个已知地址",
-                    peer_id,
-                    addrs.len()
-                );
-                for addr in &addrs {
-                    let dial_addr = addr.clone().with_p2p(peer_id).unwrap_or(addr.clone());
-                    match core.swarm.dial(dial_addr) {
-                        Ok(()) => tracing::info!("重拨 {} 地址: {}", peer_id, addr),
-                        Err(e) => {
-                            tracing::debug!("重拨 {} 地址 {} 失败: {}", peer_id, addr, e)
-                        }
-                    }
-                }
-            }
-            // === 重拨结束 ===
-        }
-
-        // 外拨连接失败
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
-            Some(pid) => {
-                tracing::error!("Connect failed to {pid}: {error:?}");
-            }
-            None => {
-                tracing::debug!("Outgoing connection error (no peer id): {error:?}");
-            }
-        },
-
-        // 入站连接错误
-        SwarmEvent::IncomingConnectionError {
-            local_addr, error, ..
-        } => {
-            tracing::error!("Incoming error on {local_addr:?}: {error:?}");
-        }
-
-        // 拨号中
-        SwarmEvent::Dialing { peer_id, .. } => {
-            tracing::debug!("Dialing: {peer_id:?}");
-        }
-
-        // 监听器关闭
-        SwarmEvent::ListenerClosed {
-            addresses, reason, ..
-        } => {
-            tracing::warn!("Listener closed: {addresses:?}, reason: {reason:?}");
-        }
-
-        // 监听器错误
-        SwarmEvent::ListenerError { error, .. } => {
-            tracing::error!("Listener error: {error}");
-        }
-
-        // 发现对等节点新外部地址
-        SwarmEvent::NewExternalAddrOfPeer { peer_id, address } => {
-            tracing::info!("Peer {peer_id} new addr: {address}");
-        }
-
-        // 监听地址过期
-        SwarmEvent::ExpiredListenAddr { address, .. } => {
-            tracing::error!("Address expired: {address}");
-        }
-
-        // 其他事件（忽略）
-        _ => {}
-    }
-}
-
-/// 打开本地 DHT 数据库并创建 RecordStore
-///
-/// 优先使用 ChatCore 中已打开的共享数据库连接，避免重复打开导致文件锁冲突。
-/// 如果共享连接不可用，回退到直接打开文件。
-fn open_dht_store(core: &ChatCore) -> Option<RedbRecordStore> {
-    // 优先使用共享连接
-    if let Some(ref db) = core.dht_db {
-        return Some(RedbRecordStore::new(db.clone()));
-    }
-    // 回退：直接打开文件（仅在 ChatCore 初始化完成前使用）
-    let dht_path = core.data_dir.join("dht.redb");
-    let db = redb::Database::create(&dht_path).ok()?;
-    Some(RedbRecordStore::new(Arc::new(db)))
-}
-
-/// 处理 Kademlia 事件
-fn handle_kademlia_event(kad_event: kad::Event, core: &mut ChatCore) {
-    match kad_event {
-        kad::Event::OutboundQueryProgressed {
-            result: QueryResult::GetRecord(result),
-            ..
-        } => handle_get_record_result(result, core),
-
-        kad::Event::OutboundQueryProgressed {
-            result: QueryResult::PutRecord(result),
-            ..
-        } => match result {
-            Ok(ok) => tracing::debug!("Successfully published DHT record to {:?}", ok.key),
-            Err(e) => tracing::warn!("Failed to publish DHT record: {:?}", e),
-        },
-
-        kad::Event::OutboundQueryProgressed {
-            result: QueryResult::GetProviders(result),
-            ..
-        } => match result {
-            Ok(kad::GetProvidersOk::FoundProviders { key, providers }) => {
-                // GetProviders 成功：缓存 provider 的 PeerID
-                // provider key 是 ML-DSA 公钥 hex
-                let key_str = std::str::from_utf8(key.as_ref()).unwrap_or("");
-                if !key_str.is_empty() && !providers.is_empty() {
-                    tracing::debug!(
-                        "GetProviders: found {} providers for key {}..",
-                        providers.len(),
-                        &key_str[..16.min(key_str.len())]
-                    );
-                    if let Some(store) = open_dht_store(core) {
-                        for provider in &providers {
-                            let _ = store.set_pubkey_peerid(key_str, provider);
-                        }
-                    }
-                    // 通过 oneshot channel 通知等待的 dht_lookup_peerid
-                    if let Ok(mut callbacks) = crate::p2p::DHT_PROVIDER_CALLBACKS.lock() {
-                        if let Some(sender) = callbacks.remove(key_str) {
-                            // 发送第一个找到的 provider
-                            if let Some(first_provider) = providers.iter().next() {
-                                let _ = sender.send(*first_provider);
-                            }
-                        }
-                    }
-                    // === 自动连接：对每个找到的 provider 主动 dial ===
-                    // 当 DHT 查询成功找到 provider 时，说明对方在线。
-                    // 主动 dial 建立连接，这样后续的 RetryPendingMessages 可以直接发送消息。
-                    // dial 失败是正常的（可能对方暂时不可达，或已建立连接），不影响后续重试。
-                    // 直接 dial PeerID，libp2p 会通过 Kademlia routing table 查找地址。
-                    for provider in &providers {
-                        let dial_result = core.swarm.dial(*provider);
-                        match dial_result {
-                            Ok(()) => tracing::debug!(
-                                "自动连接: 正在 dial provider {}..",
-                                &key_str[..16.min(key_str.len())]
-                            ),
-                            Err(e) => tracing::debug!(
-                                "自动连接: dial provider {}.. 失败: {}（可能已连接或正在连接）",
-                                &key_str[..16.min(key_str.len())],
-                                e
-                            ),
-                        }
-                    }
-                    // === 触发离线消息重试 ===
-                    // 本地数据库已缓存 pubkey→PeerID 映射，且已发起 dial，
-                    // 触发 RetryPendingMessages 重试之前进入离线队列的消息。
-                    let cmd_tx = core.core_handle.cmd_tx.clone();
-                    let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
-                }
-            }
-            Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
-                tracing::trace!("GetProviders finished with no additional record");
-            }
-            Err(e) => tracing::warn!("Get providers query failed: {:?}", e),
-        },
-
-        kad::Event::RoutingUpdated {
-            peer,
-            is_new_peer,
-            addresses,
-            old_peer,
-            ..
-        } => {
-            if is_new_peer {
-                tracing::info!(
-                    "New peer added to routing table: {} with {} addresses",
-                    peer,
-                    addresses.len()
-                );
-            }
-            if let Some(old) = old_peer {
-                tracing::debug!("Peer {} replaced by {} in routing table", old, peer);
-            }
-        }
-
-        _ => tracing::trace!("Unhandled Kademlia event: {:?}", kad_event),
-    }
-}
-
-/// 处理 GetRecord 查询结果
-///
-/// 只处理 `mlkem:{pubkey_hex}` 格式的记录。
-/// PeerID 发现已改用 Kademlia 原生 provider 机制（GetProviders），不再使用 GetRecord。
-fn handle_get_record_result(
-    result: Result<kad::GetRecordOk, kad::GetRecordError>,
-    core: &mut ChatCore,
-) {
-    match result {
-        Ok(GetRecordOk::FoundRecord(record)) => {
-            let record_key_str = std::str::from_utf8(record.record.key.as_ref()).unwrap_or("");
-
-            // 只处理 mlkem: 前缀的记录
-            if let Some(pubkey_hex) = record_key_str.strip_prefix("mlkem:") {
-                // ML-KEM 记录直接存储（无 SignedIdentityRecord 包装）
-                let mlkem_hex = match std::str::from_utf8(&record.record.value) {
-                    Ok(v) => v.to_string(),
-                    Err(_) => {
-                        tracing::warn!(
-                            "DHT GetRecord: ML-KEM value is not valid UTF-8 for pubkey {}",
-                            &pubkey_hex[..16]
-                        );
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    "DHT GetRecord: found ML-KEM pubkey for pubkey {}",
-                    &pubkey_hex[..16]
-                );
-
-                // 写入本地数据库缓存
-                if let Some(store) = open_dht_store(core) {
-                    let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
-                }
-
-                // ML-KEM 公钥已缓存，触发离线消息重试
-                // 注意：如果之前消息发送失败是因为缺少 ML-KEM 公钥（而非 PeerID），
-                // 现在密钥已缓存，可以重试发送
-                let cmd_tx = core.core_handle.cmd_tx.clone();
-                let _ = cmd_tx.try_send(ChatCommand::RetryPendingMessages);
-
-                // 异步更新 contacts 表（确保下次发送消息时使用最新密钥）
-                let pubkey_hex_owned = pubkey_hex.to_string();
-                tokio::spawn(async move {
-                    if let Some(pool) = storage::pool() {
-                        if let Ok(Some(identity_id)) = storage::get_current_identity(pool).await {
-                            if let Ok(mlkem_bytes) = hex::decode(&mlkem_hex) {
-                                let _ = storage::update_contact_mlkem_pubkey(
-                                    pool,
-                                    &identity_id,
-                                    &pubkey_hex_owned,
-                                    &mlkem_bytes,
-                                )
-                                .await;
-                                tracing::debug!(
-                                    "DHT ML-KEM 记录已同步到 contacts 表: {}..",
-                                    &pubkey_hex_owned[..16]
-                                );
-                            }
-                        }
-                    }
-                });
-            } else {
-                tracing::trace!(
-                    "DHT GetRecord: ignoring non-ML-KEM record: {}",
-                    record_key_str
-                );
-            }
-        }
-        Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
-            tracing::debug!("DHT query finished with no additional records");
-        }
-        Err(e) => tracing::warn!("DHT get record query failed: {:?}", e),
-    }
-}
 
 // ========== 消息接收处理 ==========
 
 /// 处理入站请求消息
 ///
 /// 流程：验证发送者 → 验证签名 → 解密 → 按 msgtype 分发
-async fn handle_incoming_request(
+///
+/// # 设计说明
+/// 消息处理（解密、数据库写入、送达回执）在当前 async 上下文中顺序执行。
+/// 不 spawn 到后台任务，因为需要 &mut ChatCore 的独占访问。
+/// send_response 在解密之前执行，确保发送方尽快收到响应确认，
+/// 避免 request-response 协议超时重试。
+pub async fn handle_incoming_request(
     core: &mut ChatCore,
     peer: libp2p::PeerId,
     channel: libp2p::request_response::ResponseChannel<ChatResponse>,
@@ -506,7 +52,7 @@ async fn handle_incoming_request(
         Some(id) => id,
         None => {
             tracing::warn!("未找到当前身份，无法处理入站消息");
-            send_response(core, channel);
+            send_response(core, channel).await;
             return;
         }
     };
@@ -519,7 +65,7 @@ async fn handle_incoming_request(
 
     if !is_known_contact {
         tracing::warn!("收到来自未知用户 {} 的消息，已拒绝", peer);
-        send_response(core, channel);
+        send_response(core, channel).await;
         return;
     }
 
@@ -543,14 +89,19 @@ async fn handle_incoming_request(
         return;
     }
 
+    // 先发送响应确认，避免 request-response 协议超时重试
+    // 注意：即使后续解密失败，也发送响应确认，因为协议层需要响应
+    send_response(core, channel).await;
+
     // 解密并处理消息
-    handle_decrypted_message(core, pool, peer, &request, &sender_mldsa_pubkey_hex).await;
+    // handle_decrypted_message 返回 true 表示解密成功，false 表示失败
+    let decryption_success = handle_decrypted_message(
+        core, pool, peer, &request, &sender_mldsa_pubkey_hex,
+    )
+    .await;
 
-    // 发送响应确认
-    send_response(core, channel);
-
-    // 对于文本消息，发送送达回执
-    if request.msgtype == ChatMessageType::Text {
+    // 只有解密成功后才发送送达回执
+    if decryption_success && request.msgtype == ChatMessageType::Text {
         // 使用 ChatMessage 自身的 hash 字段作为回执内容，
         // 与发送方 save_pending_message_with_hash 中使用的哈希一致。
         let receipt_data = hex::encode(&request.hash);
@@ -596,7 +147,7 @@ async fn handle_incoming_request(
                         return;
                     }
                 };
-                core.send_message(sender_peer_id, receipt_msg);
+                core.send_message(sender_peer_id, receipt_msg).await;
                 tracing::info!("已向 {} 发送加密的送达回执", &sender_mldsa_pubkey_hex[..16]);
             } else {
                 tracing::debug!(
@@ -655,19 +206,21 @@ async fn handle_message_verification(
 }
 
 /// 解密消息并按 msgtype 分发处理
+///
+/// 返回 true 表示解密成功并已处理，false 表示解密失败
 async fn handle_decrypted_message(
     core: &mut ChatCore,
     pool: &sqlx::Pool<sqlx::Sqlite>,
     _peer: libp2p::PeerId,
     request: &ChatMessage,
     sender_mldsa_pubkey_hex: &str,
-) {
+) -> bool {
     // 获取当前身份的 identity_id（保留用于后续可能的用途）
     let _identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
         Some(id) => id,
         None => {
             tracing::warn!("未找到当前身份");
-            return;
+            return false;
         }
     };
 
@@ -679,7 +232,7 @@ async fn handle_decrypted_message(
         Some(key) => key,
         None => {
             tracing::warn!("ML-KEM 解封装密钥未初始化，无法解密消息");
-            return;
+            return false;
         }
     };
 
@@ -703,7 +256,7 @@ async fn handle_decrypted_message(
                 &sender_mldsa_pubkey_hex[..16],
                 e
             );
-            return;
+            return false;
         }
     };
 
@@ -729,6 +282,8 @@ async fn handle_decrypted_message(
             tracing::debug!("OnlineStatus 消息通过 request-response 到达，忽略");
         }
     }
+
+    true
 }
 
 /// 处理文本消息：UTF-8 解码 → 存储 → 通知 UI
@@ -903,35 +458,29 @@ async fn handle_file_download_request(
     // 后续 rr_msg.send_request() 会自动利用新建立的直连发送分片。
     if let Ok(store) = core.get_dht_store() {
         if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex) {
-            if !core.swarm.is_connected(&recipient_peer_id) {
-                if let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
-                    && !addrs.is_empty()
-                {
-                    tracing::info!(
-                        "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
-                        &sender_mldsa_pubkey_hex[..16],
-                        addrs.len()
-                    );
-                    for addr in &addrs {
-                        let dial_addr = addr
-                            .clone()
-                            .with_p2p(recipient_peer_id)
-                            .unwrap_or(addr.clone());
-                        match core.swarm.dial(dial_addr) {
-                            Ok(()) => tracing::info!(
-                                "文件传输：正在 dial {}.. 地址: {}",
-                                &sender_mldsa_pubkey_hex[..16],
-                                addr
-                            ),
-                            Err(e) => tracing::debug!("文件传输：dial {} 失败: {}", addr, e),
-                        }
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    "文件传输：与 {}.. 已建立连接，无需额外 dial",
-                    &sender_mldsa_pubkey_hex[..16]
+            // 通过 P2pActor 检查连接状态并拨号
+            // 注意：这里不再直接访问 core.swarm，而是通过 P2pActor 发送命令
+            // 由于需要同步检查连接状态，暂时通过 P2pActor 发送 Dial 命令
+            // 如果已连接，dial 会被 libp2p 忽略
+            if let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
+                && !addrs.is_empty()
+            {
+                tracing::info!(
+                    "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
+                    &sender_mldsa_pubkey_hex[..16],
+                    addrs.len()
                 );
+                for addr in &addrs {
+                    let dial_addr = addr
+                        .clone()
+                        .with_p2p(recipient_peer_id)
+                        .unwrap_or(addr.clone());
+                    let _ = core.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
+                            addr: dial_addr,
+                        }),
+                    ).await;
+                }
             }
         } else {
             tracing::debug!(
@@ -1086,7 +635,7 @@ async fn handle_file_download_request(
 }
 
 /// 发送签名响应确认
-fn send_response(
+async fn send_response(
     core: &mut ChatCore,
     channel: libp2p::request_response::ResponseChannel<ChatResponse>,
 ) {
@@ -1097,14 +646,16 @@ fn send_response(
             return;
         }
     };
-    if let Err(e) = core
-        .swarm
-        .behaviour_mut()
-        .rr_msg
-        .send_response(channel, response)
-    {
-        tracing::error!("发送响应失败: {:?}", e);
-    }
+    // 通过 P2pActor 发送响应
+    // 注意：这里需要将 response channel 发送给 P2pActor 来处理
+    // 由于 send_response 需要访问 swarm，而 ChatCore 不再持有 swarm，
+    // 我们需要通过 P2pActor 来发送响应
+    let _ = core.p2p_handle.send(
+        crate::actor::ActorCommand::Custom(P2pCommand::SendResponse {
+            channel,
+            response,
+        }),
+    ).await;
 }
 
 /// 构建带 ML-DSA 签名的 ChatResponse
@@ -1162,124 +713,6 @@ async fn handle_delivery_receipt(
         }
         Err(e) => {
             tracing::warn!("送达回执数据不是合法 UTF-8: {}", e);
-        }
-    }
-}
-
-/// 处理 gossipsub 在线状态消息
-///
-/// 验证流程：
-/// 1. 反序列化 ChatMessage（包含 ML-DSA 签名）
-/// 2. 验证 ChatMessage 的签名和完整性
-/// 3. 反序列化 OnlineStatusPayload
-/// 4. 检查发送者是否在联系人列表中（白名单验证）
-/// 5. 更新在线状态
-async fn handle_gossipsub_message(core: &mut ChatCore, message: gossipsub::Message) {
-    // 1. 反序列化 ChatMessage
-    let chat_msg: ChatMessage = match postcard::from_bytes(&message.data) {
-        Ok(msg) => msg,
-        Err(e) => {
-            tracing::warn!("Gossipsub 消息反序列化失败: {}", e);
-            return;
-        }
-    };
-
-    // 2. 验证消息类型必须为 OnlineStatus
-    if chat_msg.msgtype != ChatMessageType::OnlineStatus {
-        tracing::debug!("Gossipsub 消息类型不是 OnlineStatus，忽略");
-        return;
-    }
-
-    // 3. 验证 ChatMessage 的 ML-DSA 签名和完整性
-    match chat_msg.verify() {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!("Gossipsub 在线状态消息签名验证失败，已忽略");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!("Gossipsub 在线状态消息验证出错: {}", e);
-            return;
-        }
-    }
-
-    // 4. 反序列化 OnlineStatusPayload
-    let payload: OnlineStatusPayload = match postcard::from_bytes(&chat_msg.data) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("OnlineStatusPayload 反序列化失败: {}", e);
-            return;
-        }
-    };
-
-    // 5. 检查发送者的 ML-DSA 公钥是否在联系人列表中（白名单验证）
-    let is_contact = match storage::pool() {
-        Some(pool) => {
-            if let Some(owner_id) = core.mldsa_identity_id.as_ref() {
-                storage::is_contact_exists(pool, owner_id, &payload.mldsa_pubkey_hex)
-                    .await
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
-        None => false,
-    };
-
-    if !is_contact {
-        tracing::debug!(
-            "收到非联系人的在线状态通知，已忽略: {}",
-            payload.mldsa_pubkey_hex
-        );
-        return;
-    }
-
-    // 6. 更新在线状态
-    tracing::info!(
-        "在线状态更新: pubkey={}, online={}, peer_id={}",
-        payload.mldsa_pubkey_hex,
-        payload.online,
-        payload.peer_id
-    );
-
-    // 通过 command channel 发送在线状态事件到 UI
-    let event = MessageEvent::ContactOnlineStatus {
-        mldsa_pubkey_hex: payload.mldsa_pubkey_hex.clone(),
-        online: payload.online,
-    };
-    if let Err(e) = core.tx_message.send(event).await {
-        tracing::error!("发送在线状态事件失败: {}", e);
-    }
-
-    // 如果对方上线，尝试建立双向连接
-    if payload.online {
-        if let Ok(peer_id) = libp2p::PeerId::from_str(&payload.peer_id) {
-            // 缓存 peer_id -> pubkey 映射
-            if let Ok(store) = core.get_dht_store() {
-                let _ = store.set_pubkey_peerid(&payload.mldsa_pubkey_hex, &peer_id);
-            }
-            core.peerid_to_pubkey
-                .insert(peer_id, payload.mldsa_pubkey_hex.clone());
-
-            // 尝试 dial 对方提供的监听地址
-            for addr_str in &payload.listen_addrs {
-                if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                    let dial_addr = addr.clone().with_p2p(peer_id).unwrap_or_else(|_| addr);
-                    match core.swarm.dial(dial_addr) {
-                        Ok(()) => {
-                            tracing::info!("通过在线状态通知拨号: {}", peer_id);
-                            break; // 成功拨号一个地址即可
-                        }
-                        Err(e) => {
-                            tracing::debug!("拨号失败 {}: {}", peer_id, e);
-                        }
-                    }
-                }
-            }
-
-            // 自己也发布一次在线状态，让对方知道我也在线，从而建立双向连接
-            // 这样双方都能在 connected_peers 中看到对方
-            core.publish_online_status(true).await;
         }
     }
 }

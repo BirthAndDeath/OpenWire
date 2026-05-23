@@ -1,10 +1,7 @@
-use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use aws_lc_rs::kem::DecapsulationKey;
-use libp2p::gossipsub;
-use libp2p::{PeerId, Swarm};
-use lru::LruCache;
-use sha2::Digest;
+use libp2p::PeerId;
 use tokio::sync::mpsc;
 use tokio::try_join;
 use tokio_util::sync::CancellationToken;
@@ -12,22 +9,18 @@ use zeroize::Zeroizing;
 
 /// 消息通道容量
 const CHANNEL_CAPACITY: usize = 64;
-/// mDNS 缓存大小
-const MDNS_CACHE_SIZE: usize = 2000;
 /// DHT 定期注册间隔（秒）- 5分钟
 pub(crate) const DHT_REGISTRATION_INTERVAL_SECS: u64 = 300;
 
-/// Gossipsub 在线状态 topic 前缀
-const GOSSIPSUB_TOPIC_PREFIX: &str = "online-status";
-
 use crate::{
+    actor::p2p::{P2pActor, P2pActorHandle, P2pCommand, P2pEvent},
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
     coreconfig::CoreConfig,
     corehandle::CoreHandle,
     error::{CoreError, CoreResult},
     identity,
     log::init_logger,
-    message::{ChatMessage, ChatMessageType, OnlineStatusPayload},
+    message::{ChatMessage, ChatMessageType},
     p2p, storage,
     transfer::FileTransferState,
 };
@@ -41,9 +34,16 @@ pub mod identity_ops;
 pub mod message_ops;
 
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
+///
+/// # 架构变更说明
+/// ChatCore 不再直接持有 libp2p Swarm，而是通过 P2pActorHandle 与 P2pActor 通信。
+/// P2pActor 拥有 Swarm 的所有权，独立运行事件循环。
+/// ChatCore 从 P2pEvent 接收通道获取网络事件。
 pub struct ChatCore {
-    /// libp2p 网络 swarm，管理所有连接和协议
-    pub(crate) swarm: Swarm<p2p::MyBehaviour>,
+    /// P2pActor 句柄：用于向 P2pActor 发送命令
+    pub(crate) p2p_handle: P2pActorHandle,
+    /// P2pActor 事件接收通道：接收网络事件
+    pub(crate) rx_p2p_event: mpsc::Receiver<P2pEvent>,
     /// 临时传输层 PeerID 密钥对（Ed25519，每次启动重新生成）
     #[allow(dead_code)]
     pub(crate) identity_keypair: libp2p::identity::Keypair,
@@ -54,7 +54,6 @@ pub struct ChatCore {
     pub(crate) rx_message: Option<mpsc::Receiver<ChatcoreEvent>>,
     /// 命令接收通道：接收外部控制指令
     pub(crate) rx_cmd: mpsc::Receiver<ChatCommand>,
-    pub(crate) mdns_cache: LruCache<PeerId, Instant>,
     pub(crate) data_dir: PathBuf,
     /// 核心句柄：用于外部控制核心
     pub core_handle: CoreHandle,
@@ -175,12 +174,23 @@ impl ChatCore {
             Some(Arc::new(db))
         };
 
+        // 启动时清理 contacts 表中过时的 ML-KEM 公钥
+        // 每次启动都会生成新的临时 ML-KEM 密钥对，旧的 ML-KEM 公钥已失效。
+        // 如果不清理，lookup_mlkem_pubkey 在 DHT 本地数据库未命中时会回退到
+        // contacts 表获取过时的公钥，导致加密消息后接收方解密失败。
+        if let Some(pool) = storage::pool() {
+            if let Err(e) = storage::clear_all_mlkem_pubkeys(pool).await {
+                tracing::warn!("启动时清理过时 ML-KEM 公钥失败: {}", e);
+            } else {
+                tracing::info!("启动时已清理 contacts 表中所有过时的 ML-KEM 公钥");
+            }
+        }
+
         let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), dht_db.clone().unwrap())
             .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mdns_cache = LruCache::new(NonZeroUsize::new(MDNS_CACHE_SIZE).unwrap());
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<ChatCommand>(CHANNEL_CAPACITY);
 
@@ -206,13 +216,29 @@ impl ChatCore {
 
         let shutdown_token = CancellationToken::new();
 
-        Ok(ChatCore {
+        // 创建 P2pActor 事件通道
+        let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
+
+        // 创建 P2pActor 并启动
+        let p2p_actor = P2pActor::new(
             swarm,
+            dht_db.clone(),
+            cfg.data_dir.clone(),
+            p2p_event_tx,
+        );
+        let p2p_handle = crate::actor::p2p::start_p2p_actor(
+            p2p_actor,
+            CHANNEL_CAPACITY,
+            shutdown_token.clone(),
+        );
+
+        Ok(ChatCore {
+            p2p_handle,
+            rx_p2p_event: p2p_event_rx,
             identity_keypair: keypair,
             tx_message: tx,
             rx_message: Some(rx),
             rx_cmd: cmd_rx,
-            mdns_cache,
             data_dir: cfg.data_dir.clone(),
             core_handle: CoreHandle {
                 cmd_tx,
@@ -251,12 +277,14 @@ impl ChatCore {
         self.core_handle.clone()
     }
 
-    /// 发送消息到网络
-    pub(crate) fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
-        self.swarm
-            .behaviour_mut()
-            .rr_msg
-            .send_request(&peerid, message);
+    /// 发送消息到网络（通过 P2pActor）
+    pub(crate) async fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
+        let _ = self.p2p_handle.send(
+            crate::actor::ActorCommand::Custom(P2pCommand::SendMessage {
+                peer_id: peerid,
+                message,
+            }),
+        ).await;
     }
 
     pub(crate) async fn build_signed_message(
@@ -371,178 +399,6 @@ impl ChatCore {
             self.send_online_status().await;
         }
     }
-
-    // ========== Gossipsub 在线状态发布/订阅 ==========
-
-    /// 构建联系人对应的 gossipsub topic
-    ///
-    /// topic 格式: `online-status/{sha256(mldsa_pubkey_hex)}`
-    /// 使用 SHA256 哈希避免 topic 名称泄露公钥信息。
-    fn contact_topic(mldsa_pubkey_hex: &str) -> gossipsub::IdentTopic {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(mldsa_pubkey_hex.as_bytes());
-        let topic_hash = hex::encode(hasher.finalize());
-        gossipsub::IdentTopic::new(format!("{}/{}", GOSSIPSUB_TOPIC_PREFIX, topic_hash))
-    }
-
-    /// 订阅某个联系人的在线状态 topic
-    pub(crate) fn subscribe_to_contact_topic(&mut self, mldsa_pubkey_hex: &str) {
-        let topic = Self::contact_topic(mldsa_pubkey_hex);
-        match self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
-            Ok(true) => {
-                tracing::info!("已订阅联系人在线状态 topic: {}", topic);
-            }
-            Ok(false) => {
-                tracing::debug!("已订阅过 topic: {}", topic);
-            }
-            Err(e) => {
-                tracing::warn!("订阅 topic {} 失败: {}", topic, e);
-            }
-        }
-    }
-
-    /// 取消订阅某个联系人的在线状态 topic
-    #[allow(dead_code)]
-    pub(crate) fn unsubscribe_from_contact_topic(&mut self, mldsa_pubkey_hex: &str) {
-        let topic = Self::contact_topic(mldsa_pubkey_hex);
-        if self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic) {
-            tracing::info!("已取消订阅联系人在线状态 topic: {}", topic);
-        } else {
-            tracing::debug!("未订阅 topic: {}", topic);
-        }
-    }
-
-    /// 发布在线状态到自己的 topic
-    ///
-    /// 创建一个 ChatMessage::OnlineStatus 消息，包含 OnlineStatusPayload，
-    /// 使用 ML-DSA 签名后通过 gossipsub 发布。
-    pub(crate) async fn publish_online_status(&mut self, online: bool) {
-        let mldsa_pubkey_hex = match &self.mldsa_pubkey_hex {
-            Some(pk) => pk.clone(),
-            None => {
-                tracing::warn!("ML-DSA 公钥未初始化，无法发布在线状态");
-                return;
-            }
-        };
-
-        let peer_id = match &self.current_peer_id {
-            Some(pid) => pid.to_string(),
-            None => {
-                tracing::warn!("PeerID 未初始化，无法发布在线状态");
-                return;
-            }
-        };
-
-        // 收集当前监听地址
-        let listen_addrs: Vec<String> = self
-            .swarm
-            .listeners()
-            .map(|addr| addr.to_string())
-            .collect();
-
-        let payload = OnlineStatusPayload {
-            mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
-            online,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            peer_id,
-            listen_addrs,
-        };
-
-        let payload_data = match postcard::to_allocvec(&payload) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!("序列化 OnlineStatusPayload 失败: {}", e);
-                return;
-            }
-        };
-
-        // 使用 ML-DSA 签名创建 ChatMessage
-        let private_key = match &self.mldsa_private_key {
-            Some(k) => k,
-            None => {
-                tracing::warn!("ML-DSA 私钥未初始化，无法签名在线状态消息");
-                return;
-            }
-        };
-        let public_key = match crate::identity::extract_public_key_from_private(private_key, true) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::warn!("从私钥提取 ML-DSA 公钥失败: {}", e);
-                return;
-            }
-        };
-
-        let chat_msg = match ChatMessage::new_signed(
-            ChatMessageType::OnlineStatus,
-            payload_data,
-            private_key,
-            &public_key,
-        ) {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!("创建在线状态 ChatMessage 失败: {}", e);
-                return;
-            }
-        };
-
-        let msg_data = match postcard::to_allocvec(&chat_msg) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!("序列化 ChatMessage 失败: {}", e);
-                return;
-            }
-        };
-
-        // 发布到自己的 topic
-        let topic = Self::contact_topic(&mldsa_pubkey_hex);
-        match self
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, msg_data)
-        {
-            Ok(msg_id) => {
-                tracing::info!("已发布在线状态: online={}, msg_id={:?}", online, msg_id);
-            }
-            Err(e) => {
-                tracing::warn!("发布在线状态失败: {}", e);
-            }
-        }
-    }
-
-    /// 启动时订阅所有已知联系人的 topic
-    pub(crate) async fn subscribe_to_all_contacts(&mut self) {
-        let pool = match storage::pool() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("数据库连接池未初始化，无法订阅联系人 topic");
-                return;
-            }
-        };
-
-        let owner_id = match &self.mldsa_identity_id {
-            Some(id) => id.clone(),
-            None => {
-                tracing::warn!("身份 ID 未初始化，无法订阅联系人 topic");
-                return;
-            }
-        };
-
-        match storage::list_contacts(pool, &owner_id).await {
-            Ok(contacts) => {
-                for contact in &contacts {
-                    self.subscribe_to_contact_topic(&contact.mldsa_pubkey_hex);
-                }
-                tracing::info!("已订阅 {} 个联系人的在线状态 topic", contacts.len());
-            }
-            Err(e) => {
-                tracing::warn!("查询联系人列表失败: {}", e);
-            }
-        }
-    }
 }
 
 impl Drop for ChatCore {
@@ -552,8 +408,14 @@ impl Drop for ChatCore {
         // 再发送关闭命令，让主事件循环退出
         let _ = self.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
 
-        // 保存路由表到缓存文件，下次启动时可跳过 bootstrap 节点
-        let cache_path = self.data_dir.join("routing_table.cache");
-        p2p::save_routing_table(&mut self.swarm, &cache_path);
+        // 通知 P2pActor 保存路由表并关闭
+        // 注意：drop 是同步上下文，不能使用 send_blocking（会 panic），
+        // 使用 try_send 非阻塞发送，如果通道满则丢弃（P2pActor 即将关闭）
+        let _ = self.p2p_handle.tx.try_send(
+            crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
+        );
+        let _ = self.p2p_handle.tx.try_send(
+            crate::actor::ActorCommand::Custom(P2pCommand::Shutdown),
+        );
     }
 }

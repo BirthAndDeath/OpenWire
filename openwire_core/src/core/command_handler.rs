@@ -85,7 +85,8 @@ impl ChatCore {
                 peer_id,
                 mlkem_pubkey_hex,
             } => {
-                self.publish_identity_to_dht(&mldsa_pubkey_hex, &peer_id, &mlkem_pubkey_hex);
+                self.publish_identity_to_dht(&mldsa_pubkey_hex, &peer_id, &mlkem_pubkey_hex)
+                    .await;
             }
             ChatCommand::DiscoverContact {
                 mldsa_pubkey_hex,

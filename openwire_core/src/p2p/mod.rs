@@ -1,11 +1,12 @@
-mod behaviour;
+pub mod behaviour;
 mod bootstrap;
 pub mod dht;
 mod events;
+pub mod netevent;
 mod swarm;
 
 pub use behaviour::MyBehaviour;
-pub use events::swarm_event;
+pub use events::handle_incoming_request;
 pub use swarm::{save_routing_table, swarm_init};
 
 use libp2p::PeerId;
@@ -18,7 +19,7 @@ use crate::error::{DhtError, DhtResult};
 /// GetProviders 查询回调注册表
 ///
 /// 当 `dht_lookup_peerid` 发起 GetProviders 查询时，注册一个 oneshot sender。
-/// `events.rs` 中的 GetProvidersOk::FoundProviders 处理器会通过 key 查找对应的 sender
+/// `actor/p2p/mod.rs` 中的 GetProvidersOk::FoundProviders 处理器会通过 key 查找对应的 sender
 /// 并发送找到的 PeerID。
 ///
 /// 使用 LazyLock 确保全局唯一实例，避免 static 初始化顺序问题。
