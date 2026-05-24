@@ -23,13 +23,13 @@ tracing = "0.1"
 
 # 加密文件存储
 aes-gcm = "0.10.3"
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 rand = "0.10.1"
 
 # 密码 KDF（Argon2id）
 argon2 = "0.5.3"
 
-keyring = { version = "4.0.0" }
+keyring = { version = "4.0.1" }
 keyring-core = "1.0.0"
 # Unix mlock支持
 [target.'cfg(unix)'.dependencies]
