@@ -14,7 +14,7 @@ const ALLOWED_COMMANDS = new Set([
     'load_messages', 'get_identity_qr_data',
     'check_core_ready',
     'is_keyring_available', 'set_password', 'retry_init',
-    'get_nodes_config', 'save_nodes_config',
+    'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'plugin:window|set_content_protected'
 ]);
 
@@ -198,6 +198,7 @@ const VALIDATORS = {
     },
     retry_init: () => null,
     get_nodes_config: () => null,
+    reset_nodes_config: () => null,
     save_nodes_config: (p) => {
         if (!Array.isArray(p.relayNodes)) return 'relayNodes must be an array';
         if (!Array.isArray(p.bootstrapNodes)) return 'bootstrapNodes must be an array';

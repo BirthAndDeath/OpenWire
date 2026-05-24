@@ -155,6 +155,14 @@ impl NodesConfig {
         Ok(())
     }
 
+    /// 重置为默认节点配置并保存
+    pub fn reset_to_default(data_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let default_config = NodesConfig::default();
+        default_config.save(data_dir)?;
+        tracing::info!("节点配置已重置为默认值");
+        Ok(default_config)
+    }
+
     /// 手动将 NodesConfig 序列化为 JSON 字符串（不依赖 serde_json）
     fn to_json_pretty(&self) -> String {
         let mut json = String::from("{\n");

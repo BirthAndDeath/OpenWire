@@ -769,6 +769,23 @@ async fn save_nodes_config(
     Ok(())
 }
 
+/// 重置节点配置为默认值
+///
+/// 将 data_dir/nodes.json 重置为默认的 bootstrap 和 relay 节点列表。
+/// 返回重置后的节点配置 JSON 字符串，前端可直接更新 UI。
+#[tauri::command]
+async fn reset_nodes_config(state: tauri::State<'_, AppData>) -> Result<String, String> {
+    let inner = state.inner.read().await;
+    let data_dir = inner.data_dir.clone();
+    drop(inner);
+
+    let config = openwire_core::p2p::nodes::NodesConfig::reset_to_default(&data_dir)
+        .map_err(|e| format!("重置节点配置失败: {}", e))?;
+    let json = config.to_json_string();
+    tracing::info!("节点配置已重置为默认值，重启后生效");
+    Ok(json)
+}
+
 #[tauri::command]
 async fn is_keyring_available() -> Result<bool, String> {
     let available = rootcell::identity::PrivateKeyHandle::check_keyring_available();
@@ -1207,7 +1224,8 @@ pub fn run() {
             delete_contact,
             delete_message,
             get_nodes_config,
-            save_nodes_config
+            save_nodes_config,
+            reset_nodes_config
         ])
 
         .build(tauri::generate_context!())

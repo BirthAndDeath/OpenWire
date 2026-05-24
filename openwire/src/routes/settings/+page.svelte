@@ -231,17 +231,30 @@
     nodesMessage = "";
   }
 
-  /** 重置为默认节点配置 */
+  /** 重置为默认节点配置（通过后端 API） */
   async function resetNodesToDefault() {
-    // 先清空
-    relayNodes = [];
-    bootstrapNodes = [];
-    nodesChanged = true;
+    nodesSaving = true;
     nodesMessage = "";
-    // 直接保存空数组，后端 load 时会自动创建默认配置
-    await saveNodesConfig();
-    // 重新加载（会得到默认配置）
-    await loadNodesConfig();
+    try {
+      const jsonStr = await invoke<string>("reset_nodes_config");
+      const data = JSON.parse(jsonStr);
+      relayNodes = (data.relay_nodes || []).map((n: [string, string]) => ({
+        peerId: n[0],
+        multiaddr: n[1],
+      }));
+      bootstrapNodes = (data.bootstrap_nodes || []).map((n: [string, string]) => ({
+        peerId: n[0],
+        multiaddr: n[1],
+      }));
+      nodesChanged = false;
+      nodesMessage = $_("config_saved_restart");
+      console.log("节点配置已重置为默认值");
+    } catch (e) {
+      console.error("重置节点配置失败:", e);
+      nodesMessage = $_("config_save_failed") + `: ${e}`;
+    } finally {
+      nodesSaving = false;
+    }
   }
 
   /** 保存节点配置到后端 */
