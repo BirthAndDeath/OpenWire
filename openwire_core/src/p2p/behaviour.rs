@@ -1,9 +1,9 @@
+use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
+use crate::{ChatMessage, ChatResponse};
 use libp2p::kad::{self};
 use libp2p::request_response::cbor;
-use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour};
 
-use crate::{ChatMessage, ChatResponse};
-use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
+use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour, upnp};
 
 /// libp2p 网络行为组合
 ///
@@ -37,4 +37,6 @@ pub struct MyBehaviour {
     pub relay: relay::Behaviour,
     // DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,
+    // UPnP 协议（端口映射，可选）有一个神秘bug，我不知道为什么后来人可以试试修复
+    //pub upnp: upnp::Behaviour,
 }

@@ -18,7 +18,7 @@ use futures::StreamExt;
 use libp2p::kad::{self, GetRecordOk, QueryResult};
 use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identify, mdns, PeerId, Swarm};
+use libp2p::{dcutr, identify, mdns, relay, PeerId, Swarm};
 use redb::Database;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -398,6 +398,28 @@ impl P2pActor {
             SwarmEvent::ExpiredListenAddr { address, .. } => {
                 tracing::error!("Address expired: {address}");
             }
+
+            // --- Relay 事件 ---
+            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationReqAccepted {
+                src_peer_id, ..
+            })) => {
+                tracing::info!("Relay reservation accepted for: {}", src_peer_id);
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationTimedOut { src_peer_id })) => {
+                tracing::warn!("Relay reservation timed out for: {}", src_peer_id);
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event)) => {
+                tracing::trace!("Relay event (unhandled): {:?}", event);
+            }
+
+            // --- DCUtR 事件 ---
+            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result: Ok(_) })) => {
+                tracing::info!("DCUtR direct connection upgraded with: {}", remote_peer_id);
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result: Err(ref e) })) => {
+                tracing::warn!("DCUtR direct connection upgrade failed for {}: {:?}", remote_peer_id, e);
+            }
+
             _ => {}
         }
     }

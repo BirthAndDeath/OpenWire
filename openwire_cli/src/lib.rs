@@ -134,20 +134,20 @@ impl App {
                 Some(log_level),
             );
             cfg.passwd = Some(key_hex);
+            cfg.load_nodes_config();
             let core = openwire_core::ChatCore::try_init(cfg).await?;
             return Self::build_app(core, data_dir).await;
         }
 
         // 先尝试无密码初始化（Keyring 可用的情况）
-        let cfg = openwire_core::CoreConfig::new(
+        let mut cfg = openwire_core::CoreConfig::new(
             data_dir.clone(),
             Some(log_path.clone()),
             Some(log_level),
         );
+        cfg.load_nodes_config();
         match openwire_core::ChatCore::try_init(cfg).await {
-            Ok(core) => {
-                return Self::build_app(core, data_dir).await;
-            }
+            Ok(core) => Self::build_app(core, data_dir).await,
             Err(e) => {
                 // Keyring 不可用，需要用户输入密码
                 eprintln!("\n⚠️  系统密钥环（Keyring）不可用，无法自动管理加密密钥。");
@@ -189,6 +189,7 @@ impl App {
                     Some(log_level),
                 );
                 cfg.passwd = Some(key_hex);
+                cfg.load_nodes_config();
                 match openwire_core::ChatCore::try_init(cfg).await {
                     Ok(core) => {
                         eprintln!("✅ 密码派生密钥初始化成功（安全性低于 Keyring）\n");

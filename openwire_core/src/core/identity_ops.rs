@@ -147,7 +147,9 @@ impl ChatCore {
         let peer_id = keypair.public().to_peer_id();
 
         let dht_db = self.dht_db.clone().unwrap();
-        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let bootstrap_nodes: Vec<(String, String)> = Vec::new();
+        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to reinitialize swarm: {e}");
@@ -252,10 +254,12 @@ impl ChatCore {
     /// 重新初始化 swarm（生成新 PeerID）
     fn reinitialize_swarm(&mut self) {
         let dht_db = self.dht_db.clone().unwrap();
+        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let bootstrap_nodes: Vec<(String, String)> = Vec::new();
         match identity::generate_temporary_peerid() {
             Ok(keypair) => {
                 let peer_id = keypair.public().to_peer_id();
-                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
                     Ok(swarm) => {
                         self.identity_keypair = keypair;
                         self.current_peer_id = Some(peer_id);

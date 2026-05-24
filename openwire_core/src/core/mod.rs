@@ -186,8 +186,18 @@ impl ChatCore {
             }
         }
 
-        let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), dht_db.clone().unwrap())
-            .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
+        // 加载节点配置（relay 和 bootstrap 节点）
+        let relay_nodes: Vec<(String, String)> = cfg.relay_nodes.clone();
+        let bootstrap_nodes: Vec<(String, String)> = cfg.bootstrap_nodes.clone();
+
+        let swarm = p2p::swarm_init(
+            &cfg.data_dir,
+            keypair.clone(),
+            dht_db.clone().unwrap(),
+            &relay_nodes,
+            &bootstrap_nodes,
+        )
+        .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);

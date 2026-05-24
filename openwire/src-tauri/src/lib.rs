@@ -745,13 +745,16 @@ async fn retry_init(app_handle: tauri::AppHandle) -> Result<bool, String> {
         (data_dir, passwd)
     };
 
-    let cfg = openwire_core::CoreConfig {
+    let mut cfg = openwire_core::CoreConfig {
         data_dir,
         path_to_log: None,
         log_level: Some("info".to_string()),
         download_dir: None,
         passwd,
+        relay_nodes: Vec::new(),
+        bootstrap_nodes: Vec::new(),
     };
+    cfg.load_nodes_config();
 
     match openwire_core::ChatCore::try_init(cfg.clone()).await {
         Ok(mut chat_core_instance) => {
@@ -1030,6 +1033,7 @@ pub fn run() {
                 let mut cfg =
                     openwire_core::CoreConfig::new(data_dir, Some(log_path), Some(log_level));
                 cfg.passwd = passwd;
+                cfg.load_nodes_config();
 
                 match openwire_core::ChatCore::try_init(cfg.clone()).await {
                     Ok(chat_core_instance) => {

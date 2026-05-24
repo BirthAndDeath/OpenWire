@@ -1,8 +1,8 @@
 pub mod behaviour;
-mod bootstrap;
 pub mod dht;
 mod events;
 pub mod netevent;
+pub mod nodes;
 mod swarm;
 
 pub use behaviour::MyBehaviour;
