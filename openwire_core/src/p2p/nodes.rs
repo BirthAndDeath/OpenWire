@@ -184,6 +184,35 @@ impl NodesConfig {
         json
     }
 
+    /// 将 NodesConfig 序列化为紧凑 JSON 字符串（用于前端 API 返回）
+    pub fn to_json_string(&self) -> String {
+        let mut json = String::from("{");
+
+        // relay_nodes
+        json.push_str("\"relay_nodes\":[");
+        for (i, node) in self.relay_nodes.iter().enumerate() {
+            json.push_str(&format!("[\"{}\",\"{}\"]", node[0], node[1]));
+            if i < self.relay_nodes.len().saturating_sub(1) {
+                json.push(',');
+            }
+        }
+        json.push_str("],");
+
+        // bootstrap_nodes
+        json.push_str("\"bootstrap_nodes\":[");
+        for (i, node) in self.bootstrap_nodes.iter().enumerate() {
+            json.push_str(&format!("[\"{}\",\"{}\"]", node[0], node[1]));
+            if i < self.bootstrap_nodes.len().saturating_sub(1) {
+                json.push(',');
+            }
+        }
+        json.push_str("]");
+
+        json.push('}');
+        json
+    }
+
+
     /// 手动解析 JSON 字符串为 NodesConfig（不依赖 serde_json）
     fn from_json_str(content: &str) -> Result<Self, String> {
         let content = content.trim();

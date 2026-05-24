@@ -705,6 +705,70 @@ async fn check_core_ready(state: tauri::State<'_, AppData>) -> Result<bool, Stri
     Ok(inner.core_ready)
 }
 
+/// 获取节点配置（bootstrap 和 relay 节点列表）
+///
+/// 从 data_dir/nodes.json 读取节点配置并返回给前端。
+/// 返回 JSON 字符串格式：{"relay_nodes": [["peer_id", "addr"], ...], "bootstrap_nodes": [...]}
+#[tauri::command]
+async fn get_nodes_config(state: tauri::State<'_, AppData>) -> Result<String, String> {
+    let inner = state.inner.read().await;
+    let data_dir = inner.data_dir.clone();
+    drop(inner);
+
+    let nodes_config = openwire_core::p2p::nodes::NodesConfig::load(&data_dir);
+    // 手动序列化为 JSON 字符串
+    let json = nodes_config.to_json_string();
+    Ok(json)
+}
+
+/// 保存节点配置（bootstrap 和 relay 节点列表）
+///
+/// 前端修改后调用此命令保存到 data_dir/nodes.json。
+/// 注意：修改后需要重启应用才能生效。
+/// 参数 relay_nodes 和 bootstrap_nodes 都是 [[peer_id, multiaddr], ...] 格式。
+#[tauri::command]
+async fn save_nodes_config(
+    state: tauri::State<'_, AppData>,
+    relay_nodes: Vec<Vec<String>>,
+    bootstrap_nodes: Vec<Vec<String>>,
+) -> Result<(), String> {
+    let inner = state.inner.read().await;
+    let data_dir = inner.data_dir.clone();
+    drop(inner);
+
+    // 转换 Vec<Vec<String>> 为 Vec<[String; 2]>
+    let relay: Vec<[String; 2]> = relay_nodes
+        .into_iter()
+        .map(|v| {
+            if v.len() != 2 {
+                Err("每个 relay 节点必须包含 peer_id 和 multiaddr".to_string())
+            } else {
+                Ok([v[0].clone(), v[1].clone()])
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let bootstrap: Vec<[String; 2]> = bootstrap_nodes
+        .into_iter()
+        .map(|v| {
+            if v.len() != 2 {
+                Err("每个 bootstrap 节点必须包含 peer_id 和 multiaddr".to_string())
+            } else {
+                Ok([v[0].clone(), v[1].clone()])
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let config = openwire_core::p2p::nodes::NodesConfig {
+        relay_nodes: relay,
+        bootstrap_nodes: bootstrap,
+    };
+
+    config.save(&data_dir).map_err(|e| format!("保存节点配置失败: {}", e))?;
+    tracing::info!("节点配置已更新，重启后生效");
+    Ok(())
+}
+
 #[tauri::command]
 async fn is_keyring_available() -> Result<bool, String> {
     let available = rootcell::identity::PrivateKeyHandle::check_keyring_available();
@@ -1141,8 +1205,11 @@ pub fn run() {
             is_keyring_available,
             check_core_ready,
             delete_contact,
-            delete_message
+            delete_message,
+            get_nodes_config,
+            save_nodes_config
         ])
+
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|apphandle, event| match event {

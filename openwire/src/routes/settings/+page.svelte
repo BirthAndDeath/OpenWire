@@ -29,11 +29,11 @@
     { code: "ja", name: "日本語" },
   ];
 
-  // 主题选项
-  const themes = [
-    { value: "dark", label: "暗色主题" },
-    { value: "light", label: "亮色主题" },
-  ];
+  // 主题选项（使用 $derived 响应语言切换）
+  let themes = $derived([
+    { value: "dark", label: $_("theme_dark") },
+    { value: "light", label: $_("theme_light") },
+  ]);
 
   // 加载状态
   let isLoading = $state(true);
@@ -50,6 +50,27 @@
   // Keyring 可用性（隔离层检查）
   let keyringAvailable = $state(false);
   let keyringCheckDone = $state(false);
+
+  // ============================================================
+  // 节点配置（bootstrap / relay）
+  // ============================================================
+  interface NodeEntry {
+    peerId: string;
+    multiaddr: string;
+  }
+
+  let relayNodes = $state<NodeEntry[]>([]);
+  let bootstrapNodes = $state<NodeEntry[]>([]);
+  let nodesLoaded = $state(false);
+  let nodesChanged = $state(false);
+  let nodesSaving = $state(false);
+  let nodesMessage = $state("");
+
+  // 新增节点输入
+  let newRelayPeerId = $state("");
+  let newRelayAddr = $state("");
+  let newBootstrapPeerId = $state("");
+  let newBootstrapAddr = $state("");
 
   // 等待全局状态初始化完成
   $effect(() => {
@@ -133,12 +154,115 @@
       } catch (e) {
         console.error("获取截屏保护设置失败:", e);
       }
+
+      // 加载节点配置
+      await loadNodesConfig();
     }
 
     if (!isLoading) {
       loadSettings();
     }
   });
+
+  // ============================================================
+  // 节点配置相关函数
+  // ============================================================
+
+  /** 从后端加载节点配置 */
+  async function loadNodesConfig() {
+    try {
+      const jsonStr = await invoke<string>("get_nodes_config");
+      const data = JSON.parse(jsonStr);
+      relayNodes = (data.relay_nodes || []).map((n: [string, string]) => ({
+        peerId: n[0],
+        multiaddr: n[1],
+      }));
+      bootstrapNodes = (data.bootstrap_nodes || []).map((n: [string, string]) => ({
+        peerId: n[0],
+        multiaddr: n[1],
+      }));
+      nodesLoaded = true;
+      nodesChanged = false;
+      console.log(`已加载节点配置: ${relayNodes.length} relay, ${bootstrapNodes.length} bootstrap`);
+    } catch (e) {
+      console.error("加载节点配置失败:", e);
+      nodesLoaded = true;
+    }
+  }
+
+  /** 添加 relay 节点 */
+  function addRelayNode() {
+    const peerId = newRelayPeerId.trim();
+    const addr = newRelayAddr.trim();
+    if (!peerId || !addr) return;
+    // 检查重复
+    if (relayNodes.some(n => n.peerId === peerId && n.multiaddr === addr)) return;
+    relayNodes = [...relayNodes, { peerId, multiaddr: addr }];
+    newRelayPeerId = "";
+    newRelayAddr = "";
+    nodesChanged = true;
+    nodesMessage = "";
+  }
+
+  /** 删除 relay 节点 */
+  function removeRelayNode(index: number) {
+    relayNodes = relayNodes.filter((_, i) => i !== index);
+    nodesChanged = true;
+    nodesMessage = "";
+  }
+
+  /** 添加 bootstrap 节点 */
+  function addBootstrapNode() {
+    const peerId = newBootstrapPeerId.trim();
+    const addr = newBootstrapAddr.trim();
+    if (!peerId || !addr) return;
+    if (bootstrapNodes.some(n => n.peerId === peerId && n.multiaddr === addr)) return;
+    bootstrapNodes = [...bootstrapNodes, { peerId, multiaddr: addr }];
+    newBootstrapPeerId = "";
+    newBootstrapAddr = "";
+    nodesChanged = true;
+    nodesMessage = "";
+  }
+
+  /** 删除 bootstrap 节点 */
+  function removeBootstrapNode(index: number) {
+    bootstrapNodes = bootstrapNodes.filter((_, i) => i !== index);
+    nodesChanged = true;
+    nodesMessage = "";
+  }
+
+  /** 重置为默认节点配置 */
+  async function resetNodesToDefault() {
+    // 先清空
+    relayNodes = [];
+    bootstrapNodes = [];
+    nodesChanged = true;
+    nodesMessage = "";
+    // 直接保存空数组，后端 load 时会自动创建默认配置
+    await saveNodesConfig();
+    // 重新加载（会得到默认配置）
+    await loadNodesConfig();
+  }
+
+  /** 保存节点配置到后端 */
+  async function saveNodesConfig() {
+    nodesSaving = true;
+    nodesMessage = "";
+    try {
+      await invoke("save_nodes_config", {
+        relayNodes: relayNodes.map(n => [n.peerId, n.multiaddr]),
+        bootstrapNodes: bootstrapNodes.map(n => [n.peerId, n.multiaddr]),
+      });
+      nodesChanged = false;
+      nodesMessage = $_("config_saved_restart");
+      console.log("节点配置已保存");
+    } catch (e) {
+      console.error("保存节点配置失败:", e);
+      nodesMessage = $_("config_save_failed") + `: ${e}`;
+    } finally {
+      nodesSaving = false;
+    }
+  }
 
   // 切换语言
   async function changeLanguage(lang: string) {
@@ -309,6 +433,134 @@
             📁 {$_("select_upload_dir")}
           </button>
         </div>
+      </section>
+
+      <!-- ============================================================ -->
+      <!-- 节点配置：Bootstrap + Relay -->
+      <!-- ============================================================ -->
+      <section class="settings-section">
+        <h2>🌐 {$_("node_settings")}</h2>
+        <p class="section-desc">
+          {$_("node_settings_desc")}
+        </p>
+
+        {#if !nodesLoaded}
+          <p class="loading-hint">{$_("loading_nodes")}</p>
+        {:else}
+          <!-- Relay 节点列表 -->
+          <div class="node-group">
+            <h3>🔁 {$_("relay_nodes")}（{relayNodes.length}）</h3>
+            <p class="node-desc">
+              {$_("relay_nodes_desc")}
+            </p>
+
+            <div class="node-list">
+              {#if relayNodes.length === 0}
+                <p class="empty-hint">{$_("no_relay_nodes")}</p>
+              {:else}
+                {#each relayNodes as node, i}
+                  <div class="node-item">
+                    <div class="node-info">
+                      <span class="node-peerid" title={node.peerId}>{node.peerId.slice(0, 20)}...</span>
+                      <span class="node-addr" title={node.multiaddr}>{node.multiaddr}</span>
+                    </div>
+                    <button class="node-remove-btn" onclick={() => removeRelayNode(i)} title={$_("delete")}>✕</button>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+
+            <!-- 新增 relay 节点 -->
+            <div class="node-add-form">
+              <input
+                type="text"
+                placeholder={$_("peer_id_placeholder_relay")}
+                bind:value={newRelayPeerId}
+                class="node-input peerid-input"
+              />
+              <input
+                type="text"
+                placeholder={$_("multiaddr_placeholder_relay")}
+                bind:value={newRelayAddr}
+                class="node-input addr-input"
+              />
+              <button class="node-add-btn" onclick={addRelayNode} disabled={!newRelayPeerId.trim() || !newRelayAddr.trim()}>
+                ➕ {$_("add")}
+              </button>
+            </div>
+          </div>
+
+          <!-- Bootstrap 节点列表 -->
+          <div class="node-group">
+            <h3>🌱 {$_("bootstrap_nodes")}（{bootstrapNodes.length}）</h3>
+            <p class="node-desc">
+              {$_("bootstrap_nodes_desc")}
+            </p>
+
+            <div class="node-list">
+              {#if bootstrapNodes.length === 0}
+                <p class="empty-hint">{$_("no_bootstrap_nodes")}</p>
+              {:else}
+                {#each bootstrapNodes as node, i}
+                  <div class="node-item">
+                    <div class="node-info">
+                      <span class="node-peerid" title={node.peerId}>{node.peerId.slice(0, 20)}...</span>
+                      <span class="node-addr" title={node.multiaddr}>{node.multiaddr}</span>
+                    </div>
+                    <button class="node-remove-btn" onclick={() => removeBootstrapNode(i)} title={$_("delete")}>✕</button>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+
+            <!-- 新增 bootstrap 节点 -->
+            <div class="node-add-form">
+              <input
+                type="text"
+                placeholder={$_("peer_id_placeholder_bootstrap")}
+                bind:value={newBootstrapPeerId}
+                class="node-input peerid-input"
+              />
+              <input
+                type="text"
+                placeholder={$_("multiaddr_placeholder_bootstrap")}
+                bind:value={newBootstrapAddr}
+                class="node-input addr-input"
+              />
+              <button class="node-add-btn" onclick={addBootstrapNode} disabled={!newBootstrapPeerId.trim() || !newBootstrapAddr.trim()}>
+                ➕ {$_("add")}
+              </button>
+            </div>
+          </div>
+
+          <!-- 操作按钮 -->
+          <div class="node-actions">
+            <button
+              class="save-btn"
+              onclick={saveNodesConfig}
+              disabled={!nodesChanged || nodesSaving}
+            >
+              {nodesSaving ? $_("saving") : "💾 " + $_("save_config")}
+            </button>
+            <button class="reset-btn" onclick={resetNodesToDefault}>
+              🔄 {$_("reset_default")}
+            </button>
+          </div>
+
+          <!-- 提示消息 -->
+          {#if nodesMessage}
+            <div class="node-message" class:success={nodesMessage.startsWith("✅")} class:error={nodesMessage.startsWith("❌")}>
+              {nodesMessage}
+            </div>
+          {/if}
+
+          <!-- 重启提示 -->
+          {#if nodesChanged}
+            <div class="restart-hint">
+              {$_("restart_hint")}
+            </div>
+          {/if}
+        {/if}
       </section>
 
       <!-- 密码设置（仅 Keyring 不可用时显示） -->
@@ -606,5 +858,236 @@
   .keyring-icon {
     font-size: 20px;
     flex-shrink: 0;
+  }
+
+  /* ============================================================ */
+  /* 节点配置样式 */
+  /* ============================================================ */
+
+  .node-group {
+    margin-bottom: 24px;
+    padding: 16px;
+    background: var(--bg-secondary, #0a0a0a);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 8px;
+  }
+
+  .node-group h3 {
+    margin: 0 0 4px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary, #fafafa);
+  }
+
+  .node-desc {
+    margin: 0 0 12px 0;
+    font-size: 12px;
+    color: var(--text-secondary, #737373);
+    line-height: 1.4;
+  }
+
+  .node-list {
+    margin-bottom: 12px;
+  }
+
+  .node-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    margin-bottom: 4px;
+    background: var(--bg-tertiary, #1a1a1a);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  .node-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .node-peerid {
+    color: var(--text-primary, #fafafa);
+    font-family: monospace;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .node-addr {
+    color: var(--text-secondary, #737373);
+    font-family: monospace;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .node-remove-btn {
+    background: transparent;
+    border: none;
+    color: #ef4444;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    transition: all 0.2s;
+  }
+
+  .node-remove-btn:hover {
+    background: rgba(239, 68, 68, 0.15);
+  }
+
+  .node-add-form {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .node-input {
+    flex: 1;
+    min-width: 120px;
+    background: var(--bg-secondary, #0a0a0a);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--text-primary, #fafafa);
+    font-size: 12px;
+    font-family: monospace;
+    transition: border-color 0.2s;
+  }
+
+  .node-input:focus {
+    outline: none;
+    border-color: #3b82f6;
+  }
+
+  .node-input::placeholder {
+    color: var(--text-secondary, #555);
+    font-family: system-ui;
+  }
+
+  .peerid-input {
+    flex: 1.5;
+  }
+
+  .addr-input {
+    flex: 2;
+  }
+
+  .node-add-btn {
+    background: transparent;
+    border: 1px solid #3b82f6;
+    border-radius: 4px;
+    padding: 6px 12px;
+    color: #3b82f6;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+
+  .node-add-btn:hover:not(:disabled) {
+    background: rgba(59, 130, 246, 0.15);
+  }
+
+  .node-add-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .empty-hint {
+    color: var(--text-secondary, #555);
+    font-size: 12px;
+    font-style: italic;
+    padding: 8px 0;
+  }
+
+  .loading-hint {
+    color: var(--text-secondary, #737373);
+    font-size: 13px;
+    text-align: center;
+    padding: 20px;
+  }
+
+  .node-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 16px;
+  }
+
+  .save-btn {
+    background: #3b82f6;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 20px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+  }
+
+  .save-btn:hover:not(:disabled) {
+    background: #2563eb;
+  }
+
+  .save-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .reset-btn {
+    background: transparent;
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 6px;
+    padding: 10px 20px;
+    color: var(--text-primary, #fafafa);
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+  }
+
+  .reset-btn:hover {
+    border-color: #f59e0b;
+    color: #f59e0b;
+  }
+
+  .node-message {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  .node-message.success {
+    background: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.2);
+    color: #10b981;
+  }
+
+  .node-message.error {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+  }
+
+  .restart-hint {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    line-height: 1.4;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
   }
 </style>
