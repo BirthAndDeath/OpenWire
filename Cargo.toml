@@ -24,7 +24,6 @@ libp2p = { version = "0.56.0", features = [
     "tcp",
     "noise",
     "yamux",
-    "upnp",
 ] }
 tracing = "0.1.44"
 [profile.dev]

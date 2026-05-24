@@ -146,12 +146,11 @@ impl ChatCore {
 
         // 首次发送成功后标记为已发送，避免 retry 时重复发送
         // 注意：retry 路径（is_retry=true）由 retry_pending_messages 负责调用 mark_sent
-        if !is_retry {
-            if let Some(pool) = storage::pool() {
-                if let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await {
-                    tracing::warn!("标记消息 {}.. 为已发送失败: {}", &message_hash[..16], e);
-                }
-            }
+        if !is_retry
+            && let Some(pool) = storage::pool()
+            && let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await
+        {
+            tracing::warn!("标记消息 {}.. 为已发送失败: {}", &message_hash[..16], e);
         }
 
         Ok(message_hash)
@@ -196,11 +195,12 @@ impl ChatCore {
                 tracing::info!("Found ML-KEM pubkey for {} via DHT local DB", pubkey_short);
                 // 后台异步发起 DHT 网络查询以验证公钥是否最新
                 let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-                let _ = self.p2p_handle.send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+                let _ = self
+                    .p2p_handle
+                    .send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
                         key: mlkem_key,
-                    }),
-                ).await;
+                    }))
+                    .await;
                 return hex::decode(&mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
             }
             _ => {
@@ -224,10 +224,7 @@ impl ChatCore {
                     return Ok(pubkey);
                 }
                 Ok(Some(_)) => {
-                    tracing::debug!(
-                        "ML-KEM pubkey in contacts DB is empty for {}",
-                        pubkey_short
-                    );
+                    tracing::debug!("ML-KEM pubkey in contacts DB is empty for {}", pubkey_short);
                 }
                 Ok(None) => {
                     tracing::info!(
@@ -258,11 +255,12 @@ impl ChatCore {
             tracing::debug!("lookup_mlkem_pubkey: is_retry=true, 跳过 save_pending_message");
         }
         let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-        let _ = self.p2p_handle.send(
-            crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+        let _ = self
+            .p2p_handle
+            .send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
                 key: mlkem_key,
-            }),
-        ).await;
+            }))
+            .await;
         Err(CoreError::MlKemKeyNotCached(format!(
             "联系人 {} 的 ML-KEM 公钥未缓存，消息已保存到离线队列，后台正在通过 DHT 网络查询",
             pubkey_short
@@ -587,11 +585,14 @@ impl ChatCore {
         // === 步骤 4：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
         // 查询结果会通过 P2pEvent::GetProvidersResult 事件处理
         // 自动缓存到本地数据库，并触发 retry_pending_messages 重试待发送消息
-        let _ = self.p2p_handle.send(
-            crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
-                key: mldsa_pubkey_hex.to_string(),
-            }),
-        ).await;
+        let _ = self
+            .p2p_handle
+            .send(crate::actor::ActorCommand::Custom(
+                P2pCommand::GetProviders {
+                    key: mldsa_pubkey_hex.to_string(),
+                },
+            ))
+            .await;
 
         tracing::debug!(
             "dht_lookup_peerid: 本地未找到 {}..，已发起非阻塞 GetProviders 查询",

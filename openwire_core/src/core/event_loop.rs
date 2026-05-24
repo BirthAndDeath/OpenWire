@@ -135,12 +135,15 @@ impl ChatCore {
                 // 处理 NetEvent 请求
                 tracing::info!("收到 NetEvent 请求: peer={}, request={:?}", peer, request);
                 // 简单响应确认（通过 P2pActor 发送 NetEvent 响应）
-                let _ = self.p2p_handle.send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::SendNetEventResponse {
-                        channel,
-                        response: crate::p2p::netevent::NetEventResponse::Ack,
-                    }),
-                ).await;
+                let _ = self
+                    .p2p_handle
+                    .send(crate::actor::ActorCommand::Custom(
+                        P2pCommand::SendNetEventResponse {
+                            channel,
+                            response: crate::p2p::netevent::NetEventResponse::Ack,
+                        },
+                    ))
+                    .await;
             }
             P2pEvent::ConnectionEstablished { peer_id } => {
                 tracing::info!("Connection established with {}", peer_id);
@@ -154,11 +157,14 @@ impl ChatCore {
                         }
                         _ => {
                             // 如果本地 DHT 没有缓存，发起 GetProviders 查询
-                            let _ = self.p2p_handle.send(
-                                crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
-                                    key: peer_id.to_string(),
-                                }),
-                            ).await;
+                            let _ = self
+                                .p2p_handle
+                                .send(crate::actor::ActorCommand::Custom(
+                                    P2pCommand::GetProviders {
+                                        key: peer_id.to_string(),
+                                    },
+                                ))
+                                .await;
                         }
                     }
                 }
@@ -178,12 +184,12 @@ impl ChatCore {
             }
             P2pEvent::MdnsDiscovered { peer_id, addr } => {
                 tracing::info!("mDNS discovered: {} at {}", peer_id, addr);
-                let _ = self.p2p_handle.send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress {
-                        peer_id,
-                        addr,
-                    }),
-                ).await;
+                let _ = self
+                    .p2p_handle
+                    .send(crate::actor::ActorCommand::Custom(
+                        P2pCommand::AddKademliaAddress { peer_id, addr },
+                    ))
+                    .await;
             }
             P2pEvent::MdnsExpired { peer_id } => {
                 tracing::info!("mDNS expired: {}", peer_id);
@@ -193,12 +199,12 @@ impl ChatCore {
                 listen_addrs,
             } => {
                 for addr in listen_addrs {
-                    let _ = self.p2p_handle.send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress {
-                            peer_id,
-                            addr,
-                        }),
-                    ).await;
+                    let _ = self
+                        .p2p_handle
+                        .send(crate::actor::ActorCommand::Custom(
+                            P2pCommand::AddKademliaAddress { peer_id, addr },
+                        ))
+                        .await;
                 }
             }
             P2pEvent::GetProvidersResult { key, providers } => {
@@ -216,11 +222,12 @@ impl ChatCore {
                 }
                 // 如果有 provider，尝试拨号连接
                 if let Some(peer_id) = providers.first() {
-                    let _ = self.p2p_handle.send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::Dial {
+                    let _ = self
+                        .p2p_handle
+                        .send(crate::actor::ActorCommand::Custom(P2pCommand::Dial {
                             peer_id: *peer_id,
-                        }),
-                    ).await;
+                        }))
+                        .await;
                 }
                 // 如果已连接的 PeerID 现在有了公钥映射，刷新在线状态
                 // 这解决了 ConnectionEstablished 触发时 peerid_to_pubkey 尚未建立映射
@@ -239,13 +246,13 @@ impl ChatCore {
                     value.len()
                 );
                 // 缓存到本地 DHT 数据库
-                if let Ok(store) = self.get_dht_store() {
-                    if key.starts_with("mlkem:") {
-                        let pubkey_hex = key.strip_prefix("mlkem:").unwrap_or("");
-                        if !pubkey_hex.is_empty() {
-                            let mlkem_hex = String::from_utf8_lossy(&value);
-                            let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
-                        }
+                if let Ok(store) = self.get_dht_store()
+                    && key.starts_with("mlkem:")
+                {
+                    let pubkey_hex = key.strip_prefix("mlkem:").unwrap_or("");
+                    if !pubkey_hex.is_empty() {
+                        let mlkem_hex = String::from_utf8_lossy(&value);
+                        let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
                     }
                 }
             }

@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod identity;
 mod log;
+pub use vstd::prelude::*;
 pub mod message;
 pub mod p2p;
 pub mod signature;

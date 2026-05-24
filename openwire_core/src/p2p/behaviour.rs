@@ -3,7 +3,7 @@ use crate::{ChatMessage, ChatResponse};
 use libp2p::kad::{self};
 use libp2p::request_response::cbor;
 
-use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour, upnp};
+use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour};
 
 /// libp2p 网络行为组合
 ///
