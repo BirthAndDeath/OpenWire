@@ -5,7 +5,7 @@ resolver = "3"
 [workspace.dependencies]
 rootcell = { path = "rootcell" }
 openwire_core = { path = "openwire_core" }
-tokio = { version = "1.52.1", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 libp2p = { version = "0.56.0", features = [
     "dns",
     "tokio",
