@@ -9,7 +9,7 @@ default = []
 
 [dependencies]
 # 安全内存
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
 
 # 错误处理
 anyhow = "1.0"

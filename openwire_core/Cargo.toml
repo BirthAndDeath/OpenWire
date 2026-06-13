@@ -29,12 +29,12 @@ rand = "0.10.1"
 lru = "0.18.0"
 
 redb = "4.1.0"
-zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 async-compression = { version = "0.4.42", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 keyring = { version = "4.0.1" }
 async-trait = "0.1.89"
-vstd = "0.0.0-2026-05-24-0157"
+vstd = "0.0.0-2026-05-31-0205"
 
 [dev-dependencies]
 serde_json = "1"
