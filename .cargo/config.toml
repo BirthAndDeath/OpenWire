@@ -1,5 +1,5 @@
-[source.crates-io]
-replace-with = "ustc"
+#[source.crates-io]
+#replace-with = "ustc"
 
 [source.ustc]
 registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
@@ -14,6 +14,6 @@ registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
 [env]
 AWS_LC_SYS_PREBUILT_NASM = "1"
 [build]
-[target.'cfg(target_os = "linux")']
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#[target.'cfg(target_os = "linux")']
+#linker = "clang"
+#rustflags = ["-C", "link-arg=-fuse-ld=lld"]
