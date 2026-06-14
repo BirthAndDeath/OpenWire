@@ -147,7 +147,9 @@ impl ChatCore {
         let peer_id = keypair.public().to_peer_id();
 
         let dht_db = self.dht_db.clone().unwrap();
-        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let bootstrap_nodes: Vec<(String, String)> = Vec::new();
+        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to reinitialize swarm: {e}");
@@ -158,7 +160,6 @@ impl ChatCore {
         };
 
         // 5. 更新 ChatCore 字段
-        self.swarm = swarm;
         self.identity_keypair = keypair;
         self.mldsa_pubkey_hex = Some(mldsa_pubkey_hex.clone());
         self.current_peer_id = Some(peer_id);
@@ -167,7 +168,23 @@ impl ChatCore {
         self.mlkem_decap_key = Some(mlkem_decap_key);
         self.mldsa_private_key = Some(Zeroizing::new(mldsa_handle.get_private_key().to_vec()));
 
-        // 6. 立即发布新身份到 DHT
+        // 6. 重新创建 P2pActor（使用新的 swarm）
+        let (p2p_event_tx, p2p_event_rx) = tokio::sync::mpsc::channel(super::CHANNEL_CAPACITY);
+        let p2p_actor = crate::actor::p2p::P2pActor::new(
+            swarm,
+            self.dht_db.clone(),
+            self.data_dir.clone(),
+            p2p_event_tx,
+        );
+        let p2p_handle = crate::actor::p2p::start_p2p_actor(
+            p2p_actor,
+            super::CHANNEL_CAPACITY,
+            self.core_handle.shutdown_token.clone(),
+        );
+        self.p2p_handle = p2p_handle;
+        self.rx_p2p_event = p2p_event_rx;
+
+        // 7. 立即发布新身份到 DHT
         if let Ok(store) = self.get_dht_store() {
             let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
             let _ = store.set_mlkem_pubkey(&mldsa_pubkey_hex, &mlkem_pubkey_hex);
@@ -196,7 +213,7 @@ impl ChatCore {
                     }
 
                     // 发布空记录到 Kademlia 网络（墓碑记录）
-                    self.publish_tombstone_records(&identity_id);
+                    self.publish_tombstone_records(&identity_id).await;
 
                     // 如果删除的是当前身份，重置字段
                     if self.mldsa_identity_id.as_deref() == Some(&identity_id) {
@@ -237,14 +254,33 @@ impl ChatCore {
     /// 重新初始化 swarm（生成新 PeerID）
     fn reinitialize_swarm(&mut self) {
         let dht_db = self.dht_db.clone().unwrap();
+        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let bootstrap_nodes: Vec<(String, String)> = Vec::new();
         match identity::generate_temporary_peerid() {
             Ok(keypair) => {
                 let peer_id = keypair.public().to_peer_id();
-                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db) {
+                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
                     Ok(swarm) => {
-                        self.swarm = swarm;
                         self.identity_keypair = keypair;
                         self.current_peer_id = Some(peer_id);
+
+                        // 重新创建 P2pActor（使用新的 swarm）
+                        let (p2p_event_tx, p2p_event_rx) =
+                            tokio::sync::mpsc::channel(super::CHANNEL_CAPACITY);
+                        let p2p_actor = crate::actor::p2p::P2pActor::new(
+                            swarm,
+                            self.dht_db.clone(),
+                            self.data_dir.clone(),
+                            p2p_event_tx,
+                        );
+                        let p2p_handle = crate::actor::p2p::start_p2p_actor(
+                            p2p_actor,
+                            super::CHANNEL_CAPACITY,
+                            self.core_handle.shutdown_token.clone(),
+                        );
+                        self.p2p_handle = p2p_handle;
+                        self.rx_p2p_event = p2p_event_rx;
+
                         tracing::info!("Swarm reinitialized, PeerID={}", peer_id);
                     }
                     Err(e) => {
@@ -259,25 +295,16 @@ impl ChatCore {
     }
 
     /// 发布空记录到 Kademlia 网络（墓碑记录）
-    fn publish_tombstone_records(&mut self, identity_id: &str) {
-        let peerid_key = format!("peerid:{}", identity_id);
-        let mlkem_key = format!("mlkem:{}", identity_id);
-        let empty_record = |key: String| libp2p::kad::Record {
-            key: libp2p::kad::RecordKey::new(&key),
-            value: Vec::new(),
-            publisher: None,
-            expires: None,
-        };
-        let _ = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .put_record(empty_record(peerid_key), libp2p::kad::Quorum::One);
-        let _ = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .put_record(empty_record(mlkem_key), libp2p::kad::Quorum::One);
+    async fn publish_tombstone_records(&mut self, identity_id: &str) {
+        // 通过 P2pActor 发布墓碑记录（空 ML-KEM 公钥表示删除）
+        let _ = self.p2p_handle.send(
+            crate::actor::ActorCommand::Custom(
+                crate::actor::p2p::P2pCommand::PublishIdentity {
+                    mldsa_pubkey_hex: identity_id.to_string(),
+                    mlkem_pubkey_hex: String::new(),
+                },
+            ),
+        ).await;
         tracing::info!(
             "Published tombstone records to DHT network for deleted identity: {}",
             &identity_id[..16]

@@ -589,32 +589,29 @@ impl RecordStore for RedbRecordStore {
                     let data = value.value();
                     if let Ok(providers) = postcard::from_bytes::<Vec<StoredProvider>>(data) {
                         for stored in providers {
-                            if !Self::is_expired(stored.expires) {
-                                if let Ok(provider) = stored.provider.parse() {
-                                    let expires = stored.expires.map(|exp| {
-                                        Instant::now()
-                                            + Duration::from_secs(
-                                                exp.saturating_sub(Self::now_unix()),
-                                            )
-                                    });
-                                    // 从 PEER_MULTIADDRS_TABLE 获取该 provider 的地址
-                                    let addresses =
-                                        self.get_multiaddrs(&provider).unwrap_or_default();
+                            if !Self::is_expired(stored.expires)
+                                && let Ok(provider) = stored.provider.parse()
+                            {
+                                let expires = stored.expires.map(|exp| {
+                                    Instant::now()
+                                        + Duration::from_secs(exp.saturating_sub(Self::now_unix()))
+                                });
+                                // 从 PEER_MULTIADDRS_TABLE 获取该 provider 的地址
+                                let addresses = self.get_multiaddrs(&provider).unwrap_or_default();
 
-                                    provided_records.push(Cow::Owned(ProviderRecord {
-                                        key: RecordKey::from(key_str.as_bytes().to_vec()),
-                                        provider,
-                                        expires,
-                                        addresses,
-                                    }));
+                                provided_records.push(Cow::Owned(ProviderRecord {
+                                    key: RecordKey::from(key_str.as_bytes().to_vec()),
+                                    provider,
+                                    expires,
+                                    addresses,
+                                }));
 
-                                    // 性能优化：限制返回记录数量
-                                    if provided_records.len() >= 5_000 {
-                                        tracing::warn!(
-                                            "DHT provided() 返回超过5,000条记录，可能影响性能"
-                                        );
-                                        break;
-                                    }
+                                // 性能优化：限制返回记录数量
+                                if provided_records.len() >= 5_000 {
+                                    tracing::warn!(
+                                        "DHT provided() 返回超过5,000条记录，可能影响性能"
+                                    );
+                                    break;
                                 }
                             }
                         }

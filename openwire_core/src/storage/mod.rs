@@ -5,8 +5,9 @@ mod migrations;
 mod stats;
 
 pub use contact::{
-    Contact, delete_contact, get_contact_by_mldsa_pubkey, get_contact_mlkem_pubkey,
-    is_contact_exists, list_contacts, update_contact_mlkem_pubkey, upsert_contact,
+    Contact, clear_all_mlkem_pubkeys, delete_contact, get_contact_by_mldsa_pubkey,
+    get_contact_mlkem_pubkey, is_contact_exists, list_contacts, update_contact_mlkem_pubkey,
+    upsert_contact,
 };
 pub use identity::{
     Identity, add_identity, delete_identity, get_current_identity, init, init_path,

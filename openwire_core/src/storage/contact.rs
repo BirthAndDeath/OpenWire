@@ -136,3 +136,20 @@ pub async fn list_contacts(
     .await
     .map_err(Into::into)
 }
+
+/// 清理所有联系人的 ML-KEM 公钥（启动时调用）
+///
+/// 每次启动都会生成新的临时 ML-KEM 密钥对，旧的 ML-KEM 公钥已失效。
+/// 如果不清理，lookup_mlkem_pubkey 在 DHT 本地数据库未命中时会回退到
+/// contacts 表获取过时的公钥，导致加密消息后接收方解密失败。
+///
+/// 注意：此函数会清空所有联系人的 mlkem_public_key 字段，但保留联系人本身。
+/// 新的 ML-KEM 公钥会在收到对方消息时通过 handle_incoming_request 自动更新，
+/// 或通过 DHT 网络查询（GetRecord）获取。
+pub async fn clear_all_mlkem_pubkeys(pool: &Pool<Sqlite>) -> StorageResult<u64> {
+    let rows = sqlx::query("UPDATE contacts SET mlkem_public_key = NULL")
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(rows)
+}

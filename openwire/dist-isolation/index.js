@@ -14,8 +14,10 @@ const ALLOWED_COMMANDS = new Set([
     'load_messages', 'get_identity_qr_data',
     'check_core_ready',
     'is_keyring_available', 'set_password', 'retry_init',
+    'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'plugin:window|set_content_protected'
 ]);
+
 
 const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|', 'plugin:path|'];
 
@@ -195,7 +197,31 @@ const VALIDATORS = {
         return null;
     },
     retry_init: () => null,
+    get_nodes_config: () => null,
+    reset_nodes_config: () => null,
+    save_nodes_config: (p) => {
+        if (!Array.isArray(p.relayNodes)) return 'relayNodes must be an array';
+        if (!Array.isArray(p.bootstrapNodes)) return 'bootstrapNodes must be an array';
+        for (const node of p.relayNodes) {
+            if (!Array.isArray(node) || node.length !== 2 || typeof node[0] !== 'string' || typeof node[1] !== 'string') {
+                return 'Each relay node must be [peer_id, multiaddr]';
+            }
+            if (node[0].length > 256) return 'relay node peer_id too long';
+            if (node[1].length > 1024) return 'relay node multiaddr too long';
+        }
+        for (const node of p.bootstrapNodes) {
+            if (!Array.isArray(node) || node.length !== 2 || typeof node[0] !== 'string' || typeof node[1] !== 'string') {
+                return 'Each bootstrap node must be [peer_id, multiaddr]';
+            }
+            if (node[0].length > 256) return 'bootstrap node peer_id too long';
+            if (node[1].length > 1024) return 'bootstrap node multiaddr too long';
+        }
+        if (p.relayNodes.length > 50) return 'Too many relay nodes (max 50)';
+        if (p.bootstrapNodes.length > 50) return 'Too many bootstrap nodes (max 50)';
+        return null;
+    },
 };
+
 
 // ============================================================
 // Main hook

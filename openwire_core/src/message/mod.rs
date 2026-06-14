@@ -72,10 +72,7 @@ impl ChatResponse {
 
         let hash = Self::compute_hash(timestamp, &nonce);
         let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
-            crate::error::MessageError::SignFailed(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )))
+            crate::error::MessageError::SignFailed(Box::new(std::io::Error::other(e.to_string())))
         })?;
 
         Ok(Self {
@@ -91,8 +88,7 @@ impl ChatResponse {
         let hash = Self::compute_hash(self.timestamp, &self.nonce);
         crate::signature::verify_signature(&self.sender_public_key, &hash, &self.signature).map_err(
             |e| {
-                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::other(
                     e.to_string(),
                 )))
             },
@@ -144,10 +140,7 @@ impl ChatMessage {
 
         // 使用 ML-DSA 签名
         let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
-            crate::error::MessageError::SignFailed(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )))
+            crate::error::MessageError::SignFailed(Box::new(std::io::Error::other(e.to_string())))
         })?;
 
         Ok(Self {
@@ -186,8 +179,7 @@ impl ChatMessage {
         // 3. 验证 ML-DSA 签名
         crate::signature::verify_signature(&self.sender_public_key, &computed, &self.signature)
             .map_err(|e| {
-                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::other(
                     e.to_string(),
                 )))
             })
