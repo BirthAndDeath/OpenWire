@@ -27,6 +27,7 @@ pub fn handle_friend_online(
             mldsa_pubkey_hex,
             peer_id,
             listen_addrs,
+            mlkem_pubkey_hex: _,
         } => (mldsa_pubkey_hex, peer_id, listen_addrs),
     };
 
@@ -95,10 +96,12 @@ pub fn build_friend_online_request(
     mldsa_pubkey_hex: &str,
     peer_id: &PeerId,
     listen_addrs: &[libp2p::Multiaddr],
+    mlkem_pubkey_hex: &str,
 ) -> NetEventRequest {
     NetEventRequest::FriendOnline {
         mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
         peer_id: peer_id.to_string(),
         listen_addrs: listen_addrs.iter().map(|a| a.to_string()).collect(),
+        mlkem_pubkey_hex: mlkem_pubkey_hex.to_string(),
     }
 }

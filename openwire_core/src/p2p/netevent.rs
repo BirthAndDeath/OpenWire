@@ -28,6 +28,8 @@ pub enum NetEventRequest {
         peer_id: String,
         /// 发送者的监听地址列表
         listen_addrs: Vec<String>,
+        /// 发送者的当前 ML-KEM 公钥 hex（随通知直接传递，无需 DHT 查询）
+        mlkem_pubkey_hex: String,
     },
 }
 

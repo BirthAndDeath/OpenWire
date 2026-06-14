@@ -222,6 +222,9 @@ struct MessageDto {
 async fn load_messages(
     mldsa_pubkey_hex: &str,
     before: Option<i64>,
+    before_id: Option<i64>,
+    after: Option<i64>,
+    after_id: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<MessageDto>, String> {
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
@@ -233,11 +236,14 @@ async fn load_messages(
         }
         Err(e) => return Err(format!("获取当前身份失败: {}", e)),
     };
-    let msgs = storage::get_messages(
+    let msgs = storage::get_messages_range(
         pool,
         &owner_identity_id,
         mldsa_pubkey_hex,
         before,
+        before_id,
+        after,
+        after_id,
         limit.unwrap_or(50),
     )
     .await

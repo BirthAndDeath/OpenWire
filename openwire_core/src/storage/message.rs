@@ -102,18 +102,49 @@ pub async fn get_messages(
     before: Option<i64>,
     limit: i64,
 ) -> StorageResult<Vec<Message>> {
-    // 限制最大查询数量防止DoS
-    let limit = limit.min(1000);
+    get_messages_range(
+        pool,
+        owner_identity_id,
+        peer_pubkey_hex,
+        before,
+        None,
+        None,
+        None,
+        limit,
+    )
+    .await
+}
+
+/// 双向游标分页：before → 加载更旧消息；after → 加载更新消息。
+/// 使用 (ts, id) 复合游标确保同一秒内多条消息也能准确定位。
+pub async fn get_messages_range(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
+    before_ts: Option<i64>,
+    before_id: Option<i64>,
+    after_ts: Option<i64>,
+    after_id: Option<i64>,
+    limit: i64,
+) -> StorageResult<Vec<Message>> {
+    let limit = limit.min(200);
 
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages
-          WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 AND (?3 IS NULL OR ts < ?3)
-          ORDER BY ts DESC LIMIT ?4"#,
+          WHERE owner_identity_id = ?1
+            AND peer_pubkey_hex = ?2
+            AND (?3 IS NULL OR ts < ?3 OR (ts = ?3 AND ?4 IS NOT NULL AND id < ?4))
+            AND (?5 IS NULL OR ts > ?5 OR (ts = ?5 AND ?6 IS NOT NULL AND id > ?6))
+          ORDER BY ts DESC, id DESC
+          LIMIT ?7"#,
     )
     .bind(owner_identity_id)
     .bind(peer_pubkey_hex)
-    .bind(before)
+    .bind(before_ts)
+    .bind(before_id)
+    .bind(after_ts)
+    .bind(after_id)
     .bind(limit)
     .fetch_all(pool)
     .await

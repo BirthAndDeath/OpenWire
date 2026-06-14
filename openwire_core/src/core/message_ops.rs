@@ -144,14 +144,10 @@ impl ChatCore {
         // 发送消息到网络
         self.send_message(recipient_peer_id, message).await;
 
-        // 首次发送成功后标记为已发送，避免 retry 时重复发送
-        // 注意：retry 路径（is_retry=true）由 retry_pending_messages 负责调用 mark_sent
-        if !is_retry
-            && let Some(pool) = storage::pool()
-            && let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await
-        {
-            tracing::warn!("标记消息 {}.. 为已发送失败: {}", &message_hash[..16], e);
-        }
+        // 不再立即标记为已发送。消息保持 pending 状态，
+        // 由对方发回的 DeliveryReceipt 送达回执标记为已送达。
+        // 如果网络发送失败，retry_pending_messages 会重试。
+        // retry 路径（is_retry=true）由 retry_pending_messages 自行 mark_sent。
 
         Ok(message_hash)
     }

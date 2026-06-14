@@ -50,21 +50,85 @@
     // 已加载的消息 ID 集合，用于去重
     let loadedMsgIds = $state<Set<string>>(new Set());
 
-    // 当 contactId 变化时，加载历史消息
+    // ========== 双向懒加载状态 ==========
+    let loading = $state(false);
+    let hasMoreOlder = $state(true);  // 是否还有更早的历史消息可加载
+    const PAGE_SIZE = 50;
+    const LOAD_THRESHOLD = 200;       // 滚动到距顶部多少 px 时触发加载
+    // (ts, id) 游标边界，记录已加载消息的时间范围
+    // ts 以秒为单位（与数据库格式一致）
+    let oldestCursor = $state<{ ts: number; id: number } | null>(null);
+
+    // 当 contactId 变化时，重新初始化
     $effect(() => {
         const cid = contactId;
         if (!cid) {
             msgs = [];
             loadedMsgIds = new Set();
+            hasMoreOlder = true;
+            oldestCursor = null;
             return;
         }
-        loadHistory(cid);
+        loadLatest(cid);
     });
 
-    // 从数据库加载历史消息
-    async function loadHistory(peerId: string) {
+    // ---------- 消息加载 ----------
+
+    // 将后端消息行转换为前端 Msg 格式
+    function parseBackend(m: {
+        id: number;
+        mldsa_pubkey_hex: string;
+        content: string;
+        is_outgoing: boolean;
+        ts: number;
+        pending: number;
+    }): Msg {
+        // 尝试解析 file_hash 消息
+        let type: Msg["type"] = "text";
+        let file_hash_info: Msg["file_hash_info"] = undefined;
         try {
-            const history: {
+            const parsed = JSON.parse(m.content);
+            if (parsed.file_hash && parsed.filename !== undefined) {
+                type = "file_hash";
+                file_hash_info = {
+                    filename: parsed.filename,
+                    total_size: parsed.total_size || 0,
+                    file_hash: parsed.file_hash,
+                    file_id: parsed.file_id || parsed.file_hash,
+                };
+            }
+        } catch {
+            // 不是 JSON，保持 text 类型
+        }
+        return {
+            id: `hist-${m.id}`,
+            content:
+                type === "file_hash"
+                    ? `[文件] ${file_hash_info!.filename} (${formatFileSize(file_hash_info!.total_size)})`
+                    : m.content,
+            ts: m.ts * 1000,
+            me: m.is_outgoing,
+            type,
+            file_hash_info,
+            mldsa_pubkey_hex: m.mldsa_pubkey_hex,
+            pending: m.pending === 1 ? true : undefined,
+        };
+    }
+
+    // 从后端提取数字 id（去掉 "hist-" 前缀）
+    function extractNumericId(msgId: string): number {
+        if (msgId.startsWith("hist-")) {
+            return parseInt(msgId.slice(5), 10);
+        }
+        // 实时消息没有 "hist-" 前缀，返回 NaN
+        return NaN;
+    }
+
+    // 初始加载：获取最新消息
+    async function loadLatest(peerId: string) {
+        loading = true;
+        try {
+            const raw: {
                 id: number;
                 mldsa_pubkey_hex: string;
                 content: string;
@@ -73,53 +137,95 @@
                 pending: number;
             }[] = await invoke("load_messages", {
                 mldsaPubkeyHex: peerId,
-                before: null,
-                limit: 50,
+                limit: PAGE_SIZE,
             });
             // 反转顺序（数据库按时间倒序，前端需要正序）
-            const loaded: Msg[] = history.reverse().map((m) => {
-                // 尝试解析 file_hash 消息
-                let type: Msg["type"] = "text";
-                let file_hash_info: Msg["file_hash_info"] = undefined;
-                try {
-                    const parsed = JSON.parse(m.content);
-                    if (parsed.file_hash && parsed.filename !== undefined) {
-                        type = "file_hash";
-                        file_hash_info = {
-                            filename: parsed.filename,
-                            total_size: parsed.total_size || 0,
-                            file_hash: parsed.file_hash,
-                            file_id: parsed.file_id || parsed.file_hash,
-                        };
-                    }
-                } catch {
-                    // 不是 JSON，保持 text 类型
-                }
-                return {
-                    id: `hist-${m.id}`,
-                    content:
-                        type === "file_hash"
-                            ? `[文件] ${file_hash_info!.filename} (${formatFileSize(file_hash_info!.total_size)})`
-                            : m.content,
-                    ts: m.ts * 1000,
-                    me: m.is_outgoing,
-                    type,
-                    file_hash_info,
-                    mldsa_pubkey_hex: m.mldsa_pubkey_hex,
-                    // pending=1 表示待发送，pending=0 表示已送达
-                    pending: m.pending === 1 ? true : undefined,
-                };
-            });
+            const loaded = raw.reverse().map(parseBackend);
             const ids = new Set(loaded.map((m) => m.id));
             msgs = loaded;
             loadedMsgIds = ids;
-            tick().then(() =>
-                vlist?.scrollToIndex(msgs.length - 1, { smooth: false }),
-            );
+            // 如果返回数量 < limit，说明没有更早的消息了
+            hasMoreOlder = raw.length >= PAGE_SIZE;
+            // 更新游标
+            if (loaded.length > 0) {
+                const id0 = extractNumericId(loaded[0].id);
+                oldestCursor = { ts: Math.floor(loaded[0].ts / 1000), id: isNaN(id0) ? 0 : id0 };
+            } else {
+                oldestCursor = null;
+                hasMoreOlder = false;
+            }
+            // 滚动到底部
+            await tick();
+            vlist?.scrollToIndex(msgs.length - 1, { smooth: false });
         } catch (e) {
-            console.error("加载历史消息失败:", e);
+            console.error("加载消息失败:", e);
+        } finally {
+            loading = false;
         }
     }
+
+    // 加载更早的消息（上向翻页 —— 用户向上滚动触顶时调用）
+    async function loadOlder() {
+        if (loading || !hasMoreOlder || msgs.length === 0 || !contactId || !oldestCursor) return;
+        loading = true;
+        // 记录当前滚动偏移，用于 prepend 后恢复
+        const scrollPos = vlist?.scrollTop ?? 0;
+        try {
+            const raw: {
+                id: number;
+                mldsa_pubkey_hex: string;
+                content: string;
+                is_outgoing: boolean;
+                ts: number;
+                pending: number;
+            }[] = await invoke("load_messages", {
+                mldsaPubkeyHex: contactId,
+                before: oldestCursor.ts,
+                beforeId: oldestCursor.id,
+                limit: PAGE_SIZE,
+            });
+            if (raw.length < PAGE_SIZE) hasMoreOlder = false;
+            if (raw.length === 0) return;
+            // 解析、反转（DESC → ASC）、去重
+            const parsed = raw.reverse().map(parseBackend);
+            const newOnes = parsed.filter((m) => !loadedMsgIds.has(m.id));
+            if (newOnes.length === 0) {
+                hasMoreOlder = false; // 剩余的都是重复内容，说明已到尽头
+                return;
+            }
+            // 更新游标（新加载消息中最旧的那条）
+            const firstNew = newOnes[0];
+            const firstNewId = extractNumericId(firstNew.id);
+            oldestCursor = {
+                ts: Math.floor(firstNew.ts / 1000),
+                id: isNaN(firstNewId) ? 0 : firstNewId,
+            };
+            // Prepending
+            const count = newOnes.length;
+            msgs = [...newOnes, ...msgs];
+            newOnes.forEach((m) => loadedMsgIds.add(m.id));
+            await tick();
+            // 滚动位置补偿：prepend 的内容将旧内容推下去了，
+            // 需要向下滚动补偿新内容的总高度
+            vlist?.scrollTo(scrollPos + count * 80);
+        } catch (e) {
+            console.error("加载更早消息失败:", e);
+        } finally {
+            loading = false;
+        }
+    }
+
+    // ---------- Scroll 事件处理 ----------
+
+    function handleScroll(scrollEvent: { scrollTop: number; scrollLeft: number }) {
+        if (!vlist || loading) return;
+        // 距离顶部 < 阈值 → 加载更早消息
+        if (scrollEvent.scrollTop < LOAD_THRESHOLD && hasMoreOlder) {
+            loadOlder();
+        }
+    }
+
+    // ---------- 以下函数与改造前完全兼容 ----------
 
     export function add(
         text: string,
@@ -272,7 +378,7 @@
     }
 </script>
 
-<VList bind:this={vlist} data={msgs} getKey={(m) => m.id} class="list">
+<VList bind:this={vlist} data={msgs} getKey={(m) => m.id} class="list" onscroll={handleScroll}>
     {#snippet children(m)}
         <div class="msg" class:me={m.me}>
             <div class="bubble" class:file-hash={m.type === "file_hash"}>
@@ -289,135 +395,119 @@
                     >
                         <div class="file-icon">
                             <svg
-                                width="32"
-                                height="32"
+                                width="24"
+                                height="24"
                                 viewBox="0 0 24 24"
                                 fill="none"
                                 stroke="currentColor"
                                 stroke-width="2"
                             >
-                                <path
-                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
-                                />
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
                                 <polyline points="14 2 14 8 20 8" />
                                 <line x1="12" y1="18" x2="12" y2="12" />
-                                <line x1="9" y1="15" x2="12" y2="12" />
-                                <line x1="15" y1="15" x2="12" y2="12" />
+                                <line x1="9" y1="15" x2="15" y2="15" />
                             </svg>
                         </div>
                         <div class="file-info">
-                            <span class="file-name"
-                                >{m.file_hash_info.filename}</span
-                            >
-                            <span class="file-size"
-                                >{formatFileSize(
-                                    m.file_hash_info.total_size,
-                                )}</span
-                            >
-                            <span class="file-hash-label"
-                                >文件分享 - 点击下载</span
-                            >
-                        </div>
-                        <!-- 下载进度条 -->
-                        {#if getFileProgress(m)}
-                            {@const progress = getFileProgress(m)!}
-                            <div class="download-progress">
-                                <div class="progress-bar">
-                                    <div
-                                        class="progress-fill"
-                                        class:completed={progress.status ===
-                                            "completed"}
-                                        style="width: {calcProgress(progress)}%"
-                                    ></div>
+                            <span class="file-name">{m.file_hash_info.filename}</span>
+                            <span class="file-size">{formatFileSize(m.file_hash_info.total_size)}</span>
+                            <span class="file-hash-label">点击下载文件</span>
+
+                            {#if getFileProgress(m)}
+                                {@const p = getFileProgress(m)!}
+                                <div class="download-progress">
+                                    <div class="progress-bar">
+                                        <div
+                                            class="progress-fill"
+                                            class:completed={p.status === "completed"}
+                                            style="width: {calcProgress(p)}%"
+                                        ></div>
+                                    </div>
+                                    <span class="progress-text">
+                                        {#if p.status === "downloading"}
+                                            下载中... {calcProgress(p)}%
+                                        {:else if p.status === "completed"}
+                                            下载完成
+                                        {:else if p.status === "failed"}
+                                            下载失败
+                                        {/if}
+                                    </span>
                                 </div>
-                                <span class="progress-text">
-                                    {#if progress.status === "downloading"}
-                                        下载中 {calcProgress(progress)}% ({formatFileSize(
-                                            progress.received_bytes,
-                                        )}/{formatFileSize(
-                                            progress.total_size,
-                                        )})
-                                    {:else if progress.status === "completed"}
-                                        下载完成 ✓
-                                    {:else}
-                                        下载失败 ✗
-                                    {/if}
-                                </span>
-                            </div>
-                        {/if}
+                            {/if}
+                        </div>
                     </div>
                 {:else if m.type === "file_stream"}
-                    <!-- FileStream 消息：显示文件传输中 -->
+                    <!-- file_stream 类型消息（接收文件传输中） -->
                     <div class="file-stream-content">
                         <div class="file-icon">
                             <svg
-                                width="32"
-                                height="32"
+                                width="24"
+                                height="24"
                                 viewBox="0 0 24 24"
                                 fill="none"
                                 stroke="currentColor"
                                 stroke-width="2"
                             >
-                                <path
-                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
-                                />
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
                                 <polyline points="14 2 14 8 20 8" />
-                                <line x1="16" y1="13" x2="8" y2="13" />
-                                <line x1="16" y1="17" x2="8" y2="17" />
                             </svg>
                         </div>
-                        <div class="file-info">
-                            <span class="file-name">文件传输中...</span>
-                            <span class="file-hash-label">正在接收文件分片</span
-                            >
-                        </div>
+                        <span>{m.content}</span>
                     </div>
-                {:else}
-                    <!-- 普通文本消息 -->
+                {:else if m.type === "text"}
                     <p>{m.content}</p>
                 {/if}
-                <div class="msg-meta">
-                    <time>{new Date(m.ts).toLocaleTimeString()}</time>
-                    {#if m.me && m.pending === true}
-                        <span class="pending-indicator" title="发送中..."
-                            >⏳</span
-                        >
-                    {:else if m.me && m.pending === false}
-                        <span class="sent-indicator" title="已送达">✓</span>
-                    {/if}
-                </div>
             </div>
-            <button class="x" onclick={() => del(m.id)}>×</button>
+            <div class="msg-meta">
+                <time>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+                {#if m.pending === true}
+                    <span class="pending-indicator">● 发送中</span>
+                {:else if m.pending === false}
+                    <span class="sent-indicator">✓</span>
+                {/if}
+            </div>
+            <button class="x" onclick={() => del(m.id)} aria-label="删除消息">×</button>
         </div>
     {/snippet}
 </VList>
+
+{#if loading}
+    <div class="loading-hint">加载中...</div>
+{/if}
 
 <style>
     :global(.virtua-scroll-view) {
         padding: 16px;
         background: transparent;
-        backdrop-filter: blur(10px);
-        height: 100%;
     }
-
+    .list {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+    }
     .msg {
         display: flex;
-        gap: 8px;
-        margin-bottom: 12px;
+        flex-direction: column;
         align-items: flex-start;
+        margin-bottom: 8px;
+        position: relative;
+        padding-right: 36px;
+        gap: 2px;
     }
     .msg.me {
-        flex-direction: row-reverse;
+        align-items: flex-end;
+        padding-right: 0;
+        padding-left: 36px;
     }
-
     .bubble {
         max-width: 70%;
-        padding: 12px 16px;
-        border-radius: 16px;
-        background: var(--bg-tertiary, #1a1a1a);
-        color: var(--text-primary, #fafafa);
+        padding: 8px 12px;
+        border-radius: 12px;
+        background: var(--bg-secondary, #2a2a2a);
+        word-break: break-word;
+        white-space: pre-wrap;
     }
-    .me .bubble {
+    .msg.me .bubble {
         background: #3b82f6;
     }
 
@@ -428,7 +518,7 @@
         cursor: pointer;
         padding: 8px;
     }
-    .me .bubble.file-hash {
+    .msg.me .bubble.file-hash {
         background: #2563eb;
         border-color: #60a5fa;
     }
@@ -540,7 +630,7 @@
     }
     @keyframes pulse {
         0%,
-        100% {
+        50% {
             opacity: 0.7;
         }
         50% {
@@ -557,6 +647,10 @@
         color: #666;
         cursor: pointer;
         opacity: 0;
+        position: absolute;
+        right: 8px;
+        top: 50%;
+        transform: translateY(-50%);
     }
     .msg:hover .x {
         opacity: 1;
@@ -564,5 +658,21 @@
     .x:hover {
         background: rgba(239, 68, 68, 0.2);
         color: #ef4444;
+    }
+    .msg.me .x {
+        right: auto;
+        left: 8px;
+    }
+
+    .loading-hint {
+        text-align: center;
+        font-size: 12px;
+        color: #888;
+        padding: 4px;
+        position: absolute;
+        top: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        pointer-events: none;
     }
 </style>

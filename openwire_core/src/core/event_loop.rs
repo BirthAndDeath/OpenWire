@@ -132,9 +132,107 @@ impl ChatCore {
                 request,
                 channel,
             } => {
-                // 处理 NetEvent 请求
                 tracing::info!("收到 NetEvent 请求: peer={}, request={:?}", peer, request);
-                // 简单响应确认（通过 P2pActor 发送 NetEvent 响应）
+
+                // === Fix 2: 处理 FriendOnline 通知：缓存对方身份 + 触发反向发现 ===
+                // FriendOnline 直接携带所有身份信息（ML-DSA 公钥、PeerID、ML-KEM 公钥），
+                // 无需等待 DHT 查询，连接建立后立即可用。
+                let crate::p2p::netevent::NetEventRequest::FriendOnline {
+                    mldsa_pubkey_hex,
+                    peer_id: claimed_peer_id,
+                    listen_addrs: _,
+                    mlkem_pubkey_hex,
+                } = &request;
+                    // 验证：声称的 PeerID 必须与实际连接的 PeerID 一致
+                    if *claimed_peer_id != peer.to_string() {
+                        tracing::warn!(
+                            "FriendOnline PeerID 不匹配: 声称={}, 实际={}，忽略",
+                            claimed_peer_id,
+                            peer
+                        );
+                    } else {
+                        tracing::info!(
+                            "收到有效的 FriendOnline: {}.. (PeerID={})",
+                            &mldsa_pubkey_hex[..16],
+                            peer
+                        );
+
+                        // 缓存 (ML-DSA 公钥 → PeerID) 映射到 DHT 存储
+                        if let Ok(store) = self.get_dht_store() {
+                            let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                        }
+                        // 同步更新内存缓存，如果已连接则刷新在线状态
+                        self.update_peerid_pubkey_mapping(peer, mldsa_pubkey_hex.clone())
+                            .await;
+
+                        // 缓存 ML-KEM 公钥（直接从 FriendOnline 获取，无需 DHT）
+                        if !mlkem_pubkey_hex.is_empty() {
+                            if let Ok(store) = self.get_dht_store() {
+                                let _ = store.set_mlkem_pubkey(mldsa_pubkey_hex, mlkem_pubkey_hex);
+                            }
+                        }
+
+                        // 检查对方是否已在联系人列表中
+                        let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
+                        if !owner_id.is_empty() {
+                            if let Some(pool) = storage::pool() {
+                                let is_known = storage::is_contact_exists(
+                                    pool,
+                                    owner_id,
+                                    mldsa_pubkey_hex,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                                if !is_known && !mlkem_pubkey_hex.is_empty() {
+                                    tracing::info!(
+                                        "FriendOnline 来自未知联系人 {}..，FriendOnline 携带了 ML-KEM，直接自动添加",
+                                        &mldsa_pubkey_hex[..16]
+                                    );
+                                    // 直接从 FriendOnline 获取的信息添加联系人，无需 DHT
+                                    let mlkem_bytes = hex::decode(mlkem_pubkey_hex.as_str())
+                                        .unwrap_or_default();
+                                    if !mlkem_bytes.is_empty() {
+                                        self.add_contact(
+                                            mldsa_pubkey_hex.to_string(),
+                                            mlkem_bytes,
+                                            None,
+                                        )
+                                        .await;
+                                        let msg = format!(
+                                            "已自动添加联系人: {}..（通过 FriendOnline）",
+                                            &mldsa_pubkey_hex[..16]
+                                        );
+                                        self.send_log_mpsc(msg).await;
+                                    }
+                                }
+
+                                // === Fix 7: FriendOnline 处理后检查并重试待发送消息 ===
+                                // ConnectionEstablished → retry_pending_messages 在 FriendOnline
+                                // 到达前运行，使用旧 DHT 存储找不到 PeerID 就跳过。
+                                // FriendOnline 到达后缓存了 (公钥→PeerID) 映射，此时重试能成功。
+                                match storage::list_pending(pool).await {
+                                    Ok(msgs) => {
+                                        let has_pending = msgs.iter().any(|m| {
+                                            m.peer_pubkey_hex == *mldsa_pubkey_hex
+                                        });
+                                        if has_pending {
+                                            tracing::info!(
+                                                "FriendOnline 处理后 {}.. 有待发消息，立即重试",
+                                                &mldsa_pubkey_hex[..16]
+                                            );
+                                            self.retry_pending_messages().await;
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "FriendOnline 处理后查询待发消息失败: {}", e
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
+                // 发送响应确认（通过 P2pActor 发送 NetEvent 响应）
                 let _ = self
                     .p2p_handle
                     .send(crate::actor::ActorCommand::Custom(
@@ -156,16 +254,41 @@ impl ChatCore {
                             self.peerid_to_pubkey.insert(peer_id, pubkey_hex);
                         }
                         _ => {
-                            // 如果本地 DHT 没有缓存，发起 GetProviders 查询
-                            let _ = self
-                                .p2p_handle
-                                .send(crate::actor::ActorCommand::Custom(
-                                    P2pCommand::GetProviders {
-                                        key: peer_id.to_string(),
-                                    },
-                                ))
-                                .await;
+                            // Fix 3: 移除错误的 GetProviders 查询（用 PeerID 查 DHT 无意义）
+                            // 后续 FriendOnline 通知或 DHT 发现会提供正确的 (公钥→PeerID) 映射
+                            tracing::debug!(
+                                "ConnectionEstablished: 本地未缓存 PeerID {} 对应的公钥",
+                                peer_id
+                            );
                         }
+                    }
+                }
+
+                // === Fix 1: 连接建立后向对方发送 FriendOnline 通知（身份交换）===
+                if let Some(mldsa_pubkey_hex) = self.mldsa_pubkey_hex.clone() {
+                    if let Some(current_peer_id) = self.current_peer_id {
+                        let mlkem = self.mlkem_pubkey_hex.clone().unwrap_or_default();
+                        let friend_online =
+                            crate::actor::p2p::netevent::build_friend_online_request(
+                                &mldsa_pubkey_hex,
+                                &current_peer_id,
+                                &[], // 监听地址 - ChatCore 暂未持久化存储
+                                &mlkem,
+                            );
+                        let _ = self
+                            .p2p_handle
+                            .send(crate::actor::ActorCommand::Custom(
+                                P2pCommand::SendNetEvent {
+                                    peer_id,
+                                    request: friend_online,
+                                },
+                            ))
+                            .await;
+                        tracing::info!(
+                            "已向 {} 发送 FriendOnline 通知 (PubKey={}..)",
+                            peer_id,
+                            &mldsa_pubkey_hex[..16]
+                        );
                     }
                 }
 
@@ -253,6 +376,52 @@ impl ChatCore {
                     if !pubkey_hex.is_empty() {
                         let mlkem_hex = String::from_utf8_lossy(&value);
                         let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
+
+                        // === 反向发现：收到 ML-KEM 密钥后，检查是否需要自动添加对方 ===
+                        let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
+                        if !owner_id.is_empty() {
+                            if let Some(pool) = storage::pool() {
+                                let is_known = storage::is_contact_exists(
+                                    pool,
+                                    owner_id,
+                                    pubkey_hex,
+                                )
+                                .await
+                                .unwrap_or(false);
+
+                                if !is_known {
+                                    let has_peerid = store
+                                        .get_peerid_by_pubkey(pubkey_hex)
+                                        .ok()
+                                        .flatten()
+                                        .is_some();
+                                    // Fix: 不能直接读刚 set 的值（总是 Some），需检查 hex 有效性
+                                    let mlkem_hex_str = mlkem_hex.as_ref();
+                                    let has_valid_mlkem = !mlkem_hex_str.is_empty()
+                                        && hex::decode(mlkem_hex_str).is_ok();
+
+                                    if has_peerid && has_valid_mlkem {
+                                        tracing::info!(
+                                            "FriendOnline 反向发现完成，自动添加联系人 {}..",
+                                            &pubkey_hex[..16]
+                                        );
+                                        let mlkem_bytes = hex::decode(mlkem_hex.as_ref())
+                                            .unwrap_or_default();
+                                        self.add_contact(
+                                            pubkey_hex.to_string(),
+                                            mlkem_bytes,
+                                            None,
+                                        )
+                                        .await;
+                                        let msg = format!(
+                                            "已自动添加联系人: {}..（通过 FriendOnline）",
+                                            &pubkey_hex[..16]
+                                        );
+                                        self.send_log_mpsc(msg).await;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

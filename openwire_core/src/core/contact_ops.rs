@@ -30,6 +30,19 @@ impl ChatCore {
                             key: mldsa_pubkey_hex.clone(),
                         }),
                     ).await;
+                    // Fix 4: 重新发布自身身份到 DHT，确保对方能通过 DHT 反向发现我方
+                    // 直接写入本地 DHT 存储 + 发起网络发布
+                    if let Ok(store) = self.get_dht_store() {
+                        if let (Some(pubkey), Some(pid)) = (&self.mldsa_pubkey_hex, &self.current_peer_id) {
+                            let _ = store.set_pubkey_peerid(pubkey, pid);
+                        }
+                    }
+                    let _ = self.p2p_handle.send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::PublishIdentity {
+                            mldsa_pubkey_hex: self.mldsa_pubkey_hex.clone().unwrap_or_default(),
+                            mlkem_pubkey_hex: self.mlkem_pubkey_hex.clone().unwrap_or_default(),
+                        }),
+                    ).await;
                     let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
                     let _ = self.p2p_handle.send(
                         crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
