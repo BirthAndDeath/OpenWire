@@ -1,4 +1,4 @@
-use sqlx::{FromRow, Pool, Row, Sqlite};
+use sqlx::{self, AssertSqlSafe, FromRow, Pool, Row, Sqlite};
 
 use crate::error::{StorageError, StorageResult};
 
@@ -205,7 +205,7 @@ pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<
         placeholders.join(",")
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(&*sql));
     for id in ids {
         query = query.bind(id);
     }
@@ -227,7 +227,7 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageR
         placeholders.join(",")
     );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(AssertSqlSafe(&*sql));
     for id in ids {
         query = query.bind(id);
     }
