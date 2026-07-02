@@ -1,7 +1,12 @@
+/// 联系人管理模块
 mod contact;
+/// 身份管理模块
 mod identity;
+/// 消息管理模块
 mod message;
+/// 数据库迁移模块
 mod migrations;
+/// 统计查询模块
 mod stats;
 
 pub use contact::{

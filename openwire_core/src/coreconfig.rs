@@ -24,15 +24,7 @@ pub struct CoreConfig {
     pub bootstrap_nodes: Vec<(String, String)>,
 }
 
-
 impl CoreConfig {
-    /// 创建配置实例
-    ///
-    /// # 参数
-    /// - `data_dir`: 数据目录路径
-    /// - `rx_cmd`: 命令接收通道，用于外部控制核心（发送消息、关闭等）
-    /// - `path_to_log`: 可选日志文件路径
-    /// - `log_level`: 可选日志级别
     /// 创建配置实例
     ///
     /// # 参数
@@ -79,8 +71,15 @@ impl CoreConfig {
     /// 如果文件不存在，会自动创建默认配置。
     pub fn load_nodes_config(&mut self) {
         let nodes_config = crate::p2p::nodes::NodesConfig::load(&self.data_dir);
-        self.relay_nodes = nodes_config.relay_nodes.into_iter().map(|a| (a[0].clone(), a[1].clone())).collect();
-        self.bootstrap_nodes = nodes_config.bootstrap_nodes.into_iter().map(|a| (a[0].clone(), a[1].clone())).collect();
+        self.relay_nodes = nodes_config
+            .relay_nodes
+            .into_iter()
+            .map(|a| (a[0].clone(), a[1].clone()))
+            .collect();
+        self.bootstrap_nodes = nodes_config
+            .bootstrap_nodes
+            .into_iter()
+            .map(|a| (a[0].clone(), a[1].clone()))
+            .collect();
     }
-
 }

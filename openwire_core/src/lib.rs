@@ -1,19 +1,35 @@
+#![warn(missing_docs)]
+//! OpenWire 核心库，处理后端可复用代码工作
+/// Actor 模块（P2P 事件循环 Actor 模式）
 pub mod actor;
+/// 命令与事件类型定义
 pub mod command;
+/// 压缩/解压缩模块
 pub mod compression;
+/// 核心逻辑（ChatCore）
 pub mod core;
 mod coreconfig;
+/// 核心句柄（外部控制接口）
 pub mod corehandle;
+/// 加密模块（ML-KEM + AES-GCM）
 pub mod crypto;
+/// 诊断模块（DHT + 加密自检）
 pub mod diagnostics;
+/// 错误类型定义
 pub mod error;
+/// 身份管理（ML-DSA + ML-KEM）
 pub mod identity;
 mod log;
 pub use vstd::prelude::*;
+/// 消息结构定义
 pub mod message;
+/// P2P 网络模块
 pub mod p2p;
+/// 签名模块（ML-DSA）
 pub mod signature;
+/// 存储模块（SQLite）
 pub mod storage;
+/// 文件传输模块
 pub mod transfer;
 pub use actor::p2p::{P2pActor, P2pActorHandle, P2pCommand, P2pEvent, start_p2p_actor};
 pub use actor::{Actor, ActorHandle, RUNTIME};

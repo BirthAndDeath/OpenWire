@@ -4,6 +4,7 @@ use zeroize::Zeroizing;
 use crate::{core::ChatCore, identity, p2p, storage};
 
 impl ChatCore {
+    /// 生成新身份（ML-DSA 密钥对 + 临时 ML-KEM 密钥对）
     pub(crate) async fn generate_identity(&mut self) {
         let temp_cfg = crate::coreconfig::CoreConfig {
             data_dir: self.data_dir.clone(),
@@ -200,6 +201,7 @@ impl ChatCore {
         self.send_log_mpsc(msg).await;
     }
 
+    /// 删除指定身份（移除密钥文件 + DHT 记录 + 数据库记录）
     pub(crate) async fn delete_identity(&mut self, identity_id: String) {
         if let Some(pool) = storage::pool() {
             match storage::delete_identity(pool, &self.data_dir, &identity_id).await {
