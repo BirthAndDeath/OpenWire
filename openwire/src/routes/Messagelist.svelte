@@ -52,9 +52,9 @@
 
     // ========== 双向懒加载状态 ==========
     let loading = $state(false);
-    let hasMoreOlder = $state(true);  // 是否还有更早的历史消息可加载
+    let hasMoreOlder = $state(true); // 是否还有更早的历史消息可加载
     const PAGE_SIZE = 50;
-    const LOAD_THRESHOLD = 200;       // 滚动到距顶部多少 px 时触发加载
+    const LOAD_THRESHOLD = 200; // 滚动到距顶部多少 px 时触发加载
     // (ts, id) 游标边界，记录已加载消息的时间范围
     // ts 以秒为单位（与数据库格式一致）
     let oldestCursor = $state<{ ts: number; id: number } | null>(null);
@@ -149,7 +149,10 @@
             // 更新游标
             if (loaded.length > 0) {
                 const id0 = extractNumericId(loaded[0].id);
-                oldestCursor = { ts: Math.floor(loaded[0].ts / 1000), id: isNaN(id0) ? 0 : id0 };
+                oldestCursor = {
+                    ts: Math.floor(loaded[0].ts / 1000),
+                    id: isNaN(id0) ? 0 : id0,
+                };
             } else {
                 oldestCursor = null;
                 hasMoreOlder = false;
@@ -166,7 +169,14 @@
 
     // 加载更早的消息（上向翻页 —— 用户向上滚动触顶时调用）
     async function loadOlder() {
-        if (loading || !hasMoreOlder || msgs.length === 0 || !contactId || !oldestCursor) return;
+        if (
+            loading ||
+            !hasMoreOlder ||
+            msgs.length === 0 ||
+            !contactId ||
+            !oldestCursor
+        )
+            return;
         loading = true;
         // 记录当前滚动偏移，用于 prepend 后恢复
         const scrollPos = vlist?.scrollTop ?? 0;
@@ -217,10 +227,10 @@
 
     // ---------- Scroll 事件处理 ----------
 
-    function handleScroll(scrollEvent: { scrollTop: number; scrollLeft: number }) {
+    function handleScroll(offset: number) {
         if (!vlist || loading) return;
-        // 距离顶部 < 阈值 → 加载更早消息
-        if (scrollEvent.scrollTop < LOAD_THRESHOLD && hasMoreOlder) {
+        // 这里的 offset 是 VList 传入的滚动位置，使用它判断是否触底/触顶。
+        if (offset < LOAD_THRESHOLD && hasMoreOlder) {
             loadOlder();
         }
     }
@@ -378,8 +388,14 @@
     }
 </script>
 
-<VList bind:this={vlist} data={msgs} getKey={(m) => m.id} class="list" onscroll={handleScroll}>
-    {#snippet children(m)}
+<VList
+    bind:this={vlist}
+    data={msgs}
+    getKey={(m: Msg) => m.id}
+    class="list"
+    onscroll={handleScroll}
+>
+    {#snippet children(m: Msg)}
         <div class="msg" class:me={m.me}>
             <div class="bubble" class:file-hash={m.type === "file_hash"}>
                 {#if m.type === "file_hash" && m.file_hash_info}
@@ -402,15 +418,23 @@
                                 stroke="currentColor"
                                 stroke-width="2"
                             >
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <path
+                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                                />
                                 <polyline points="14 2 14 8 20 8" />
                                 <line x1="12" y1="18" x2="12" y2="12" />
                                 <line x1="9" y1="15" x2="15" y2="15" />
                             </svg>
                         </div>
                         <div class="file-info">
-                            <span class="file-name">{m.file_hash_info.filename}</span>
-                            <span class="file-size">{formatFileSize(m.file_hash_info.total_size)}</span>
+                            <span class="file-name"
+                                >{m.file_hash_info.filename}</span
+                            >
+                            <span class="file-size"
+                                >{formatFileSize(
+                                    m.file_hash_info.total_size,
+                                )}</span
+                            >
                             <span class="file-hash-label">点击下载文件</span>
 
                             {#if getFileProgress(m)}
@@ -419,7 +443,8 @@
                                     <div class="progress-bar">
                                         <div
                                             class="progress-fill"
-                                            class:completed={p.status === "completed"}
+                                            class:completed={p.status ===
+                                                "completed"}
                                             style="width: {calcProgress(p)}%"
                                         ></div>
                                     </div>
@@ -448,7 +473,9 @@
                                 stroke="currentColor"
                                 stroke-width="2"
                             >
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <path
+                                    d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                                />
                                 <polyline points="14 2 14 8 20 8" />
                             </svg>
                         </div>
@@ -459,14 +486,21 @@
                 {/if}
             </div>
             <div class="msg-meta">
-                <time>{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+                <time
+                    >{new Date(m.ts).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                    })}</time
+                >
                 {#if m.pending === true}
                     <span class="pending-indicator">● 发送中</span>
                 {:else if m.pending === false}
                     <span class="sent-indicator">✓</span>
                 {/if}
             </div>
-            <button class="x" onclick={() => del(m.id)} aria-label="删除消息">×</button>
+            <button class="x" onclick={() => del(m.id)} aria-label="删除消息"
+                >×</button
+            >
         </div>
     {/snippet}
 </VList>

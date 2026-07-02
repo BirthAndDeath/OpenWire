@@ -1,7 +1,9 @@
+use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, noise, ping, relay, tcp, yamux,
+    PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
+    memory_connection_limits, noise, ping, relay, tcp, yamux,
 };
 
 use redb::Database;
@@ -100,7 +102,9 @@ pub fn swarm_init(
         .with_quic()
         .with_dns()
         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
+        .with_behaviour(|key, relay_behaviour| {
             let peer_id = key.public().to_peer_id();
 
             // --- rr_msg: 消息传输 ---
@@ -144,8 +148,12 @@ pub fn swarm_init(
             let ping = ping::Behaviour::new(ping::Config::new());
             let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-
+            let limits =
+                connection_limits::Behaviour::new(connection_limits::ConnectionLimits::default());
+            let memmory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.01);
+            let autonat = autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
             Ok(MyBehaviour {
+                autonat,
                 rr_msg,
                 rr_netevent,
                 mdns,
@@ -154,6 +162,8 @@ pub fn swarm_init(
                 identify,
                 relay,
                 dcutr,
+                limits,
+                memmory_limits,
             })
         })
         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
@@ -223,9 +233,8 @@ fn create_kademlia(
     db: Arc<Database>,
     data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
-) -> P2pResult<kad::Behaviour<dht::RedbRecordStore>> {
-    let store = dht::RedbRecordStore::new(db);
-
+) -> P2pResult<kad::Behaviour<MemoryStore>> {
+    //let store = dht::RedbRecordStore::new(db);
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
         P2pError::SwarmInitFailed("KAD_REPLICATION_FACTOR must be non-zero".into())
@@ -240,7 +249,7 @@ fn create_kademlia(
         .set_provider_record_ttl(Some(Duration::from_secs(KAD_PROVIDER_TTL_SECS)))
         .set_publication_interval(Some(Duration::from_secs(KAD_PUBLICATION_INTERVAL_SECS)));
 
-    let mut kademlia = kad::Behaviour::with_config(peer_id, store, config);
+    let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
     kademlia.set_mode(Some(Mode::Server));
 
     // 先加载缓存的路由表
@@ -331,10 +340,7 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
 }
 
 /// 从缓存文件加载路由表
-fn load_routing_table(
-    kademlia: &mut kad::Behaviour<dht::RedbRecordStore>,
-    cache_path: &Path,
-) -> usize {
+fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &Path) -> usize {
     if !cache_path.exists() {
         return 0;
     }

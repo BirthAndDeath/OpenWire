@@ -18,7 +18,7 @@ use futures::StreamExt;
 use libp2p::kad::{self, GetRecordOk, QueryResult};
 use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{dcutr, identify, mdns, relay, PeerId, Swarm};
+use libp2p::{PeerId, Swarm, autonat, dcutr, identify, mdns, relay};
 use redb::Database;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -60,26 +60,18 @@ pub enum P2pCommand {
         mlkem_pubkey_hex: String,
     },
     /// 发起 GetProviders 查询
-    GetProviders {
-        key: String,
-    },
+    GetProviders { key: String },
     /// 发起 GetRecord 查询
-    GetRecord {
-        key: String,
-    },
+    GetRecord { key: String },
     /// 添加地址到 Kademlia 路由表
     AddKademliaAddress {
         peer_id: PeerId,
         addr: libp2p::Multiaddr,
     },
     /// 拨号
-    Dial {
-        peer_id: PeerId,
-    },
+    Dial { peer_id: PeerId },
     /// 拨号到地址
-    DialAddr {
-        addr: libp2p::Multiaddr,
-    },
+    DialAddr { addr: libp2p::Multiaddr },
     /// 发送 rr_msg 响应确认
     SendResponse {
         channel: libp2p::request_response::ResponseChannel<ChatResponse>,
@@ -107,37 +99,25 @@ pub enum P2pEvent {
         channel: libp2p::request_response::ResponseChannel<NetEventResponse>,
     },
     /// 连接建立
-    ConnectionEstablished {
-        peer_id: PeerId,
-    },
+    ConnectionEstablished { peer_id: PeerId },
     /// 连接关闭
-    ConnectionClosed {
-        peer_id: PeerId,
-    },
+    ConnectionClosed { peer_id: PeerId },
     /// mDNS 发现
     MdnsDiscovered {
         peer_id: PeerId,
         addr: libp2p::Multiaddr,
     },
     /// mDNS 过期
-    MdnsExpired {
-        peer_id: PeerId,
-    },
+    MdnsExpired { peer_id: PeerId },
     /// Identify 事件
     IdentifyReceived {
         peer_id: PeerId,
         listen_addrs: Vec<libp2p::Multiaddr>,
     },
     /// Kademlia GetProviders 结果
-    GetProvidersResult {
-        key: String,
-        providers: Vec<PeerId>,
-    },
+    GetProvidersResult { key: String, providers: Vec<PeerId> },
     /// Kademlia GetRecord 结果
-    GetRecordResult {
-        key: String,
-        value: Vec<u8>,
-    },
+    GetRecordResult { key: String, value: Vec<u8> },
     /// 日志
     Log(String),
 }
@@ -178,9 +158,7 @@ impl P2pActor {
             event_tx,
             data_dir,
             mdns_refresh_interval: std::time::Duration::from_secs(60 * 60),
-            mdns_cache: lru::LruCache::new(
-                std::num::NonZeroUsize::new(2000).unwrap(),
-            ),
+            mdns_cache: lru::LruCache::new(std::num::NonZeroUsize::new(2000).unwrap()),
         }
     }
 
@@ -194,6 +172,28 @@ impl P2pActor {
     /// 处理单个 swarm 事件
     async fn handle_swarm_event(&mut self, event: SwarmEvent<MyBehaviourEvent>) {
         match event {
+            SwarmEvent::Behaviour(MyBehaviourEvent::Autonat(event)) => {
+                if let autonat::Event::StatusChanged {
+                    old: _,
+                    new: new_status,
+                } = event
+                {
+                    match new_status {
+                        // 节点判定为公网可达
+                        autonat::NatStatus::Public(_multiaddr) => {
+
+                            // 在这里可以执行成为中继服务端等操作
+                        }
+                        // 节点判定为在 NAT 之后
+                        autonat::NatStatus::Private => {
+
+                            // 在这里可以禁用中继服务端，并寻找公共中继
+                        }
+                        // 状态未知（初始状态或探测中）
+                        autonat::NatStatus::Unknown => {}
+                    }
+                }
+            }
             // --- Kademlia 事件 ---
             SwarmEvent::Behaviour(MyBehaviourEvent::Kademlia(kad_event)) => {
                 self.handle_kademlia_event(kad_event).await;
@@ -204,9 +204,7 @@ impl P2pActor {
                 peer,
                 message:
                     RequestResponseMessage::Request {
-                        channel,
-                        request,
-                        ..
+                        channel, request, ..
                     },
                 ..
             })) => {
@@ -222,48 +220,42 @@ impl P2pActor {
             SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
                 message: RequestResponseMessage::Response { response, .. },
                 ..
-            })) => {
-                match response.verify() {
-                    Ok(true) => tracing::debug!("收到签名响应: timestamp={}", response.timestamp),
-                    Ok(false) => tracing::warn!("收到无效签名的响应，已忽略"),
-                    Err(e) => tracing::warn!("验证响应签名时出错: {}", e),
-                }
-            }
+            })) => match response.verify() {
+                Ok(true) => tracing::debug!("收到签名响应: timestamp={}", response.timestamp),
+                Ok(false) => tracing::warn!("收到无效签名的响应，已忽略"),
+                Err(e) => tracing::warn!("验证响应签名时出错: {}", e),
+            },
 
             // --- rr_msg: 出站失败 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::OutboundFailure {
-                peer,
-                error,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(
+                RequestResponseEvent::OutboundFailure { peer, error, .. },
+            )) => {
                 tracing::error!("向 {} 发送消息失败: {:?}", peer, error);
             }
 
             // --- rr_msg: 入站失败 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::InboundFailure {
-                peer,
-                error,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(
+                RequestResponseEvent::InboundFailure { peer, error, .. },
+            )) => {
                 tracing::error!("来自 {} 的入站请求失败: {:?}", peer, error);
             }
 
             // --- rr_msg: 响应已发送 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::ResponseSent {
-                ..
-            })) => {}
+            SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(
+                RequestResponseEvent::ResponseSent { .. },
+            )) => {}
 
             // --- rr_netevent: 收到 NetEvent 请求 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(RequestResponseEvent::Message {
-                peer,
-                message:
-                    RequestResponseMessage::Request {
-                        channel,
-                        request,
-                        ..
-                    },
-                ..
-            })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(
+                RequestResponseEvent::Message {
+                    peer,
+                    message:
+                        RequestResponseMessage::Request {
+                            channel, request, ..
+                        },
+                    ..
+                },
+            )) => {
                 self.send_event(P2pEvent::NetEventRequestReceived {
                     peer,
                     request,
@@ -273,10 +265,12 @@ impl P2pActor {
             }
 
             // --- rr_netevent: 收到 NetEvent 响应 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(RequestResponseEvent::Message {
-                message: RequestResponseMessage::Response { response, .. },
-                ..
-            })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(
+                RequestResponseEvent::Message {
+                    message: RequestResponseMessage::Response { response, .. },
+                    ..
+                },
+            )) => {
                 tracing::debug!("收到 NetEvent 响应: {:?}", response);
             }
 
@@ -369,7 +363,8 @@ impl P2pActor {
             // --- 连接关闭 ---
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!("Connection closed with {}", peer_id);
-                self.send_event(P2pEvent::ConnectionClosed { peer_id }).await;
+                self.send_event(P2pEvent::ConnectionClosed { peer_id })
+                    .await;
             }
 
             // --- 其他事件（日志/忽略）---
@@ -380,13 +375,17 @@ impl P2pActor {
                 Some(pid) => tracing::error!("Connect failed to {pid}: {error:?}"),
                 None => tracing::debug!("Outgoing connection error (no peer id): {error:?}"),
             },
-            SwarmEvent::IncomingConnectionError { local_addr, error, .. } => {
+            SwarmEvent::IncomingConnectionError {
+                local_addr, error, ..
+            } => {
                 tracing::error!("Incoming error on {local_addr:?}: {error:?}");
             }
             SwarmEvent::Dialing { peer_id, .. } => {
                 tracing::debug!("Dialing: {peer_id:?}");
             }
-            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+            SwarmEvent::ListenerClosed {
+                addresses, reason, ..
+            } => {
                 tracing::warn!("Listener closed: {addresses:?}, reason: {reason:?}");
             }
             SwarmEvent::ListenerError { error, .. } => {
@@ -400,12 +399,14 @@ impl P2pActor {
             }
 
             // --- Relay 事件 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationReqAccepted {
-                src_peer_id, ..
-            })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(
+                relay::Event::ReservationReqAccepted { src_peer_id, .. },
+            )) => {
                 tracing::info!("Relay reservation accepted for: {}", src_peer_id);
             }
-            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationTimedOut { src_peer_id })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationTimedOut {
+                src_peer_id,
+            })) => {
                 tracing::warn!("Relay reservation timed out for: {}", src_peer_id);
             }
             SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event)) => {
@@ -413,11 +414,21 @@ impl P2pActor {
             }
 
             // --- DCUtR 事件 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result: Ok(_) })) => {
+            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event {
+                remote_peer_id,
+                result: Ok(_),
+            })) => {
                 tracing::info!("DCUtR direct connection upgraded with: {}", remote_peer_id);
             }
-            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result: Err(ref e) })) => {
-                tracing::warn!("DCUtR direct connection upgrade failed for {}: {:?}", remote_peer_id, e);
+            SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event {
+                remote_peer_id,
+                result: Err(ref e),
+            })) => {
+                tracing::warn!(
+                    "DCUtR direct connection upgrade failed for {}: {:?}",
+                    remote_peer_id,
+                    e
+                );
             }
 
             _ => {}
@@ -430,24 +441,21 @@ impl P2pActor {
             kad::Event::OutboundQueryProgressed {
                 result: QueryResult::GetRecord(result),
                 ..
-            } => {
-                match result {
-                    Ok(GetRecordOk::FoundRecord(record)) => {
-                        let key_str =
-                            std::str::from_utf8(record.record.key.as_ref()).unwrap_or("");
-                        let value = record.record.value.clone();
-                        self.send_event(P2pEvent::GetRecordResult {
-                            key: key_str.to_string(),
-                            value,
-                        })
-                        .await;
-                    }
-                    Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
-                        tracing::debug!("DHT query finished with no additional records");
-                    }
-                    Err(e) => tracing::warn!("DHT get record query failed: {:?}", e),
+            } => match result {
+                Ok(GetRecordOk::FoundRecord(record)) => {
+                    let key_str = std::str::from_utf8(record.record.key.as_ref()).unwrap_or("");
+                    let value = record.record.value.clone();
+                    self.send_event(P2pEvent::GetRecordResult {
+                        key: key_str.to_string(),
+                        value,
+                    })
+                    .await;
                 }
-            }
+                Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                    tracing::debug!("DHT query finished with no additional records");
+                }
+                Err(e) => tracing::warn!("DHT get record query failed: {:?}", e),
+            },
 
             kad::Event::OutboundQueryProgressed {
                 result: QueryResult::PutRecord(result),

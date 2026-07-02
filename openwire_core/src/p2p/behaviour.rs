@@ -3,7 +3,10 @@ use crate::{ChatMessage, ChatResponse};
 use libp2p::kad::{self};
 use libp2p::request_response::cbor;
 
-use libp2p::{dcutr, identify, mdns, ping, relay, swarm::NetworkBehaviour};
+use libp2p::{
+    autonat, connection_limits, dcutr, identify, mdns, memory_connection_limits, ping, relay,
+    swarm::NetworkBehaviour,
+};
 
 /// libp2p 网络行为组合
 ///
@@ -28,15 +31,21 @@ pub struct MyBehaviour {
     /// mDNS 协议：局域网内自动发现对等节点
     pub mdns: mdns::tokio::Behaviour,
     /// Kademlia 协议：分布式哈希表，用于节点定位和路由
-    pub kademlia: kad::Behaviour<super::dht::RedbRecordStore>,
+    ///pub kademlia: kad::Behaviour<super::dht::RedbRecordStore>, 对于客户端传播储存太慢,改为使用内存
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     //Ping 协议（连接保活/延迟检测）
     pub ping: ping::Behaviour,
+
+    pub autonat: autonat::Behaviour,
     // Identify 协议（地址/协议交换）
     pub identify: identify::Behaviour,
     // Relay 协议（NAT 穿透，可选）
     pub relay: relay::Behaviour,
     // DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,
-    // UPnP 协议（端口映射，可选）有一个神秘bug，我不知道为什么后来人可以试试修复
-    //pub upnp: upnp::Behaviour,
+
+    pub limits: connection_limits::Behaviour,
+
+    pub memmory_limits: memory_connection_limits::Behaviour, // UPnP 协议（端口映射，可选）有一个神秘宏bug，我不知道为什么后来人可以试试修复
+                                                             //pub upnp: upnp::Behaviour,
 }

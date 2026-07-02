@@ -42,10 +42,10 @@ pub async fn add_message(
     Ok(row.get(0))
 }
 
-/// 添加消息并附带消息哈希（用于去重）
+/// 添加消息并附带消息哈希。
 ///
-/// 如果相同哈希的消息已存在，则跳过插入并返回 None。
-/// 否则插入新消息并返回 Some(id)。
+/// 这里不再把相同哈希的消息直接丢弃；首次消息保留原始哈希，后续重复消息
+/// 会使用带时间戳的衍生哈希继续入库，这样前端仍然能收到并显示新的消息。
 pub async fn add_message_with_hash(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -55,17 +55,21 @@ pub async fn add_message_with_hash(
     pending: bool,
     message_hash: &str,
 ) -> StorageResult<Option<i64>> {
-    // 先检查哈希是否已存在
     let existing: Option<String> =
         sqlx::query_scalar("SELECT message_hash FROM messages WHERE message_hash = ?1 LIMIT 1")
             .bind(message_hash)
             .fetch_optional(pool)
             .await?;
 
-    if existing.is_some() {
-        // 消息已存在，跳过去重
-        return Ok(None);
-    }
+    let effective_message_hash = if existing.is_some() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "duplicate".to_string());
+        format!("{message_hash}:{suffix}")
+    } else {
+        message_hash.to_string()
+    };
 
     let pending_val = if pending { 1 } else { 0 };
     let row = sqlx::query(
@@ -78,7 +82,7 @@ pub async fn add_message_with_hash(
     .bind(content)
     .bind(is_outgoing as i32)
     .bind(pending_val)
-    .bind(message_hash)
+    .bind(&effective_message_hash)
     .fetch_one(pool)
     .await?;
     Ok(Some(row.get(0)))
