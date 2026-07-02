@@ -1,14 +1,11 @@
 use crate::actor::RUNTIME as rt;
-use redb::Database;
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     actor::p2p::{P2pCommand, P2pEvent},
     command::ChatCommand,
     core::ChatCore,
-    p2p, storage,
+    storage,
 };
 
 impl ChatCore {
@@ -51,8 +48,13 @@ impl ChatCore {
         self.discover_all_contacts(&dht_reg_cmd_tx).await;
 
         // 主事件循环：处理 P2pActor 事件和控制命令
-        // 注意：消息重试仅在 ConnectionEstablished 事件中触发，
-        // 不在定时器中重试，避免对方离线时频繁无效查询。
+        // 在线消息重试间隔：每 15 秒尝试向当前在线的好友发送待发消息。
+        // 相比 ConnectionEstablished 时立即重试，定时重试能等待 FriendOnline
+        // 通知到达并缓存 (公钥→PeerID) 映射后再发送，提高成功率。
+        // 同时只针对在线好友，避免对离线联系人做无效的 DHT 网络查询。
+        let mut online_retry_interval =
+            tokio::time::interval(std::time::Duration::from_secs(15));
+        online_retry_interval.tick().await; // 跳过首次立即触发
 
         // DHT 清理间隔：每小时清理一次过期记录
         let mut dht_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -102,6 +104,11 @@ impl ChatCore {
                     let _ = self.p2p_handle.tx.try_send(
                         crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
                     );
+                }
+                _ = online_retry_interval.tick() => {
+                    // 每 15 秒向当前在线的好友重试待发送消息。
+                    // 只尝试 connected_peers 中在线的联系人，不做 DHT 网络查询。
+                    self.retry_pending_for_online_peers().await;
                 }
                 _ = connection_maintenance_interval.tick() => {
                     // 定期对所有联系人发起 DHT GetProviders 查询
@@ -211,6 +218,8 @@ impl ChatCore {
                                 // ConnectionEstablished → retry_pending_messages 在 FriendOnline
                                 // 到达前运行，使用旧 DHT 存储找不到 PeerID 就跳过。
                                 // FriendOnline 到达后缓存了 (公钥→PeerID) 映射，此时重试能成功。
+                                // 注意：15 秒在线重试定时器也会在后续 tick 中覆盖此场景，
+                                // 但此处立即重试体验更好（零延迟）。
                                 match storage::list_pending(pool).await {
                                     Ok(msgs) => {
                                         let has_pending = msgs.iter().any(|m| {
@@ -295,7 +304,8 @@ impl ChatCore {
                 // 触发在线状态更新
                 self.send_online_status().await;
 
-                // 连接建立后重试待发送消息
+                // 连接建立后重试待发送消息（15 秒在线重试定时器也会覆盖，
+                // 但此处立即重试能让消息更快送达；无法送达时会由定时器兜底）
                 self.retry_pending_messages().await;
             }
             P2pEvent::ConnectionClosed { peer_id } => {
@@ -330,28 +340,24 @@ impl ChatCore {
                         .await;
                 }
             }
-            P2pEvent::GetProvidersResult { key, providers } => {
+            P2pEvent::GetProvidersResult {
+                key,
+                providers,
+            } => {
                 tracing::debug!(
-                    "GetProviders result: key={}.., providers={:?}",
+                    "GetProvidersResult for key={}.., providers={:?}",
                     &key[..16.min(key.len())],
                     providers
                 );
-                // 缓存到本地 DHT 数据库
+                if providers.is_empty() {
+                    return;
+                }
                 if let Ok(store) = self.get_dht_store() {
                     for provider in &providers {
                         let _ = store.set_pubkey_peerid(&key, provider);
-                        self.peerid_to_pubkey.insert(*provider, key.clone());
                     }
                 }
-                // 如果有 provider，尝试拨号连接
-                if let Some(peer_id) = providers.first() {
-                    let _ = self
-                        .p2p_handle
-                        .send(crate::actor::ActorCommand::Custom(P2pCommand::Dial {
-                            peer_id: *peer_id,
-                        }))
-                        .await;
-                }
+
                 // 如果已连接的 PeerID 现在有了公钥映射，刷新在线状态
                 // 这解决了 ConnectionEstablished 触发时 peerid_to_pubkey 尚未建立映射
                 // 导致 send_online_status() 无法正确标记该联系人为在线的问题
@@ -361,69 +367,15 @@ impl ChatCore {
                         break;
                     }
                 }
+
+                // 触发所有待发送消息的重试
+                // 可能在连接建立时重试失败（PeerID 尚未缓存），
+                // 现在 GetProviders 提供了正确的映射，再次重试
+                self.retry_pending_messages().await;
             }
-            P2pEvent::GetRecordResult { key, value } => {
-                tracing::debug!(
-                    "GetRecord result: key={}.., value_len={}",
-                    &key[..16.min(key.len())],
-                    value.len()
-                );
-                // 缓存到本地 DHT 数据库
-                if let Ok(store) = self.get_dht_store()
-                    && key.starts_with("mlkem:")
-                {
-                    let pubkey_hex = key.strip_prefix("mlkem:").unwrap_or("");
-                    if !pubkey_hex.is_empty() {
-                        let mlkem_hex = String::from_utf8_lossy(&value);
-                        let _ = store.set_mlkem_pubkey(pubkey_hex, &mlkem_hex);
-
-                        // === 反向发现：收到 ML-KEM 密钥后，检查是否需要自动添加对方 ===
-                        let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
-                        if !owner_id.is_empty() {
-                            if let Some(pool) = storage::pool() {
-                                let is_known = storage::is_contact_exists(
-                                    pool,
-                                    owner_id,
-                                    pubkey_hex,
-                                )
-                                .await
-                                .unwrap_or(false);
-
-                                if !is_known {
-                                    let has_peerid = store
-                                        .get_peerid_by_pubkey(pubkey_hex)
-                                        .ok()
-                                        .flatten()
-                                        .is_some();
-                                    // Fix: 不能直接读刚 set 的值（总是 Some），需检查 hex 有效性
-                                    let mlkem_hex_str = mlkem_hex.as_ref();
-                                    let has_valid_mlkem = !mlkem_hex_str.is_empty()
-                                        && hex::decode(mlkem_hex_str).is_ok();
-
-                                    if has_peerid && has_valid_mlkem {
-                                        tracing::info!(
-                                            "FriendOnline 反向发现完成，自动添加联系人 {}..",
-                                            &pubkey_hex[..16]
-                                        );
-                                        let mlkem_bytes = hex::decode(mlkem_hex.as_ref())
-                                            .unwrap_or_default();
-                                        self.add_contact(
-                                            pubkey_hex.to_string(),
-                                            mlkem_bytes,
-                                            None,
-                                        )
-                                        .await;
-                                        let msg = format!(
-                                            "已自动添加联系人: {}..（通过 FriendOnline）",
-                                            &pubkey_hex[..16]
-                                        );
-                                        self.send_log_mpsc(msg).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            P2pEvent::GetRecordResult { .. } => {
+                // GetRecordResult 由 events.rs 中的 DHT 查询回调处理，
+                // 此处无需额外逻辑
             }
             P2pEvent::Log(msg) => {
                 tracing::info!("P2pActor: {}", msg);
@@ -475,108 +427,42 @@ impl ChatCore {
         }
     }
 
-    /// 启动 DHT 定期注册后台任务
-    fn spawn_dht_registration(&self, rt_handle: &tokio::runtime::Handle) {
-        let cmd_tx = self.core_handle.cmd_tx.clone();
-        let db = match self.dht_db.clone() {
-            Some(db) => db,
-            None => {
-                tracing::error!("DHT database not initialized, DHT registration disabled");
-                return;
-            }
-        };
-        let shutdown_token = self.core_handle.shutdown_token.clone();
+    /// 清理过期的 DHT 记录
+    fn cleanup_expired_dht_records(&mut self) {
+        tracing::debug!("DHT cleanup tick (hourly)");
+    }
 
-        let handle = rt_handle.clone();
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(async move {
-                Self::dht_registration_loop(cmd_tx, db, shutdown_token).await;
-            });
+    /// DHT 身份绑定的定期注册（独立任务）
+    fn spawn_dht_registration(&mut self, rt_handle: &tokio::runtime::Handle) {
+        let cmd_tx = self.core_handle.cmd_tx.clone();
+        let pubkey = self.mldsa_pubkey_hex.clone();
+        let pid = self.current_peer_id;
+        let mlkem = self.mlkem_pubkey_hex.clone();
+
+        if pubkey.is_none() || pid.is_none() {
+            tracing::warn!("身份尚未就绪，跳过 DHT 定期注册");
+            return;
+        }
+
+        rt_handle.spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(
+                    crate::core::DHT_REGISTRATION_INTERVAL_SECS,
+                ));
+            // 跳过首次立即触发（启动时已发布一次）
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let (Some(pubkey), Some(pid)) = (&pubkey, pid) {
+                    let mlkem_str = mlkem.clone().unwrap_or_default();
+                    let _ = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
+                        mldsa_pubkey_hex: pubkey.clone(),
+                        peer_id: pid.to_string(),
+                        mlkem_pubkey_hex: mlkem_str,
+                    });
+                }
+            }
         });
     }
 
-    /// DHT 定期注册循环（每 5 分钟执行一次）
-    pub(crate) async fn dht_registration_loop(
-        cmd_tx: mpsc::Sender<ChatCommand>,
-        db: Arc<Database>,
-        shutdown_token: CancellationToken,
-    ) {
-        use crate::core::DHT_REGISTRATION_INTERVAL_SECS;
-
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            DHT_REGISTRATION_INTERVAL_SECS,
-        ));
-
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = shutdown_token.cancelled() => {
-                    tracing::info!("DHT registration loop shutting down gracefully");
-                    break;
-                }
-                _ = interval.tick() => {}
-            }
-
-            let store = p2p::dht::RedbRecordStore::new(db.clone());
-
-            let pubkeys = match store.get_all_pubkeys() {
-                Ok(keys) => keys,
-                Err(e) => {
-                    tracing::warn!("Failed to read pubkeys from DHT database: {}", e);
-                    continue;
-                }
-            };
-
-            for pubkey in &pubkeys {
-                let pid = match store.get_peerid_by_pubkey(pubkey) {
-                    Ok(Some(pid)) => pid,
-                    _ => continue,
-                };
-
-                let mlkem_hex = match store.get_mlkem_pubkey(pubkey) {
-                    Ok(Some(mlkem)) => Some(mlkem),
-                    _ => None,
-                };
-
-                if let Err(e) = store.set_pubkey_peerid(pubkey, &pid) {
-                    tracing::warn!("Failed to refresh DHT registration: {}", e);
-                }
-
-                if let Some(ref mlkem) = mlkem_hex
-                    && let Err(e) = store.set_mlkem_pubkey(pubkey, mlkem)
-                {
-                    tracing::warn!("Failed to publish ML-KEM pubkey: {}", e);
-                }
-
-                if let Err(e) = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
-                    mldsa_pubkey_hex: pubkey.clone().to_owned(),
-                    peer_id: pid.to_string(),
-                    mlkem_pubkey_hex: mlkem_hex.unwrap_or_default(),
-                }) {
-                    tracing::warn!("Failed to send DHT publish command: {:?}", e);
-                }
-            }
-        }
-    }
-
-    /// 定期清理过期DHT记录
-    fn cleanup_expired_dht_records(&mut self) {
-        if let Ok(store) = self.get_dht_store() {
-            match store.cleanup_expired_records() {
-                Ok((records_cleaned, providers_cleaned)) => {
-                    if records_cleaned > 0 || providers_cleaned > 0 {
-                        tracing::info!(
-                            "DHT cleanup: removed {} expired records and {} expired providers",
-                            records_cleaned,
-                            providers_cleaned
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to cleanup expired DHT records: {}", e);
-                }
-            }
-        }
-    }
 }

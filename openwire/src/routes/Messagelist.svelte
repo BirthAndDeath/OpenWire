@@ -480,7 +480,7 @@
         padding: 16px;
         background: transparent;
     }
-    .list {
+    :global(.list) {
         height: 100%;
         display: flex;
         flex-direction: column;

@@ -770,7 +770,9 @@ async fn save_nodes_config(
         bootstrap_nodes: bootstrap,
     };
 
-    config.save(&data_dir).map_err(|e| format!("保存节点配置失败: {}", e))?;
+    config
+        .save(&data_dir)
+        .map_err(|e| format!("保存节点配置失败: {}", e))?;
     tracing::info!("节点配置已更新，重启后生效");
     Ok(())
 }
@@ -970,7 +972,7 @@ fn create_placeholder_appdata() -> AppData {
         })),
     }
 }
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+
 /// 初始化成功后设置 AppData、启动事件循环。
 ///
 /// 此函数被 `run()` 中的初始化闭包调用，避免代码重复。
@@ -1075,7 +1077,7 @@ async fn setup_core_and_event_loop(
         }
     }
 }
-
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1233,7 +1235,6 @@ pub fn run() {
             save_nodes_config,
             reset_nodes_config
         ])
-
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|apphandle, event| match event {

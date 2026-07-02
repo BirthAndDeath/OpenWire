@@ -508,6 +508,127 @@ impl ChatCore {
         tracing::info!("离线消息重试完成");
     }
 
+    /// 仅向当前在线的好友重试待发送消息
+    ///
+    /// 与 retry_pending_messages() 的区别：
+    /// - 只处理接收方 PeerID 在 connected_peers 中（当前在线）的消息
+    /// - 对不在线的联系人跳过，不发起 DHT 查询（避免无效网络开销）
+    /// - 由主循环中 15 秒间隔的定时器触发，替代 ConnectionEstablished 过早的重试
+    ///
+    /// # 设计说明
+    /// 当对方上线后，FriendOnline 通知会缓存 (公钥→PeerID) 映射到 DHT 本地数据库，
+    /// 但 FriendOnline 可能延迟或丢失。此定时器确保：
+    ///   1. FriendOnline 到达后最多 15 秒内重试成功
+    ///   2. FriendOnline 丢失时不会永久等待，下一次定时器触发即可重试
+    ///   3. 只触达在线节点，不会对离线联系人做无效的 DHT 网络查询
+    pub(crate) async fn retry_pending_for_online_peers(&mut self) {
+        let pool = match storage::pool() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("数据库不可用，无法重试待发送消息");
+                return;
+            }
+        };
+
+        let pending_msgs = match storage::list_pending(pool).await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!("查询待发送消息列表失败: {}", e);
+                return;
+            }
+        };
+
+        if pending_msgs.is_empty() {
+            return;
+        }
+
+        // 只保留接收方 PeerID 在 connected_peers 中（当前在线）的消息
+        let online_pending: Vec<_> = pending_msgs
+            .into_iter()
+            .filter(|msg| {
+                match self.get_dht_store() {
+                    Ok(store) => match store.get_peerid_by_pubkey(&msg.peer_pubkey_hex) {
+                        Ok(Some(peer_id)) => {
+                            let online = self.connected_peers.contains(&peer_id);
+                            if !online {
+                                tracing::debug!(
+                                    "待发消息 {} 的接收方 {}.. 不在线，跳过",
+                                    msg.id,
+                                    &msg.peer_pubkey_hex[..16]
+                                );
+                            }
+                            online
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "待发消息 {} 的接收方 {}.. PeerID 未缓存，跳过",
+                                msg.id,
+                                &msg.peer_pubkey_hex[..16]
+                            );
+                            false
+                        }
+                    },
+                    Err(_) => false,
+                }
+            })
+            .collect();
+
+        if online_pending.is_empty() {
+            tracing::debug!("没有面向在线好友的待发送消息");
+            return;
+        }
+
+        tracing::info!(
+            "定时重试: 向 {} 位在线好友重试 {} 条待发送消息",
+            online_pending.len(),
+            online_pending.len()
+        );
+
+        for msg in &online_pending {
+            let msgtype = detect_msgtype(&msg.content);
+
+            // 从 content 字段恢复原始数据（与 retry_pending_messages 逻辑一致）
+            let original_data = if msgtype == ChatMessageType::Text {
+                msg.content.as_bytes().to_vec()
+            } else {
+                match msg.content.find(']') {
+                    Some(pos) => {
+                        let hex_part = msg.content[pos + 1..].trim();
+                        match hex::decode(hex_part) {
+                            Ok(decoded) => decoded,
+                            Err(_) => msg.content.as_bytes().to_vec(),
+                        }
+                    }
+                    None => msg.content.as_bytes().to_vec(),
+                }
+            };
+
+            match self
+                .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true)
+                .await
+            {
+                Ok(message_hash) => {
+                    tracing::info!(
+                        "定时重试: 在线消息 {} 发送成功, hash={}..",
+                        msg.id,
+                        &message_hash[..16]
+                    );
+                    if let Err(e) = storage::update_message_hash(pool, msg.id, &message_hash).await {
+                        tracing::warn!("更新消息 {} 的 hash 失败: {}", msg.id, e);
+                    }
+                    if let Err(e) = storage::mark_sent(pool, msg.id).await {
+                        tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("定时重试: 在线消息 {} 发送失败: {}", msg.id, e);
+                }
+            }
+        }
+
+        tracing::info!("定时重试完成");
+    }
+
     /// 通过 DHT 网络查询或已建立的连接查找对方的 PeerID
     ///
     /// 查找顺序：

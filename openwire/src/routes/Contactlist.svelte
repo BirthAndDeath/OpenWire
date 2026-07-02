@@ -107,7 +107,7 @@
         >
             <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
         </svg>
-        <input placeholder="搜索..." bind:value={q} />
+        <input placeholder="搜索..." name="contact_search" bind:value={q} />
         {#if q}<button class="clear" onclick={() => (q = "")}>×</button>{/if}
     </div>
 

@@ -117,6 +117,7 @@
                 bind:this={area}
                 bind:value={text}
                 use:resize
+                name="message"
                 placeholder={disabled ? "请先选择联系人..." : "输入消息..."}
                 maxlength="4096"
                 rows="1"
