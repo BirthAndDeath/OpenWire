@@ -1,6 +1,8 @@
 use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
-use libp2p::{PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, ping, relay};
+use libp2p::{
+    PeerId, StreamProtocol, Swarm, dcutr, identify, mdns, noise, ping, relay, tcp, yamux,
+};
 
 use redb::Database;
 use std::num::NonZero;
@@ -89,6 +91,12 @@ pub fn swarm_init(
 ) -> P2pResult<Swarm<MyBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
         .with_quic()
         .with_dns()
         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
@@ -169,7 +177,16 @@ pub fn swarm_init(
             P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
         })?)
         .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    swarm
+        .listen_on("/ip6/::/tcp/0".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
     // 如果有 relay 节点配置，向 relay 节点发起连接以获取中继服务
     // relay 协议会自动处理 reservation，连接成功后本节点会获得一个 relay 地址
     for (relay_peer_id, relay_addr) in relay_nodes {

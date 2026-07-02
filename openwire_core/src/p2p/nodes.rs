@@ -25,13 +25,10 @@ pub struct NodesConfig {
 impl Default for NodesConfig {
     fn default() -> Self {
         Self {
-            relay_nodes: vec![
-                // IPFS 公共 relay 节点
-                [
-                    "12D3KooW9kGJhY7L6Kz3o7LxPq5n5q5q5q5q5q5q5q5q5q5q5q5q5q5q5q5".to_string(),
-                    "/dnsaddr/relay.libp2p.io".to_string(),
-                ],
-            ],
+            // Relay 节点列表默认为空。
+            // 节点启动后通过 DHT 引导 + Identify 协议发现网络中的 relay 节点，
+            // 用户也可通过设置界面（get_nodes_config/save_nodes_config）手动添加。
+            relay_nodes: vec![],
             bootstrap_nodes: vec![
                 // ============================================================
                 // IPFS 官方 bootstrap 节点（dnsaddr 方式）
@@ -368,4 +365,3 @@ fn extract_quoted_string(s: &str) -> Result<String, String> {
     let inner = &s[1..s.len() - 1];
     Ok(inner.to_string())
 }
-
