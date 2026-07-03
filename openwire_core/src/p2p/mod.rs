@@ -1,6 +1,6 @@
 /// 网络行为组合（libp2p NetworkBehaviour）
 pub mod behaviour;
-/// DHT 记录存储（Redb 后端，目前停用，未来可能考虑用于服务器节点）
+/// DHT 记录存储（Redb 后端，当前停用 —— Kademlia 使用 MemoryStore，此模块仅用于本地持久化缓存）
 pub mod dht;
 mod events;
 pub mod netevent;

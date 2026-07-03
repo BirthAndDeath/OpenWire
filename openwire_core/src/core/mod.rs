@@ -7,7 +7,7 @@ use tokio::try_join;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-/// 消息通道容量
+/// 消息通道容量（背压控制，防止内存溢出）
 const CHANNEL_CAPACITY: usize = 64;
 /// DHT 定期注册间隔（秒）- 5分钟
 pub(crate) const DHT_REGISTRATION_INTERVAL_SECS: u64 = 300;
@@ -24,13 +24,19 @@ use crate::{
     p2p, storage,
     transfer::FileTransferState,
 };
-
+/// 命令处理
 pub mod command_handler;
+/// 联系人操作
 pub mod contact_ops;
+/// DHT 操作（停用）
 pub mod dht_ops;
+/// 事件处理
 pub mod event_loop;
+///（未稳定标记）文件传输
 pub mod file_transfer;
+/// 联系人操作
 pub mod identity_ops;
+/// 消息操作
 pub mod message_ops;
 
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
@@ -166,11 +172,15 @@ impl ChatCore {
         // 避免 swarm_init 内部 create_kademlia_with_validator 再次打开同一文件导致锁冲突。
         let dht_db = {
             let dht_path = cfg.data_dir.join("dht.redb");
-            // 先删除旧数据库文件（切换身份时 DHT 存储需要重新初始化）
-            let _ = std::fs::remove_file(&dht_path);
-            let db = redb::Database::create(&dht_path).map_err(|e| {
-                CoreError::InitFailed(format!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))
-            })?;
+            let db = if dht_path.exists() {
+                redb::Database::open(&dht_path).map_err(|e| {
+                    CoreError::InitFailed(format!("无法打开 DHT 数据库 {:?}: {}", dht_path, e))
+                })?
+            } else {
+                redb::Database::create(&dht_path).map_err(|e| {
+                    CoreError::InitFailed(format!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))
+                })?
+            };
             Some(Arc::new(db))
         };
 
@@ -230,17 +240,9 @@ impl ChatCore {
         let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
 
         // 创建 P2pActor 并启动
-        let p2p_actor = P2pActor::new(
-            swarm,
-            dht_db.clone(),
-            cfg.data_dir.clone(),
-            p2p_event_tx,
-        );
-        let p2p_handle = crate::actor::p2p::start_p2p_actor(
-            p2p_actor,
-            CHANNEL_CAPACITY,
-            shutdown_token.clone(),
-        );
+        let p2p_actor = P2pActor::new(swarm, dht_db.clone(), cfg.data_dir.clone(), p2p_event_tx);
+        let p2p_handle =
+            crate::actor::p2p::start_p2p_actor(p2p_actor, CHANNEL_CAPACITY, shutdown_token.clone());
 
         Ok(ChatCore {
             p2p_handle,
@@ -283,20 +285,26 @@ impl ChatCore {
         self.rx_message.take()
     }
 
+    /// 获取核心句柄，用于外部控制核心（发送命令、关闭等）
     pub fn handler(&self) -> CoreHandle {
         self.core_handle.clone()
     }
 
-    /// 发送消息到网络（通过 P2pActor）
+    /// 通过 P2pActor 发送消息到网络
     pub(crate) async fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
-        let _ = self.p2p_handle.send(
-            crate::actor::ActorCommand::Custom(P2pCommand::SendMessage {
-                peer_id: peerid,
-                message,
-            }),
-        ).await;
+        let _ = self
+            .p2p_handle
+            .send(crate::actor::ActorCommand::Custom(
+                P2pCommand::SendMessage {
+                    peer_id: peerid,
+                    message,
+                },
+            ))
+            .await;
     }
 
+    /// 构建签名消息（加密后数据 + ML-DSA 签名）
+    /// 构建签名消息（加密数据 + ML-DSA 签名 + 时间戳/nonce）
     pub(crate) async fn build_signed_message(
         &self,
         msgtype: ChatMessageType,
@@ -421,11 +429,15 @@ impl Drop for ChatCore {
         // 通知 P2pActor 保存路由表并关闭
         // 注意：drop 是同步上下文，不能使用 send_blocking（会 panic），
         // 使用 try_send 非阻塞发送，如果通道满则丢弃（P2pActor 即将关闭）
-        let _ = self.p2p_handle.tx.try_send(
-            crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
-        );
-        let _ = self.p2p_handle.tx.try_send(
-            crate::actor::ActorCommand::Custom(P2pCommand::Shutdown),
-        );
+        let _ = self
+            .p2p_handle
+            .tx
+            .try_send(crate::actor::ActorCommand::Custom(
+                P2pCommand::SaveRoutingTable,
+            ));
+        let _ = self
+            .p2p_handle
+            .tx
+            .try_send(crate::actor::ActorCommand::Custom(P2pCommand::Shutdown));
     }
 }

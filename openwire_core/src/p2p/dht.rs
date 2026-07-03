@@ -28,12 +28,21 @@ struct StoredProvider {
     provider: String,
     expires: Option<u64>,
 }
-
+//！
+//！停用中 —— RedbRecordStore 不再作为 Kademlia 协议储存使用。
+//！当前 Kademlia 使用 MemoryStore（libp2p 原生内存存储）。
+//！RedbRecordStore 仅作为本地持久化缓存（pubkey↔peerid、mlkem 公钥映射），
+//！通过 get_dht_store() / lookup_peerid_by_pubkey() 访问。
+//！
+//！保留本文件不删除，未来可能用于服务器节点或需要持久化 Kademlia 记录的场景。
+//！
+/// 基于 Redb 的 Kademlia 记录存储（当前仅用于本地缓存，不接入 Kademlia 协议）
 pub struct RedbRecordStore {
     db: Arc<Database>,
 }
 
 impl RedbRecordStore {
+    /// 创建新的 RedbRecordStore，自动创建所需表
     pub fn new(db: Arc<Database>) -> Self {
         // 预先创建所有需要的表，避免后续 open_table() 时因表不存在而报错
         if let Ok(write_txn) = db.begin_write() {
@@ -99,7 +108,7 @@ impl RedbRecordStore {
         Ok(result)
     }
 
-    // Multiaddr management
+    /// 添加 PeerID 的多地址到 DHT 存储
     pub fn add_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
@@ -123,6 +132,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 移除 PeerID 的多地址
     pub fn remove_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
@@ -147,6 +157,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 获取 PeerID 的所有多地址
     pub fn get_multiaddrs(&self, peer_id: &PeerId) -> DhtResult<Vec<Multiaddr>> {
         let peer_id_str = peer_id.to_string();
         self.with_read_txn(|read_txn| {
@@ -160,6 +171,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 随机获取一个多地址
     pub fn get_random_multiaddr(&self, peer_id: &PeerId) -> DhtResult<Option<Multiaddr>> {
         let mut addrs = self.get_multiaddrs(peer_id)?;
         if addrs.is_empty() {
@@ -170,7 +182,7 @@ impl RedbRecordStore {
         Ok(Some(addrs[0].clone()))
     }
 
-    // Pubkey to PeerID mapping (temporary, stored in DHT)
+    /// 存储公钥 → PeerID 映射
     pub fn set_pubkey_peerid(&self, pubkey_hex: &str, peer_id: &PeerId) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         self.with_write_txn(|write_txn| {
@@ -180,6 +192,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 通过公钥查询 PeerID
     pub fn get_peerid_by_pubkey(&self, pubkey_hex: &str) -> DhtResult<Option<PeerId>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
@@ -214,6 +227,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 删除公钥 → PeerID 映射
     pub fn remove_pubkey_peerid(&self, pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;

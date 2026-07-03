@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// 文件流子模块
 pub mod file_stream;
 pub use file_stream::{
     ChunkReadConfig, ChunkResponse, FileHashInfo, FileStreamChunk, FileStreamMeta,
@@ -18,8 +19,11 @@ const MESSAGE_FUTURE_TOLERANCE_SECS: u64 = 60;
 #[repr(u8)]
 #[non_exhaustive]
 pub enum ChatMessageType {
+    /// 文本消息
     Text = 0,
+    /// 文件哈希分享
     FileHash = 1,
+    /// 文件流分片
     FileStream = 2,
     /// 文件下载请求（接收方发起，请求发送方开始传输文件）
     FileDownloadRequest = 3,
@@ -32,6 +36,7 @@ pub enum ChatMessageType {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// 聊天消息结构，包含签名、时间戳和完整性校验
 pub struct ChatMessage {
+    /// 消息类型
     pub msgtype: ChatMessageType,
     /// 消息发送时间戳 (ms since UNIX_EPOCH)
     pub timestamp: u64,
@@ -47,8 +52,10 @@ pub struct ChatMessage {
     pub sender_public_key: Vec<u8>,
 }
 
+/// 消息响应（签名确认）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatResponse {
+    /// 响应时间戳
     pub timestamp: u64,
     /// 随机 nonce，用于防止重放攻击
     pub nonce: [u8; 16],
@@ -107,6 +114,7 @@ impl ChatResponse {
 // ========== ChatMessage 方法 ==========
 
 impl ChatMessage {
+    /// 计算消息哈希（msgtype + timestamp + nonce + data）
     pub fn compute_hash(
         msgtype: ChatMessageType,
         timestamp: u64,
@@ -185,6 +193,7 @@ impl ChatMessage {
             })
     }
 
+    /// 检查消息是否在有效时间窗口内（防止重放攻击）
     pub fn is_fresh(&self) -> bool {
         let now = SystemTime::now();
         let message_time = UNIX_EPOCH + Duration::from_millis(self.timestamp);

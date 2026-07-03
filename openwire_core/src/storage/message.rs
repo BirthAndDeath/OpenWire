@@ -3,21 +3,28 @@ use sqlx::{self, AssertSqlSafe, FromRow, Pool, Row, Sqlite};
 use crate::error::{StorageError, StorageResult};
 
 #[derive(Debug, Clone, FromRow)]
+/// 消息结构
 pub struct Message {
     pub id: i64,
     /// 己方身份
     pub owner_identity_id: String,
     /// 对方 ML-DSA 公钥 hex
     pub peer_pubkey_hex: String,
+    /// 消息内容
     pub content: String,
+    /// 是否已发送（1=是，0=否）
     pub is_outgoing: i32,
+    /// 待发送状态（0=已发送，1=待发送，2=失败）
     pub pending: i32,
+    /// 时间戳
     pub ts: i64,
+    /// 消息哈希（用于去重和送达回执匹配）
     pub message_hash: Option<String>,
 }
 
 // ========== 消息管理 ==========
 
+/// 添加一条消息到数据库
 pub async fn add_message(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -88,6 +95,7 @@ pub async fn add_message_with_hash(
     Ok(Some(row.get(0)))
 }
 
+/// 查询单条消息
 pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<Option<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
@@ -99,6 +107,7 @@ pub async fn get_message(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<Opti
     .map_err(Into::into)
 }
 
+/// 获取与指定联系人的消息列表（游标分页）
 pub async fn get_messages(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -172,6 +181,7 @@ pub async fn get_last_message(
     .map_err(Into::into)
 }
 
+/// 删除单条消息
 pub async fn delete_message(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<u64> {
     Ok(sqlx::query("DELETE FROM messages WHERE id = ?")
         .bind(msg_id)
@@ -197,7 +207,7 @@ pub async fn delete_messages_by_peer(
 }
 
 // ========== 批量操作 ==========
-
+/// 批量添加消息
 pub async fn add_messages_batch(
     pool: &Pool<Sqlite>,
     messages: &[(String, String, String, bool, bool)], // (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending)
@@ -272,6 +282,7 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageR
 
 // ========== 待发送消息管理（离线消息队列） ==========
 
+/// 获取所有待发送消息（离线消息队列）
 pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
@@ -282,6 +293,7 @@ pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     .map_err(Into::into)
 }
 
+/// 获取所有发送失败的消息
 pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
@@ -292,6 +304,7 @@ pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     .map_err(Into::into)
 }
 
+/// 标记消息为已发送
 pub async fn mark_sent(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 0 WHERE id = ?")
         .bind(msg_id)
@@ -301,6 +314,7 @@ pub async fn mark_sent(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> 
     Ok(rows > 0)
 }
 
+/// 标记消息为待发送
 pub async fn mark_pending(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 1 WHERE id = ?")
         .bind(msg_id)
@@ -310,6 +324,7 @@ pub async fn mark_pending(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<boo
     Ok(rows > 0)
 }
 
+/// 标记消息为发送失败
 pub async fn mark_failed(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool> {
     let rows = sqlx::query("UPDATE messages SET pending = 2 WHERE id = ?")
         .bind(msg_id)

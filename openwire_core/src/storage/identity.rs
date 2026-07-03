@@ -10,21 +10,28 @@ use crate::error::{StorageError, StorageResult};
 
 static DB_POOL: std::sync::OnceLock<Pool<Sqlite>> = std::sync::OnceLock::new();
 
+/// 身份信息
 #[derive(Debug, Clone, FromRow)]
 pub struct Identity {
+    /// 数据库 ID
     pub id: i64,
-    pub identity_id: String, // 身份ID (Hex encoded ML-DSA PubKey)
+    /// 身份 ID（ML-DSA 公钥 hex）
+    pub identity_id: String,
+    /// 是否为当前身份（1=是，0=否）
     pub is_current: i32,
+    /// 创建时间
     pub created_at: i64,
 }
 
 // ========== 初始化 ==========
 
+/// 从 CoreConfig 初始化数据库连接池
 pub async fn init(cfg: &CoreConfig) -> StorageResult<()> {
     let db_path = cfg.data_dir.join("database.sqlite");
     init_path(&db_path).await
 }
 
+/// 从指定路径初始化数据库连接池
 pub async fn init_path(path: &Path) -> StorageResult<()> {
     if path.is_dir() {
         return Err(StorageError::InvalidPath(
@@ -69,6 +76,7 @@ pub async fn init_path(path: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// 获取数据库连接池
 pub fn pool() -> Option<&'static Pool<Sqlite>> {
     DB_POOL.get()
 }
@@ -96,6 +104,7 @@ pub async fn get_current_identity(pool: &Pool<Sqlite>) -> StorageResult<Option<S
     Ok(row)
 }
 
+/// 设置当前身份
 pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> StorageResult<()> {
     sqlx::query("UPDATE identities SET is_current = 0")
         .execute(pool)
@@ -107,6 +116,7 @@ pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> Sto
     Ok(())
 }
 
+/// 列出所有身份
 pub async fn list_identities(pool: &Pool<Sqlite>) -> StorageResult<Vec<Identity>> {
     sqlx::query_as::<_, Identity>(
         r#"SELECT id, identity_id, is_current, created_at FROM identities ORDER BY id"#,
@@ -134,12 +144,20 @@ pub async fn delete_identity(
     );
 
     // 2. 清理 DHT 中的记录（PUBKEY_PEERID_TABLE 和 PUBKEY_MLKEM_TABLE）
+    // DHT 数据库由主进程持有，此处尝试打开清理；若被锁则跳过（非关键操作）
     let dht_path = data_dir.join("dht.redb");
-    if let Ok(db) = redb::Database::create(&dht_path) {
-        use std::sync::Arc;
-        let store = crate::p2p::dht::RedbRecordStore::new(Arc::new(db));
-        let _ = store.remove_pubkey_peerid(identity_id);
-        let _ = store.remove_mlkem_pubkey(identity_id);
+    if dht_path.exists() {
+        match redb::Database::open(&dht_path) {
+            Ok(db) => {
+                use std::sync::Arc;
+                let store = crate::p2p::dht::RedbRecordStore::new(Arc::new(db));
+                let _ = store.remove_pubkey_peerid(identity_id);
+                let _ = store.remove_mlkem_pubkey(identity_id);
+            }
+            Err(e) => {
+                tracing::warn!("无法打开 DHT 数据库清理记录（可能已被主进程锁定）: {}", e);
+            }
+        }
     }
 
     // 3. 删除数据库记录
