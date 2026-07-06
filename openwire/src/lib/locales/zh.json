@@ -58,7 +58,7 @@
     "qr_scan_fail": "未能识别二维码，请重试",
     "enter_name_for_friend": "请输入好友名称",
     "screenshot_protection": "截屏保护",
-    "screenshot_protection_desc": "开启后背景眼睛图标替换为闭眼图标，防止屏幕截图泄露视线方向",
+    "screenshot_protection_desc": "开启后背景眼睛图标替换为闭眼图标，防止屏幕截图",
     "password_settings": "密码设置",
     "password_settings_desc": "当系统密钥环（Keyring）不可用时，使用密码加密身份数据",
     "set_password": "设置密码",

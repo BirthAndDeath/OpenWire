@@ -6,35 +6,35 @@ edition = "2021"
 [features]
 default = []
 
-
 [dependencies]
-# 安全内存
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
-
-# 错误处理
 anyhow = "1.0"
-
-
-# Hex编码
 hex = "0.4.3"
-
-# 日志
 tracing = "0.1"
-
-# 加密文件存储
 aes-gcm = "0.11.0"
 blake3 = "1.8.5"
 rand = "0.10.2"
 
-# 密码 KDF（Argon2id）
-argon2 = "0.5.3"
-
 keyring = { version = "4.1.2" }
 keyring-core = "1.0.0"
-# Unix mlock支持
-[target.'cfg(unix)'.dependencies]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1.1.0"
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = "1.0.0"
 libc = "0.2.186"
 
-# Windows VirtualLock支持
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+ndk-context = "0.1.1"
+libc = "0.2.186"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = "1.0.0"
+libc = "0.2.186"
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+libc = "0.2.186"
+zbus-secret-service-keyring-store = "1.0.0"

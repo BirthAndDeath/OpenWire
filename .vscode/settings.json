@@ -14,5 +14,6 @@
   "chat.tools.terminal.autoApprove": {
     "cargo check": true,
     "cargo clippy": true
-  }
+  },
+  "java.configuration.updateBuildConfiguration": "interactive"
 }
