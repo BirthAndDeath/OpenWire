@@ -33,22 +33,37 @@ version: 0.0.1
 
 ## Features
 
-*(To be added)*
+- End-to-end encryption using ML-DSA + ML-KEM (post-quantum)
+- P2P messaging with libp2p (TCP, QUIC, WebSocket, mDNS, DHT/Kademlia)
+- File transfer with chunked compressed streaming, integrity verification, and resume support
+- Auto relay for NAT traversal (Circuit Relay v2, DCUtR hole punching, AutoNAT)
+- Offline message queue with auto-retry when contacts come online
+- SQLite local storage with SQLx
+- Post-quantum ready: AWS-LC-RS ML-DSA-65, ML-KEM-768, AES-GCM
+- CLI interface based on ratatui
+- Desktop GUI based on Tauri 2 + SvelteKit
+- Cross-platform: Windows, macOS, Linux
 
 ## Project Structure
 
-- `/chat_cli` contains the CLI project (based on ratatui, under maintenance)
-- `/chat_tauri` contains the Tauri project (under maintenance)
-- `/chat_core` contains the core logic (evolving)
+- `openwire_core/` — core P2P networking, crypto, file transfer, storage
+- `openwire/` — Tauri 2 + SvelteKit desktop application
+- `openwire_cli/` — CLI application (ratatui TUI + JSON mode)
+- `openwire_server/` — Cloudflare Workers (relay registry, presence, signaling)
+- `libp2p-pathranker/` — custom libp2p Kademlia path ranking library
+- `rootcell/` — keyring/secure key storage library
 
-### chat_tauri
+## Technology Stack
 
-- **Framework**: Tauri 2
-- **Backend**: Rust
-
-### chat_cli
-
-- **Interface**: ratatui
+- **Language**: Rust
+- **P2P**: libp2p 0.56 (TCP, QUIC, WebSocket, Relay, DHT/Kademlia, AutoNAT, DCUtR, mDNS, Identify, Ping)
+- **Crypto**: ML-DSA-65 (signing), ML-KEM-768 (key exchange), AES-GCM (encryption)
+- **Storage**: SQLite (sqlx), Redb (DHT record store)
+- **Serialization**: postcard (CBOR-based), serde
+- **Compression**: zstd
+- **Frontend**: Tauri 2 + SvelteKit
+- **CLI**: ratatui
+- **Server**: Cloudflare Workers
 
 ## Development and Testing
 
@@ -60,38 +75,23 @@ version: 0.0.1
 
 ### Setup
 
-If you use Tauri, make sure Tauri CLI is installed.
-[Install Tauri CLI](https://tauri.app/zh-cn/start/prerequisites/)
-
-If cargo times out, try using mirror sources.
-
 ```bash
 # clone and enter the project
-cd myapp
+git clone https://github.com/OpenWire/im.git
+cd im
 
-# enter the tauri project
-cd chat_tauri
-
-# install dependencies
+# run desktop GUI
+cd openwire
 npm install
+npm run tauri dev
 
-# run in development mode
-npm tauri dev
-```
-
-You can also enter the CLI directory and run:
-
-```bash
+# or run CLI
+cd openwire_cli
 cargo run
-```
 
-CLI usage example
-
-### Build
-
-```bash
-# build
-npm tauri build
+# build desktop GUI
+cd openwire
+npm run tauri build
 ```
 
 ## Contact
@@ -104,7 +104,7 @@ Contributions are welcome. Unless explicitly stated otherwise, contributions are
 ## HISTORY
 
 - 2025 Project created
-- 2026 Still tinkering
+- 2026 Core P2P networking, encryption, file transfer implemented
 
 ## PLAN
 
@@ -137,7 +137,7 @@ OpenWire 是一个跨平台 P2P 聊天应用程序，目前处于非常早期的
 - 此项目版本目前未经审计
 - 功能不完善，无完整社区
 
-## License
+## License-zh
 
 This project is licensed under the [**GNU Affero General Public License v3.0**](LICENSE)。
 出于对通信软件安全性的考虑，暂定为AGPLv3.0。
@@ -149,22 +149,36 @@ version: 0.0.1
 
 ## 特性
 
-*(待补充)*
+- 端到端加密：ML-DSA + ML-KEM（后量子密码）
+- P2P 消息：libp2p 网络（TCP, QUIC, WebSocket, mDNS, DHT/Kademlia）
+- 文件传输：分片压缩流式传输，完整性校验，断点续传
+- 自动中继：NAT 穿透（Circuit Relay v2, DCUtR 打洞, AutoNAT）
+- 离线队列：联系人上线后自动重试
+- 本地存储：SQLite + Redb
+- CLI：ratatui TUI
+- GUI：Tauri 2 + SvelteKit
+- 跨平台：Windows / macOS / Linux
 
 ## 项目结构
 
-- `/chat_cli` 存放 CLI 项目（基于 ratatui，维护中）
-- `/chat_tauri` 存放 Tauri 项目（维护中）
-- `/chat_core` 存放核心项目逻辑（演进中）
+- `openwire_core/` — 核心 P2P 网络、加密、文件传输、存储
+- `openwire/` — Tauri 2 + SvelteKit 桌面应用
+- `openwire_cli/` — CLI 应用（ratatui TUI + JSON 模式）
+- `openwire_server/` — Cloudflare Workers（中继注册、在线状态、信令）
+- `libp2p-pathranker/` — 自定义 libp2p Kademlia 路径排序库
+- `rootcell/` — 密钥环/安全密钥存储库
 
-### chat_tauri
+## 技术栈
 
-- **框架**: Tauri 2
-- **后端**: Rust
-
-### chat_cli
-
-- **界面**: ratatui
+- **语言**: Rust
+- **P2P**: libp2p 0.56（TCP, QUIC, WebSocket, Relay, DHT/Kademlia, AutoNAT, DCUtR, mDNS, Identify, Ping）
+- **加密**: ML-DSA-65（签名）, ML-KEM-768（密钥交换）, AES-GCM（数据加密）
+- **存储**: SQLite（sqlx）, Redb（DHT 记录存储）
+- **序列化**: postcard（CBOR-based）, serde
+- **压缩**: zstd
+- **前端**: Tauri 2 + SvelteKit
+- **CLI**: ratatui
+- **服务端**: Cloudflare Workers
 
 ## 开发测试
 
@@ -176,38 +190,23 @@ version: 0.0.1
 
 ### 开发环境搭建
 
-如果使用 Tauri，请确保已安装 Tauri CLI。
-[安装 tauri cli](https://tauri.app/zh-cn/start/prerequisites/)
-
-如果 cargo 网络超时，可以尝试使用镜像源。
-
 ```bash
-# 克隆项目后进入目录
-cd myapp
+# 克隆项目
+git clone https://github.com/OpenWire/im.git
+cd im
 
-# 进入 tauri 项目
-cd chat_tauri
-
-# 安装依赖
+# 运行桌面 GUI
+cd openwire
 npm install
+npm run tauri dev
 
-# 开发调试
-npm tauri dev
-```
-
-你也可以进入 CLI 目录然后执行：
-
-```bash
+# 或运行 CLI
+cd openwire_cli
 cargo run
-```
 
-运行 CLI 事例
-
-### 开发构建
-
-```bash
-# 构建
-npm tauri build
+# 构建桌面 GUI
+cd openwire
+npm run tauri build
 ```
 
 ## 联系
@@ -217,19 +216,14 @@ npm tauri build
 
 欢迎贡献！在未明确申明的情况下，默认您的贡献遵守本项目的 license。
 
-## HISTORY
+## HISTORY-zh
 
 - 2025 创建项目
-- 2026 摸鱼中
+- 2026 完成核心 P2P 网络、加密、文件传输实现
 
-## PLAN
+## PLAN-zh
 
-搭建基础框架 ing
-未来展望：
-
-- 算力共享？
-- 实现 p2p 传输层的网页？
-
-### 吐槽
-
-^q^
+- 基础框架搭建完成
+- 未来展望：
+  - 算力共享？
+  - 实现 P2P 传输层的网页？
