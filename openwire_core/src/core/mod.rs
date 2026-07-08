@@ -84,6 +84,8 @@ pub struct ChatCore {
     pub(crate) file_transfers: HashMap<String, FileTransferState>,
     /// 文件路径映射（file_id -> 本地文件路径），用于发送方查找文件
     pub(crate) file_path_map: HashMap<[u8; 32], PathBuf>,
+    /// 上次文件传输超时扫描时间（限制扫描频率，避免每分片触发）
+    pub(crate) last_file_timeout_scan: std::time::Instant,
     /// 内存 DHT 缓存
     pub(crate) dht_cache: Arc<DhtCache>,
     /// 已建立连接的 PeerID 及其连接数（用于在线状态计数）
@@ -264,6 +266,7 @@ impl ChatCore {
             download_dir,
             file_transfers: HashMap::new(),
             file_path_map: HashMap::new(),
+            last_file_timeout_scan: std::time::Instant::now(),
             dht_cache,
             connected_peers: std::collections::HashMap::new(),
             peerid_to_pubkey: HashMap::new(),

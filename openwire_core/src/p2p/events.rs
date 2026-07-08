@@ -432,7 +432,7 @@ async fn handle_file_download_request(
         &file_hash_hex[..16]
     );
 
-    // 查 sent_files 历史验证合法性
+    // 查 sent_files 历史验证合法性，数据库不可用时降级到 file_path_map
     let sent_file = match storage::pool() {
         Some(pool) => match storage::get_sent_file(pool, &request.file_hash).await {
             Ok(Some(sent)) => Some(sent),
@@ -441,12 +441,17 @@ async fn handle_file_download_request(
         None => None,
     };
 
-    let Some(sent_file) = sent_file else {
+    // 优先使用 sent_files 记录的文件路径，否则回退到 file_path_map
+    let file_path = sent_file
+        .as_ref()
+        .map(|s| std::path::PathBuf::from(&s.file_path))
+        .or_else(|| core.file_path_map.get(&request.file_hash).cloned());
+
+    let Some(file_path) = file_path else {
         tracing::warn!(
             "拒绝下载请求: file_hash={}.. 不在发送历史中",
             &file_hash_hex[..16]
         );
-        // 发送拒绝响应
         let response = crate::message::DownloadResponse {
             file_hash: request.file_hash,
             accepted: false,
@@ -467,8 +472,14 @@ async fn handle_file_download_request(
         return;
     };
 
+    let filename = sent_file
+        .map(|s| s.filename)
+        .unwrap_or_else(|| file_path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string());
+
     // 接受请求：注册到 file_path_map 供分片发送使用
-    let file_path = std::path::PathBuf::from(&sent_file.file_path);
     core.file_path_map.insert(request.file_hash, file_path.clone());
 
     // 获取文件信息
@@ -482,7 +493,6 @@ async fn handle_file_download_request(
     let file_size = metadata.len();
     let chunk_size: u32 = 256 * 1024;
     let total_chunks = file_size.div_ceil(chunk_size as u64) as u32;
-    let filename = sent_file.filename;
 
     let file_hash = request.file_hash;
 
@@ -581,15 +591,35 @@ async fn handle_file_download_request(
             }
         };
 
-        if let Err(e) = core
-            .send_text(
-                sender_mldsa_pubkey_hex,
-                ChatMessageType::FileStream,
-                chunk_data,
-            )
-            .await
-        {
-            tracing::warn!("发送文件分片 {} 失败: {}", chunk_index, e);
+        let mut send_ok = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300 * attempt)).await;
+            }
+            match core
+                .send_text(
+                    sender_mldsa_pubkey_hex,
+                    ChatMessageType::FileStream,
+                    chunk_data.clone(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    send_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "发送文件分片 {} 失败 (尝试 {}/3): {}",
+                        chunk_index,
+                        attempt + 1,
+                        e
+                    );
+                }
+            }
+        }
+        if !send_ok {
+            tracing::error!("发送文件分片 {} 失败（3次尝试均已失败），传输中止", chunk_index);
             return;
         }
 

@@ -5,10 +5,12 @@ use std::time::Instant;
 use crate::{
     command::{FileTransferProgress, MessageEvent},
     core::ChatCore,
+    crypto::constant_time_compare,
     error::CoreError,
     message::{ChatMessageType, FileStreamChunk},
     transfer::{FileTransferState, TransferStatus},
 };
+use sha2::Digest;
 
 /// 最大文件名长度（字节），防止超长文件名导致的资源耗尽
 const MAX_FILENAME_BYTES: usize = 512;
@@ -383,18 +385,23 @@ impl ChatCore {
             }
         }
 
-        // ========== 超时检查：清理超时的传输 ==========
-        // 检查所有活跃传输是否超时，超时的标记为失败并清理
-        // 防止因发送方断开连接或网络故障导致传输永远挂起
+        // ========== 超时检查：清理超时的传输（限制每 60 秒扫描一次） ==========
         let now = Instant::now();
-        let timed_out_ids: Vec<String> = self
-            .file_transfers
-            .iter()
-            .filter(|(_, state)| {
-                now.duration_since(state.started_at) > crate::transfer::TRANSFER_TIMEOUT
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let timed_out_ids: Vec<String> = if now.duration_since(self.last_file_timeout_scan)
+            > std::time::Duration::from_secs(60)
+        {
+            self.last_file_timeout_scan = now;
+            self.file_transfers
+                .iter()
+                .filter(|(_, state)| {
+                    now.duration_since(state.started_at)
+                        > crate::transfer::TRANSFER_TIMEOUT
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         for id in &timed_out_ids {
             if let Some(state) = self.file_transfers.get_mut(id) {
                 tracing::warn!(
@@ -461,12 +468,24 @@ impl ChatCore {
                 "分片 {} 已接收，跳过（断点续传幂等处理）",
                 chunk.chunk_index
             );
-            // 发送进度事件（结构化数据，上层负责序列化为 JSON）
+            // 精确计算已接收字节数（最后一个分片可能小于 chunk_size）
+            let last_chunk_index = state.total_chunks - 1;
+            let last_chunk_size = if state.total_size % state.chunk_size as u64 == 0 {
+                state.chunk_size as u64
+            } else {
+                state.total_size % state.chunk_size as u64
+            };
+            let received_bytes = state
+                .received_chunks
+                .iter()
+                .map(|&idx| if idx == last_chunk_index { last_chunk_size } else { state.chunk_size as u64 })
+                .sum();
+
             let progress_event = FileTransferProgress {
                 filename: state.filename.clone(),
                 chunk_index: chunk.chunk_index,
                 total_chunks: state.total_chunks,
-                received_bytes: state.received_chunks.len() as u64 * chunk.chunk_size as u64,
+                received_bytes,
                 total_size: state.total_size,
                 status: "downloading".to_string(),
             };
@@ -520,6 +539,25 @@ impl ChatCore {
                 tracing::error!("{}", err_msg);
                 return Err(CoreError::FileTransferFailed(err_msg));
             }
+        }
+
+        // ========== 安全校验：分片哈希完整性 ==========
+        // 验证解压后的数据哈希与发送方提供的 chunk_hash 一致
+        let computed_chunk_hash = {
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&decompressed);
+            hasher.finalize()
+        };
+        if !constant_time_compare(&computed_chunk_hash, &chunk.chunk_hash) {
+            let err_msg = format!(
+                "分片哈希校验失败: chunk_index={}, expected={:?}, computed={:?} (file_id: {}..)",
+                chunk.chunk_index,
+                &chunk.chunk_hash[..8],
+                &computed_chunk_hash[..8],
+                &file_id_hex[..16]
+            );
+            tracing::error!("{}", err_msg);
+            return Err(CoreError::FileTransferFailed(err_msg));
         }
 
         // 从状态中获取临时文件路径（复用已存储的路径，避免重复构造）

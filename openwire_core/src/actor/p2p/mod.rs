@@ -776,7 +776,7 @@ impl P2pActor {
         }
 
         // 2. 尝试通过 Identify 自动发现的 relay 候选节点
-        let candidates = std::mem::take(&mut self.relay_candidates);
+        let candidates = self.relay_candidates.clone();
         for (candidate_peer_id, candidate_addr) in &candidates {
             let has_p2p = candidate_addr.iter().any(|p| matches!(p, Protocol::P2p(..)));
             let full_addr = if has_p2p {
