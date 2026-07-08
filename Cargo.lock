@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "libp2p-pathranker"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -4915,7 +4915,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openwire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "android-native-keyring-store",
  "hex",
