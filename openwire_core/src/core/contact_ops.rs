@@ -24,31 +24,30 @@ impl ChatCore {
                     tracing::info!("Successfully added contact: {}", &mldsa_pubkey_hex[..16]);
                     let msg = format!("好友 {} 添加成功", &mldsa_pubkey_hex[..16]);
                     self.send_log_mpsc(msg).await;
-                    // 添加联系人后，发起 DHT 查询以获取对方的最新信息
-                    let _ = self.p2p_handle.send(
+                    // 添加联系人后，发起 DHT 查询以获取对方的最新信息（使用 try_send 避免阻塞）
+                    let _ = self.p2p_handle.tx.try_send(
                         crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
                             key: mldsa_pubkey_hex.clone(),
                         }),
-                    ).await;
+                    );
                     // Fix 4: 重新发布自身身份到 DHT，确保对方能通过 DHT 反向发现我方
-                    // 直接写入本地 DHT 存储 + 发起网络发布
-                    if let Ok(store) = self.get_dht_store() {
-                        if let (Some(pubkey), Some(pid)) = (&self.mldsa_pubkey_hex, &self.current_peer_id) {
-                            let _ = store.set_pubkey_peerid(pubkey, pid);
-                        }
+                    // 直接写入本地 DHT 存储 + 发起网络发布（使用 try_send 避免阻塞）
+                    let store = self.get_dht_store();
+                    if let (Some(pubkey), Some(pid)) = (&self.mldsa_pubkey_hex, &self.current_peer_id) {
+                        let _ = store.set_pubkey_peerid(pubkey, pid);
                     }
-                    let _ = self.p2p_handle.send(
+                    let _ = self.p2p_handle.tx.try_send(
                         crate::actor::ActorCommand::Custom(P2pCommand::PublishIdentity {
                             mldsa_pubkey_hex: self.mldsa_pubkey_hex.clone().unwrap_or_default(),
                             mlkem_pubkey_hex: self.mlkem_pubkey_hex.clone().unwrap_or_default(),
                         }),
-                    ).await;
+                    );
                     let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-                    let _ = self.p2p_handle.send(
+                    let _ = self.p2p_handle.tx.try_send(
                         crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
                             key: mlkem_key,
                         }),
-                    ).await;
+                    );
                     true
                 }
                 Err(e) => {
@@ -67,10 +66,7 @@ impl ChatCore {
 
     /// 从 DHT 本地数据库获取缓存的 ML-KEM 公钥字节
     fn get_cached_mlkem_bytes(&self, mldsa_pubkey_hex: &str) -> Vec<u8> {
-        let store = match self.get_dht_store() {
-            Ok(store) => store,
-            Err(_) => return Vec::new(),
-        };
+        let store = self.get_dht_store();
         match store.get_mlkem_pubkey(mldsa_pubkey_hex) {
             Ok(Some(hex_str)) => match hex::decode(&hex_str) {
                 Ok(bytes) => bytes,
@@ -100,21 +96,18 @@ impl ChatCore {
         };
 
         let store = self.get_dht_store();
-        let (has_local_peerid, has_local_mlkem) = match store {
-            Ok(ref store) => (
-                store
-                    .get_peerid_by_pubkey(mldsa_pubkey_hex)
-                    .ok()
-                    .flatten()
-                    .is_some(),
-                store
-                    .get_mlkem_pubkey(mldsa_pubkey_hex)
-                    .ok()
-                    .flatten()
-                    .is_some(),
-            ),
-            Err(_) => (false, false),
-        };
+        let (has_local_peerid, has_local_mlkem) = (
+            store
+                .get_peerid_by_pubkey(mldsa_pubkey_hex)
+                .ok()
+                .flatten()
+                .is_some(),
+            store
+                .get_mlkem_pubkey(mldsa_pubkey_hex)
+                .ok()
+                .flatten()
+                .is_some(),
+        );
 
         // 如果本地已有完整信息
         if has_local_peerid && has_local_mlkem {
@@ -124,12 +117,12 @@ impl ChatCore {
                     "DHT discovery: contact {} already exists, refreshing DHT query",
                     pubkey_short
                 );
-                // 通过 P2pActor 发起 GetProviders 以刷新在线状态
-                let _ = self.p2p_handle.send(
+                // 通过 P2pActor 发起 GetProviders 以刷新在线状态（使用 try_send 避免阻塞）
+                let _ = self.p2p_handle.tx.try_send(
                     crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
                         key: mldsa_pubkey_hex.to_string(),
                     }),
-                ).await;
+                );
             } else {
                 // 新联系人：直接添加
                 tracing::info!(
@@ -147,11 +140,11 @@ impl ChatCore {
 
         // 本地没有缓存，发起网络 DHT 查询但不阻塞等待
         if !has_local_peerid {
-            let _ = self.p2p_handle.send(
+            let _ = self.p2p_handle.tx.try_send(
                 crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
                     key: mldsa_pubkey_hex.to_string(),
                 }),
-            ).await;
+            );
             tracing::debug!(
                 "DHT discovery: initiated GetProviders for {} (non-blocking)",
                 pubkey_short
@@ -160,11 +153,11 @@ impl ChatCore {
 
         if !has_local_mlkem {
             let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-            let _ = self.p2p_handle.send(
+            let _ = self.p2p_handle.tx.try_send(
                 crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
                     key: mlkem_key,
                 }),
-            ).await;
+            );
             tracing::debug!(
                 "DHT discovery: initiated ML-KEM query for {} (non-blocking)",
                 pubkey_short

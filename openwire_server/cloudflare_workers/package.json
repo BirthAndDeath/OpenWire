@@ -1,0 +1,11 @@
+{
+  "name": "openwire-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenWire relay registry and bootstrap coordination service. Runs on Cloudflare Workers with Durable Objects.",
+  "main": "src/worker.mjs",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}

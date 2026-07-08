@@ -5,17 +5,14 @@ use libp2p::{
     PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
     memory_connection_limits, noise, ping, relay, tcp, yamux,
 };
+use std::time::Duration;
 
-use redb::Database;
 use std::num::NonZero;
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
 
 use super::behaviour::MyBehaviour;
-use super::dht;
 use super::netevent::{NetEventRequest, NetEventResponse};
 use crate::error::{P2pError, P2pResult};
 use crate::{ChatMessage, ChatResponse};
@@ -68,8 +65,8 @@ const KAD_REPLICATION_FACTOR: usize = 20;
 const KAD_PARALLELISM: usize = 3;
 /// Kademlia 定期 bootstrap 间隔（秒）
 const KAD_BOOTSTRAP_INTERVAL_SECS: u64 = 300;
-/// Provider 记录 TTL（秒）- 24小时
-const KAD_PROVIDER_TTL_SECS: u64 = 24 * 60 * 60;
+/// Provider 记录 TTL（秒）- 1小时（中继节点离线后快速淘汰）
+const KAD_PROVIDER_TTL_SECS: u64 = 60 * 60;
 /// Kademlia 发布间隔（秒）- 1小时
 const KAD_PUBLICATION_INTERVAL_SECS: u64 = 60 * 60;
 
@@ -81,29 +78,37 @@ const ROUTING_TABLE_CACHE_FILE: &str = "routing_table.cache";
 /// # 参数
 /// - `data_dir`: 数据目录路径
 /// - `keypair`: libp2p 身份密钥对
-/// - `dht_db`: DHT 数据库连接
 /// - `relay_nodes`: Relay 中继节点列表 [(PeerId, Multiaddr)]，用于 NAT 穿透
 /// - `bootstrap_nodes`: Bootstrap 引导节点列表 [(PeerId, Multiaddr)]，用于 DHT 网络引导
 pub fn swarm_init(
     data_dir: &Path,
     keypair: libp2p::identity::Keypair,
-    dht_db: Arc<Database>,
-    relay_nodes: &[(String, String)],
     bootstrap_nodes: &[(String, String)],
 ) -> P2pResult<Swarm<MyBehaviour>> {
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
+let mut swarm = {
+        let builder = libp2p::SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                noise::Config::new,
+                yamux::Config::default,
+            )
+            .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
+            .with_quic();
+
+        #[cfg(not(target_os = "android"))]
+        let builder = builder
+            .with_dns()
+            .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
+
+        let builder = futures::executor::block_on(
+            builder.with_websocket(noise::Config::new, yamux::Config::default),
         )
-        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
-        .with_quic()
-        .with_dns()
-        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
-        .with_relay_client(noise::Config::new, yamux::Config::default)
-        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
+        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
+
+        builder
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
         .with_behaviour(|key, relay_behaviour| {
             let peer_id = key.public().to_peer_id();
 
@@ -139,15 +144,26 @@ pub fn swarm_init(
                     .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
             // 创建 Kademlia 行为实例
-            let kademlia = create_kademlia(peer_id, dht_db.clone(), data_dir, bootstrap_nodes)?;
+            let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes)?;
             let identify_config =
                 identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
                     .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
                     .with_cache_size(IDENTIFY_CACHE_SIZE);
             let identify = identify::Behaviour::new(identify_config);
             let ping = ping::Behaviour::new(ping::Config::new());
-            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+            let relay_config = relay::Config {
+                max_reservations: 50,
+                max_reservations_per_peer: 5,
+                reservation_duration: Duration::from_secs(7200),
+                reservation_rate_limiters: vec![],
+                max_circuits: 50,
+                max_circuits_per_peer: 5,
+                max_circuit_duration: Duration::from_secs(3600),
+                max_circuit_bytes: 100 * 1024 * 1024,
+                circuit_src_rate_limiters: vec![],
+            };
+            let relay_server = relay::Behaviour::new(key.public().to_peer_id(), relay_config);
             let limits =
                 connection_limits::Behaviour::new(connection_limits::ConnectionLimits::default());
             let memmory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.01);
@@ -160,7 +176,8 @@ pub fn swarm_init(
                 kademlia,
                 ping,
                 identify,
-                relay,
+                relay_client: relay_behaviour,
+                relay_server,
                 dcutr,
                 limits,
                 memmory_limits,
@@ -174,7 +191,8 @@ pub fn swarm_init(
                     NonZero::new(DIAL_CONCURRENCY_FACTOR).expect("DIAL_CONCURRENCY_FACTOR > 0"),
                 )
         })
-        .build();
+        .build()
+    };
 
     // 端口 0 表示系统自动分配
     swarm
@@ -197,32 +215,17 @@ pub fn swarm_init(
             P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
         })?)
         .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    // 如果有 relay 节点配置，向 relay 节点发起连接以获取中继服务
-    // relay 协议会自动处理 reservation，连接成功后本节点会获得一个 relay 地址
-    for (relay_peer_id, relay_addr) in relay_nodes {
-        match relay_addr.parse::<libp2p::Multiaddr>() {
-            Ok(addr) => {
-                let full_addr = addr
-                    .clone()
-                    .with_p2p(match PeerId::from_str(relay_peer_id) {
-                        Ok(pid) => pid,
-                        Err(e) => {
-                            tracing::warn!("无效的 relay PeerID '{}': {}", relay_peer_id, e);
-                            continue;
-                        }
-                    })
-                    .unwrap_or(addr.clone());
-
-                match swarm.dial(full_addr) {
-                    Ok(()) => tracing::info!("正在连接 relay 节点: {}", relay_peer_id),
-                    Err(e) => tracing::warn!("连接 relay 节点 {} 失败: {}", relay_peer_id, e),
-                }
-            }
-            Err(e) => {
-                tracing::warn!("无效的 relay 地址 '{}': {}", relay_addr, e);
-            }
-        }
-    }
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0/ws".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    swarm
+        .listen_on("/ip6/::/tcp/0/ws".parse().map_err(|e| {
+            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+        })?)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
 
     Ok(swarm)
 }
@@ -230,11 +233,10 @@ pub fn swarm_init(
 /// 创建 Kademlia 行为
 fn create_kademlia(
     peer_id: PeerId,
-    db: Arc<Database>,
     data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
 ) -> P2pResult<kad::Behaviour<MemoryStore>> {
-    //let store = dht::RedbRecordStore::new(db);
+    //let store = crate::server_redb_store::RedbRecordStore::new(db);
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
         P2pError::SwarmInitFailed("KAD_REPLICATION_FACTOR must be non-zero".into())
@@ -250,7 +252,7 @@ fn create_kademlia(
         .set_publication_interval(Some(Duration::from_secs(KAD_PUBLICATION_INTERVAL_SECS)));
 
     let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
-    kademlia.set_mode(Some(Mode::Server));
+    kademlia.set_mode(Some(Mode::Client));
 
     // 先加载缓存的路由表
     let cache_path = data_dir.join(ROUTING_TABLE_CACHE_FILE);

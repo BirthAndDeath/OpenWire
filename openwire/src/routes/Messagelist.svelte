@@ -2,6 +2,7 @@
     import { VList } from "virtua/svelte";
     import { tick } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
+    import { save } from "@tauri-apps/plugin-dialog";
 
     interface Msg {
         id: string;
@@ -358,21 +359,34 @@
         );
     }
 
-    // 点击 FileHash 消息发起下载
+// 点击 FileHash 消息发起下载
     async function handleFileHashClick(msg: Msg) {
         if (!msg.file_hash_info || !msg.sender_mldsa_pubkey_hex) return;
         const info = msg.file_hash_info;
 
         // 检查是否已经在下载中
         if (fileProgress[info.filename]?.status === "downloading") {
-            return; // 已经在下载中，忽略重复点击
+            return;
         }
+
+        // 弹出保存对话框让用户选择保存位置
+        let savePath: string | null = null;
+        try {
+            savePath = await save({
+                defaultPath: info.filename,
+                title: "保存文件",
+            });
+        } catch (e) {
+            console.error("打开保存对话框失败:", e);
+            return;
+        }
+        if (!savePath) return; // 用户取消
 
         try {
             await invoke("request_file_download", {
                 senderMldsaPubkeyHex: msg.sender_mldsa_pubkey_hex,
-                fileIdHex: info.file_id,
-                downloadDir: null, // 使用默认下载目录
+                fileHashHex: info.file_hash,
+                savePath: savePath,
             });
         } catch (e) {
             console.error("请求文件下载失败:", e);

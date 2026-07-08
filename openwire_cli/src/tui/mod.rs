@@ -89,15 +89,21 @@ pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
 
     app.core_handle.shutdown();
 
-    // 使用 spawn_blocking 等待后台线程结束，避免阻塞 tokio 线程
-    let result_thread = tokio::task::spawn_blocking(move || core_joinhandle.join()).await;
+    // 恢复终端状态（在等待后台线程之前执行，确保即使 join 阻塞也能恢复）
+    let _ = disable_raw_mode();
+    let _ = terminal.show_cursor();
+
+    // 使用 spawn_blocking 等待后台线程结束，添加超时防止永久阻塞
+    let result_thread = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || core_joinhandle.join())
+    ).await;
     match result_thread {
-        Ok(join_result) => eprintln!("结束后台线程 结果{:?}", join_result),
-        Err(e) => eprintln!("等待后台线程失败: {:?}", e),
+        Ok(Ok(join_result)) => eprintln!("结束后台线程 结果{:?}", join_result),
+        Ok(Err(e)) => eprintln!("等待后台线程失败: {:?}", e),
+        Err(_) => eprintln!("后台线程关闭超时（强制退出）"),
     }
 
-    disable_raw_mode()?;
-    terminal.clear()?;
-    terminal.show_cursor()?;
+    let _ = terminal.clear();
     Ok(())
 }

@@ -1,20 +1,18 @@
 use crate::actor::RUNTIME as rt;
-use tokio::sync::mpsc;
 
 use crate::{
     actor::p2p::{P2pCommand, P2pEvent},
     command::ChatCommand,
-    core::ChatCore,
+    core::{timers, ChatCore},
     storage,
 };
 
 impl ChatCore {
     /// 启动核心事件循环（使用独立的 Tokio 运行时）
     pub fn run(mut self) -> std::thread::JoinHandle<()> {
-        let handle = rt.handle().clone();
         std::thread::spawn(move || {
             rt.block_on(async move {
-                self.run_inner(&handle).await;
+                self.run_inner().await;
             });
         })
     }
@@ -26,52 +24,35 @@ impl ChatCore {
     ) -> std::thread::JoinHandle<()> {
         let handle = rt_handle.clone();
         let handle_for_block = handle.clone();
-        let handle_for_inner = handle.clone();
         std::thread::spawn(move || {
             let _guard = handle.enter();
             handle_for_block.block_on(async move {
-                self.run_inner(&handle_for_inner).await;
+                self.run_inner().await;
             });
         })
     }
 
     /// 内部事件循环：DHT 注册 + 主循环
-    async fn run_inner(&mut self, rt_handle: &tokio::runtime::Handle) {
-        // 启动 DHT 定期注册任务
-        let dht_reg_cmd_tx = self.core_handle.cmd_tx.clone();
-        self.spawn_dht_registration(rt_handle);
+    async fn run_inner(&mut self) {
+        // 启动所有定时器任务（独立 tokio::spawn，通过 cmd_tx 发送命令）
+        let shutdown_token = self.core_handle.shutdown_token.clone();
+        timers::spawn_all(self.core_handle.cmd_tx.clone(), shutdown_token);
 
         // 启动后立即执行一次 DHT 身份发布
-        self.publish_current_identity_to_dht(&dht_reg_cmd_tx);
+        self.publish_current_identity_to_dht();
 
         // 启动后对所有已添加的联系人发起 DHT 发现（非阻塞）
-        self.discover_all_contacts(&dht_reg_cmd_tx).await;
+        self.discover_all_contacts().await;
 
-        // 主事件循环：处理 P2pActor 事件和控制命令
-        // 在线消息重试间隔：每 15 秒尝试向当前在线的好友发送待发消息。
-        // 相比 ConnectionEstablished 时立即重试，定时重试能等待 FriendOnline
-        // 通知到达并缓存 (公钥→PeerID) 映射后再发送，提高成功率。
-        // 同时只针对在线好友，避免对离线联系人做无效的 DHT 网络查询。
-        let mut online_retry_interval =
-            tokio::time::interval(std::time::Duration::from_secs(15));
-        online_retry_interval.tick().await; // 跳过首次立即触发
-
-        // DHT 清理间隔：每小时清理一次过期记录
-        let mut dht_cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-        dht_cleanup_interval.tick().await; // 跳过首次立即触发
-
-        // 路由表持久化间隔：每 5 分钟保存一次，确保运行期间缓存持续更新
-        let mut routing_table_save_interval =
-            tokio::time::interval(std::time::Duration::from_secs(300));
-        routing_table_save_interval.tick().await; // 跳过首次立即触发
-
-        // === 主动连接维护间隔：每 5 分钟对所有联系人发起 DHT GetProviders 查询 ===
-        let mut connection_maintenance_interval =
-            tokio::time::interval(std::time::Duration::from_secs(300));
-        connection_maintenance_interval.tick().await; // 跳过首次立即触发（启动时已调用 discover_all_contacts）
-
+        // 主事件循环：仅处理 P2pActor 事件和控制命令（定时器通过命令驱动）
         loop {
             tokio::select! {
+                // 处理取消信号
+                _ = self.core_handle.shutdown_token.cancelled() => {
+                    tracing::info!("ChatCore 收到取消信号，正在关闭...");
+                    self.shutdown_p2p();
+                    break;
+                }
                 // 从 P2pActor 接收网络事件
                 Some(event) = self.rx_p2p_event.recv() => {
                     self.handle_p2p_event(event).await;
@@ -79,47 +60,32 @@ impl ChatCore {
                 Some(cmd) = self.rx_cmd.recv() => {
                     if matches!(cmd, ChatCommand::Shutdown) {
                         tracing::info!("P2P core shutting down...");
-                        // 通知 P2pActor 保存路由表并关闭
-                        let _ = self.p2p_handle.send(
-                            crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
-                        ).await;
-                        let _ = self.p2p_handle.send(
-                            crate::actor::ActorCommand::Custom(P2pCommand::Shutdown),
-                        ).await;
+                        self.shutdown_p2p();
                         break;
                     }
                     // 处理身份切换：更新 DHT 注册循环的身份信息
                     if matches!(cmd, ChatCommand::SelectIdentity { .. }) {
                         self.handle_command(cmd).await;
-                        self.publish_current_identity_to_dht(&dht_reg_cmd_tx);
+                        self.publish_current_identity_to_dht();
                     } else {
                         self.handle_command(cmd).await;
                     }
                 }
-                _ = dht_cleanup_interval.tick() => {
-                    self.cleanup_expired_dht_records();
-                }
-                _ = routing_table_save_interval.tick() => {
-                    // 通知 P2pActor 保存路由表（使用 try_send 避免阻塞）
-                    let _ = self.p2p_handle.tx.try_send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
-                    );
-                }
-                _ = online_retry_interval.tick() => {
-                    // 每 15 秒向当前在线的好友重试待发送消息。
-                    // 只尝试 connected_peers 中在线的联系人，不做 DHT 网络查询。
-                    self.retry_pending_for_online_peers().await;
-                }
-                _ = connection_maintenance_interval.tick() => {
-                    // 定期对所有联系人发起 DHT GetProviders 查询
-                    // 这是非阻塞的：get_providers 只是发起网络查询，不等待结果
-                    // 结果通过 P2pEvent::GetProvidersResult 事件处理
-                    self.discover_all_contacts(&dht_reg_cmd_tx).await;
-                    // 连接维护后触发离线消息重试
-                    let _ = dht_reg_cmd_tx.try_send(ChatCommand::RetryPendingMessages);
-                }
-                else => break,
             }
+        }
+    }
+
+    /// 向 P2pActor 发送关闭命令并保存路由表
+    fn shutdown_p2p(&self) {
+        if let Err(e) = self.p2p_handle.tx.try_send(
+            crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
+        ) {
+            tracing::warn!("Failed to send SaveRoutingTable on shutdown: {e:?}");
+        }
+        if let Err(e) = self.p2p_handle.tx.try_send(
+            crate::actor::ActorCommand::Custom(P2pCommand::Shutdown),
+        ) {
+            tracing::warn!("Failed to send Shutdown on shutdown: {e:?}");
         }
     }
 
@@ -147,7 +113,7 @@ impl ChatCore {
                 let crate::p2p::netevent::NetEventRequest::FriendOnline {
                     mldsa_pubkey_hex,
                     peer_id: claimed_peer_id,
-                    listen_addrs: _,
+                    listen_addrs,
                     mlkem_pubkey_hex,
                 } = &request;
                     // 验证：声称的 PeerID 必须与实际连接的 PeerID 一致
@@ -165,18 +131,16 @@ impl ChatCore {
                         );
 
                         // 缓存 (ML-DSA 公钥 → PeerID) 映射到 DHT 存储
-                        if let Ok(store) = self.get_dht_store() {
-                            let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
-                        }
+                        let store = self.get_dht_store();
+                        let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
                         // 同步更新内存缓存，如果已连接则刷新在线状态
                         self.update_peerid_pubkey_mapping(peer, mldsa_pubkey_hex.clone())
                             .await;
 
                         // 缓存 ML-KEM 公钥（直接从 FriendOnline 获取，无需 DHT）
                         if !mlkem_pubkey_hex.is_empty() {
-                            if let Ok(store) = self.get_dht_store() {
-                                let _ = store.set_mlkem_pubkey(mldsa_pubkey_hex, mlkem_pubkey_hex);
-                            }
+                            let store = self.get_dht_store();
+                            let _ = store.set_mlkem_pubkey(mldsa_pubkey_hex, mlkem_pubkey_hex);
                         }
 
                         // 检查对方是否已在联系人列表中
@@ -214,62 +178,71 @@ impl ChatCore {
                                     }
                                 }
 
-                                // === Fix 7: FriendOnline 处理后检查并重试待发送消息 ===
+// === Fix 7: FriendOnline 处理后检查并重试待发送消息 ===
                                 // ConnectionEstablished → retry_pending_messages 在 FriendOnline
                                 // 到达前运行，使用旧 DHT 存储找不到 PeerID 就跳过。
                                 // FriendOnline 到达后缓存了 (公钥→PeerID) 映射，此时重试能成功。
-                                // 注意：15 秒在线重试定时器也会在后续 tick 中覆盖此场景，
-                                // 但此处立即重试体验更好（零延迟）。
-                                match storage::list_pending(pool).await {
-                                    Ok(msgs) => {
-                                        let has_pending = msgs.iter().any(|m| {
-                                            m.peer_pubkey_hex == *mldsa_pubkey_hex
-                                        });
-                                        if has_pending {
-                                            tracing::info!(
-                                                "FriendOnline 处理后 {}.. 有待发消息，立即重试",
-                                                &mldsa_pubkey_hex[..16]
-                                            );
-                                            self.retry_pending_messages().await;
-                                        }
-                                    }
-                                    Err(e) => tracing::warn!(
-                                        "FriendOnline 处理后查询待发消息失败: {}", e
-                                    ),
-                                }
+                                match storage::list_pending_by_peer(pool, mldsa_pubkey_hex).await {
+                                     Ok(msgs) => {
+                                         if !msgs.is_empty() {
+                                             tracing::info!(
+                                                 "FriendOnline 处理后 {}.. 有 {} 条待发消息，立即重试",
+                                                 &mldsa_pubkey_hex[..16],
+                                                 msgs.len()
+                                             );
+                                             self.retry_pending_for_peer(mldsa_pubkey_hex).await;
+                                         }
+                                     }
+                                     Err(e) => tracing::warn!(
+                                         "FriendOnline 处理后查询待发消息失败: {}", e
+                                     ),
+                                 }
                             }
                         }
                     }
 
+                // 先尝试拨号对方监听地址（跳过 /p2p-circuit 地址，只能用于入站连接）
+                for addr_str in listen_addrs {
+                    if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                        // 跳过中继地址，这些只能用于入站连接
+                        if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) {
+                            tracing::debug!("Skipping relay address in FriendOnline: {addr}");
+                            continue;
+                        }
+                        // 使用 try_send 避免阻塞
+                        if let Err(e) = self.p2p_handle.tx.try_send(
+                            crate::actor::ActorCommand::Custom(P2pCommand::DialAddr { addr }),
+                        ) {
+                            tracing::warn!("Failed to send DialAddr: {e:?}");
+                        }
+                    }
+                }
+
                 // 发送响应确认（通过 P2pActor 发送 NetEvent 响应）
-                let _ = self
-                    .p2p_handle
-                    .send(crate::actor::ActorCommand::Custom(
-                        P2pCommand::SendNetEventResponse {
-                            channel,
-                            response: crate::p2p::netevent::NetEventResponse::Ack,
-                        },
-                    ))
-                    .await;
+                if let Err(e) = self.p2p_handle.tx.try_send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::SendNetEventResponse {
+                        channel,
+                        response: crate::p2p::netevent::NetEventResponse::Ack,
+                    }),
+                ) {
+                    tracing::warn!("Failed to send NetEventResponse: {e:?}");
+                }
             }
-            P2pEvent::ConnectionEstablished { peer_id } => {
-                tracing::info!("Connection established with {}", peer_id);
-                self.connected_peers.insert(peer_id);
+            P2pEvent::ConnectionEstablished { peer_id, listen_addrs } => {
+                tracing::info!("Connection established with {} ({} listen addrs)", peer_id, listen_addrs.len());
+                self.connected_peers.entry(peer_id).and_modify(|c| *c += 1).or_insert(1);
 
                 // 从 DHT 反向查找该 PeerID 对应的 ML-DSA 公钥
-                if let Ok(store) = self.get_dht_store() {
-                    match store.get_pubkey_by_peerid(&peer_id) {
-                        Ok(Some(pubkey_hex)) => {
-                            self.peerid_to_pubkey.insert(peer_id, pubkey_hex);
-                        }
-                        _ => {
-                            // Fix 3: 移除错误的 GetProviders 查询（用 PeerID 查 DHT 无意义）
-                            // 后续 FriendOnline 通知或 DHT 发现会提供正确的 (公钥→PeerID) 映射
-                            tracing::debug!(
-                                "ConnectionEstablished: 本地未缓存 PeerID {} 对应的公钥",
-                                peer_id
-                            );
-                        }
+                let store = self.get_dht_store();
+                match store.get_pubkey_by_peerid(&peer_id) {
+                    Ok(Some(pubkey_hex)) => {
+                        self.peerid_to_pubkey.insert(peer_id, pubkey_hex);
+                    }
+                    _ => {
+                        tracing::debug!(
+                            "ConnectionEstablished: 本地未缓存 PeerID {} 对应的公钥",
+                            peer_id
+                        );
                     }
                 }
 
@@ -281,18 +254,17 @@ impl ChatCore {
                             crate::actor::p2p::netevent::build_friend_online_request(
                                 &mldsa_pubkey_hex,
                                 &current_peer_id,
-                                &[], // 监听地址 - ChatCore 暂未持久化存储
+                                &listen_addrs,
                                 &mlkem,
                             );
-                        let _ = self
-                            .p2p_handle
-                            .send(crate::actor::ActorCommand::Custom(
-                                P2pCommand::SendNetEvent {
-                                    peer_id,
-                                    request: friend_online,
-                                },
-                            ))
-                            .await;
+                        if let Err(e) = self.p2p_handle.tx.try_send(
+                            crate::actor::ActorCommand::Custom(P2pCommand::SendNetEvent {
+                                peer_id,
+                                request: friend_online,
+                            }),
+                        ) {
+                            tracing::warn!("Failed to send FriendOnline NetEvent: {e:?}");
+                        }
                         tracing::info!(
                             "已向 {} 发送 FriendOnline 通知 (PubKey={}..)",
                             peer_id,
@@ -303,26 +275,27 @@ impl ChatCore {
 
                 // 触发在线状态更新
                 self.send_online_status().await;
-
-                // 连接建立后重试待发送消息（15 秒在线重试定时器也会覆盖，
-                // 但此处立即重试能让消息更快送达；无法送达时会由定时器兜底）
-                self.retry_pending_messages().await;
+                // 注意：不再在 ConnectionEstablished 时立即重试，改由 FriendOnline 到达后重试
+                // 这样可以确保身份信息（ML-KEM 公钥、PeerID 映射）已就绪后再发送
             }
             P2pEvent::ConnectionClosed { peer_id } => {
                 tracing::info!("Connection closed with {}", peer_id);
-                self.connected_peers.remove(&peer_id);
-                self.peerid_to_pubkey.remove(&peer_id);
+                // 使用连接计数：减到 0 才真正移除，防止双连接误判离线
+                if let std::collections::hash_map::Entry::Occupied(mut entry) = self.connected_peers.entry(peer_id) {
+                    *entry.get_mut() = entry.get().saturating_sub(1);
+                    if *entry.get() == 0 {
+                        entry.remove();
+                        self.peerid_to_pubkey.remove(&peer_id);
+                    }
+                }
                 // 触发在线状态更新
                 self.send_online_status().await;
             }
             P2pEvent::MdnsDiscovered { peer_id, addr } => {
                 tracing::info!("mDNS discovered: {} at {}", peer_id, addr);
-                let _ = self
-                    .p2p_handle
-                    .send(crate::actor::ActorCommand::Custom(
-                        P2pCommand::AddKademliaAddress { peer_id, addr },
-                    ))
-                    .await;
+                let _ = self.p2p_handle.tx.try_send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress { peer_id, addr }),
+                );
             }
             P2pEvent::MdnsExpired { peer_id } => {
                 tracing::info!("mDNS expired: {}", peer_id);
@@ -332,12 +305,9 @@ impl ChatCore {
                 listen_addrs,
             } => {
                 for addr in listen_addrs {
-                    let _ = self
-                        .p2p_handle
-                        .send(crate::actor::ActorCommand::Custom(
-                            P2pCommand::AddKademliaAddress { peer_id, addr },
-                        ))
-                        .await;
+                    let _ = self.p2p_handle.tx.try_send(
+                        crate::actor::ActorCommand::Custom(P2pCommand::AddKademliaAddress { peer_id, addr }),
+                    );
                 }
             }
             P2pEvent::GetProvidersResult {
@@ -352,9 +322,26 @@ impl ChatCore {
                 if providers.is_empty() {
                     return;
                 }
-                if let Ok(store) = self.get_dht_store() {
-                    for provider in &providers {
-                        let _ = store.set_pubkey_peerid(&key, provider);
+                let store = self.get_dht_store();
+                for provider in &providers {
+                    let _ = store.set_pubkey_peerid(&key, provider);
+                }
+
+                // === 拨号每个发现的 provider，建立 P2P 连接 ===
+                // GetProviders 从 DHT 查询到联系人 PeerID 后，Kademlia 路由表中已有其地址，
+                // 通过 Dial 触发 libp2p 自动查找并连接
+                for provider in &providers {
+                    if !self.connected_peers.contains_key(provider) {
+                        tracing::info!(
+                            "DHT 发现联系人 {}..，正在拨号 PeerID={}",
+                            &key[..16.min(key.len())],
+                            provider
+                        );
+                        if let Err(e) = self.p2p_handle.tx.try_send(
+                            crate::actor::ActorCommand::Custom(P2pCommand::Dial { peer_id: *provider }),
+                        ) {
+                            tracing::warn!("Failed to send Dial to provider {}: {e:?}", provider);
+                        }
                     }
                 }
 
@@ -362,7 +349,7 @@ impl ChatCore {
                 // 这解决了 ConnectionEstablished 触发时 peerid_to_pubkey 尚未建立映射
                 // 导致 send_online_status() 无法正确标记该联系人为在线的问题
                 for provider in &providers {
-                    if self.connected_peers.contains(provider) {
+                    if self.connected_peers.contains_key(provider) {
                         self.send_online_status().await;
                         break;
                     }
@@ -378,22 +365,26 @@ impl ChatCore {
                 // 此处无需额外逻辑
             }
             P2pEvent::Log(msg) => {
-                tracing::info!("P2pActor: {}", msg);
+                if let Some(warning) = msg.strip_prefix("relay_warning:") {
+                    tracing::warn!("P2pActor relay warning: {}", warning);
+                    self.send_warning_mpsc(warning.to_string()).await;
+                } else {
+                    tracing::info!("P2pActor: {}", msg);
+                }
             }
         }
     }
 
     /// 将当前身份发布到 DHT 网络（本地数据库 + 网络发布）
-    fn publish_current_identity_to_dht(&mut self, cmd_tx: &mpsc::Sender<ChatCommand>) {
+    pub(crate) fn publish_current_identity_to_dht(&mut self) {
         if let (Some(pubkey), Some(pid)) = (self.mldsa_pubkey_hex.clone(), self.current_peer_id) {
             let mlkem = self.mlkem_pubkey_hex.clone().unwrap_or_default();
-            if let Ok(store) = self.get_dht_store() {
-                let _ = store.set_pubkey_peerid(&pubkey, &pid);
-                if !mlkem.is_empty() {
-                    let _ = store.set_mlkem_pubkey(&pubkey, &mlkem);
-                }
+            let store = self.get_dht_store();
+            let _ = store.set_pubkey_peerid(&pubkey, &pid);
+            if !mlkem.is_empty() {
+                let _ = store.set_mlkem_pubkey(&pubkey, &mlkem);
             }
-            let _ = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
+            let _ = self.core_handle.cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
                 mldsa_pubkey_hex: pubkey.clone(),
                 peer_id: pid.to_string(),
                 mlkem_pubkey_hex: mlkem,
@@ -403,7 +394,7 @@ impl ChatCore {
     }
 
     /// 对所有已添加的联系人发起 DHT 发现
-    async fn discover_all_contacts(&self, cmd_tx: &mpsc::Sender<ChatCommand>) {
+    pub(crate) async fn discover_all_contacts(&self) {
         if let Some(pool) = storage::pool() {
             let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
             if !owner_id.is_empty() {
@@ -412,7 +403,7 @@ impl ChatCore {
                         let count = contacts.len();
                         tracing::info!("启动后向 {} 位联系人发送 DHT 发现命令", count);
                         for contact in &contacts {
-                            let _ = cmd_tx.try_send(ChatCommand::DiscoverContact {
+                            let _ = self.core_handle.cmd_tx.try_send(ChatCommand::DiscoverContact {
                                 mldsa_pubkey_hex: contact.mldsa_pubkey_hex.clone(),
                                 name: contact.name.clone(),
                             });
@@ -428,41 +419,7 @@ impl ChatCore {
     }
 
     /// 清理过期的 DHT 记录
-    fn cleanup_expired_dht_records(&mut self) {
+    pub(crate) fn cleanup_expired_dht_records(&mut self) {
         tracing::debug!("DHT cleanup tick (hourly)");
     }
-
-    /// DHT 身份绑定的定期注册（独立任务）
-    fn spawn_dht_registration(&mut self, rt_handle: &tokio::runtime::Handle) {
-        let cmd_tx = self.core_handle.cmd_tx.clone();
-        let pubkey = self.mldsa_pubkey_hex.clone();
-        let pid = self.current_peer_id;
-        let mlkem = self.mlkem_pubkey_hex.clone();
-
-        if pubkey.is_none() || pid.is_none() {
-            tracing::warn!("身份尚未就绪，跳过 DHT 定期注册");
-            return;
-        }
-
-        rt_handle.spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(
-                    crate::core::DHT_REGISTRATION_INTERVAL_SECS,
-                ));
-            // 跳过首次立即触发（启动时已发布一次）
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if let (Some(pubkey), Some(pid)) = (&pubkey, pid) {
-                    let mlkem_str = mlkem.clone().unwrap_or_default();
-                    let _ = cmd_tx.try_send(ChatCommand::DhtPublishIdentity {
-                        mldsa_pubkey_hex: pubkey.clone(),
-                        peer_id: pid.to_string(),
-                        mlkem_pubkey_hex: mlkem_str,
-                    });
-                }
-            }
-        });
-    }
-
 }

@@ -25,9 +25,8 @@ pub struct NodesConfig {
 impl Default for NodesConfig {
     fn default() -> Self {
         Self {
-            // Relay 节点列表默认为空。
-            // 节点启动后通过 DHT 引导 + Identify 协议发现网络中的 relay 节点，
-            // 用户也可通过设置界面（get_nodes_config/save_nodes_config）手动添加。
+            // 暂无公共 relay 节点，需要部署独立中继服务器。
+            // 部署后在此添加 [(PeerId, Multiaddr)]。
             relay_nodes: vec![],
             bootstrap_nodes: vec![
                 // ============================================================

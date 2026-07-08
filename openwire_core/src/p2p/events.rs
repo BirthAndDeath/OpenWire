@@ -72,17 +72,16 @@ pub async fn handle_incoming_request(
     // === 收到消息后，将发送方的 (ML-DSA 公钥 → PeerID) 映射缓存到本地 DHT 数据库 ===
     // 这样当回复消息时，dht_lookup_peerid 的步骤 1（connected_peers 反向查找）能直接命中，
     // 无需等待 DHT 网络查询完成，解决两个在线节点之间 DHT 记录尚未传播时的通信问题。
-    if let Ok(store) = core.get_dht_store() {
-        let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
-        // 同步更新内存缓存，如果该 PeerID 已连接则触发在线状态刷新
-        core.update_peerid_pubkey_mapping(peer, sender_mldsa_pubkey_hex.clone())
-            .await;
-        tracing::debug!(
-            "已缓存发送方身份绑定: {}.. -> PeerID={}",
-            &sender_mldsa_pubkey_hex[..16],
-            peer
-        );
-    }
+    let store = core.get_dht_store();
+    let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
+    // 同步更新内存缓存，如果该 PeerID 已连接则触发在线状态刷新
+    core.update_peerid_pubkey_mapping(peer, sender_mldsa_pubkey_hex.clone())
+        .await;
+    tracing::debug!(
+        "已缓存发送方身份绑定: {}.. -> PeerID={}",
+        &sender_mldsa_pubkey_hex[..16],
+        peer
+    );
 
     // 验证消息签名
     if !handle_message_verification(core, &request, &peer).await {
@@ -107,8 +106,8 @@ pub async fn handle_incoming_request(
         let receipt_data = hex::encode(&request.hash);
 
         // 通过 DHT 查找发送方的 PeerID 和 ML-KEM 公钥，并发回加密的回执
-        if let Ok(store) = core.get_dht_store() {
-            if let Ok(Some(sender_peer_id)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
+        let store = core.get_dht_store();
+        if let Ok(Some(sender_peer_id)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
                 // 获取发送方的 ML-KEM 公钥，用于加密回执数据
                 let sender_mlkem_pubkey = match store.get_mlkem_pubkey(&sender_mldsa_pubkey_hex) {
                     Ok(Some(hex_str)) if !hex_str.is_empty() => match hex::decode(&hex_str) {
@@ -157,7 +156,6 @@ pub async fn handle_incoming_request(
             }
         }
     }
-}
 
 /// 验证消息签名和新鲜度
 ///
@@ -274,6 +272,9 @@ async fn handle_decrypted_message(
         ChatMessageType::FileDownloadRequest => {
             handle_file_download_request(core, sender_mldsa_pubkey_hex, decrypted_data).await;
         }
+        ChatMessageType::FileDownloadResponse => {
+            handle_file_download_response(core, decrypted_data).await;
+        }
         ChatMessageType::DeliveryReceipt => {
             handle_delivery_receipt(core, pool, decrypted_data).await;
         }
@@ -329,7 +330,7 @@ async fn handle_text_message(
                 }
                 Ok(None) => {
                     // 重复消息，跳过
-                    tracing::debug!("跳过重复消息: {}", &text[..text.len().min(50)]);
+                    tracing::debug!("跳过重复消息 (hash={}..)", &message_hash[..16]);
                     return;
                 }
                 Err(e) => {
@@ -411,93 +412,66 @@ async fn handle_file_stream_message(core: &mut ChatCore, data: Vec<u8>) {
 }
 
 /// 处理文件下载请求（发送方收到接收方的下载请求）
-/// 解析 ChunkResponse → 查找文件 → 根据已接收分片列表跳过已发送分片
-/// 使用 FileStreamChunk::from_file 只发送缺失的分片
-///
-/// 断点续传支持：
-/// - 接收方在 ChunkResponse 中携带已接收的分片序号列表
-/// - 发送方跳过这些分片，只发送缺失的分片
+/// 解析 DownloadRequest → 查 sent_files 历史 → 拒绝/接受并发送分片
 async fn handle_file_download_request(
     core: &mut ChatCore,
     sender_mldsa_pubkey_hex: &str,
     data: Vec<u8>,
 ) {
-    // 解析 ChunkResponse（携带已接收分片列表）
-    let chunk_response: crate::message::ChunkResponse = match postcard::from_bytes(&data) {
-        Ok(resp) => resp,
+    let request: crate::message::DownloadRequest = match postcard::from_bytes(&data) {
+        Ok(req) => req,
         Err(e) => {
-            tracing::warn!("解析 ChunkResponse 失败: {}", e);
+            tracing::warn!("解析 DownloadRequest 失败: {}", e);
             return;
         }
     };
 
-    let file_id_hex = hex::encode(chunk_response.file_id);
-    let received_chunks: std::collections::HashSet<u32> =
-        chunk_response.received_chunks.iter().copied().collect();
-
+    let file_hash_hex = hex::encode(request.file_hash);
     tracing::info!(
-        "收到文件下载请求: file_id={}.., 已接收 {}/{} 分片",
-        &file_id_hex[..16],
-        received_chunks.len(),
-        "?"
+        "收到文件下载请求: file_hash={}..",
+        &file_hash_hex[..16]
     );
 
-    // 查找文件路径
-    let file_path = match core.file_path_map.get(&chunk_response.file_id) {
-        Some(path) => path.clone(),
-        None => {
-            tracing::warn!("未找到 file_id {}.. 对应的文件路径", &file_id_hex[..16]);
-            return;
-        }
+    // 查 sent_files 历史验证合法性
+    let sent_file = match storage::pool() {
+        Some(pool) => match storage::get_sent_file(pool, &request.file_hash).await {
+            Ok(Some(sent)) => Some(sent),
+            _ => None,
+        },
+        None => None,
     };
 
-    // === 直连协商：在发送文件分片前，尝试与接收方建立直连 ===
-    // 文件传输数据量大，如果当前连接经过 relay，大量分片通过 relay 中转会导致性能瓶颈。
-    // 通过 DHT 获取接收方的多地址并主动 dial，尝试建立直连（含 NAT 穿透）。
-    // dial() 是同步入队操作，libp2p 后台异步处理连接建立；
-    // 后续 rr_msg.send_request() 会自动利用新建立的直连发送分片。
-    if let Ok(store) = core.get_dht_store() {
-        if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex) {
-            // 通过 P2pActor 检查连接状态并拨号
-            // 注意：这里不再直接访问 core.swarm，而是通过 P2pActor 发送命令
-            // 由于需要同步检查连接状态，暂时通过 P2pActor 发送 Dial 命令
-            // 如果已连接，dial 会被 libp2p 忽略
-            if let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
-                && !addrs.is_empty()
-            {
-                tracing::info!(
-                    "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
-                    &sender_mldsa_pubkey_hex[..16],
-                    addrs.len()
-                );
-                for addr in &addrs {
-                    let dial_addr = addr
-                        .clone()
-                        .with_p2p(recipient_peer_id)
-                        .unwrap_or(addr.clone());
-                    let _ = core.p2p_handle.send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
-                            addr: dial_addr,
-                        }),
-                    ).await;
-                }
-            }
-        } else {
-            tracing::debug!(
-                "文件传输：未找到 {}.. 的 PeerID，跳过直连协商",
-                &sender_mldsa_pubkey_hex[..16]
-            );
+    let Some(sent_file) = sent_file else {
+        tracing::warn!(
+            "拒绝下载请求: file_hash={}.. 不在发送历史中",
+            &file_hash_hex[..16]
+        );
+        // 发送拒绝响应
+        let response = crate::message::DownloadResponse {
+            file_hash: request.file_hash,
+            accepted: false,
+            filename: None,
+            total_size: None,
+            total_chunks: None,
+            chunk_size: None,
+        };
+        if let Ok(data) = postcard::to_allocvec(&response) {
+            let _ = core
+                .send_text(
+                    sender_mldsa_pubkey_hex,
+                    ChatMessageType::FileDownloadResponse,
+                    data,
+                )
+                .await;
         }
-    }
-    // === 直连协商结束 ===
-
-    // 检查文件是否存在
-    if !file_path.exists() {
-        tracing::warn!("文件不存在: {:?}", file_path);
         return;
-    }
+    };
 
-    // 获取文件元信息
+    // 接受请求：注册到 file_path_map 供分片发送使用
+    let file_path = std::path::PathBuf::from(&sent_file.file_path);
+    core.file_path_map.insert(request.file_hash, file_path.clone());
+
+    // 获取文件信息
     let metadata = match tokio::fs::metadata(&file_path).await {
         Ok(m) => m,
         Err(e) => {
@@ -506,40 +480,66 @@ async fn handle_file_download_request(
         }
     };
     let file_size = metadata.len();
-
-    // 计算分片参数
-    // 使用固定分片大小 256KB
-    let chunk_size: u32 = 256 * 1024; // 256KB 固定分片
+    let chunk_size: u32 = 256 * 1024;
     let total_chunks = file_size.div_ceil(chunk_size as u64) as u32;
+    let filename = sent_file.filename;
 
-    // 计算文件哈希（用于验证完整性）
-    let file_hash = match crate::transfer::compute_file_hash(&file_path).await {
-        Ok(hash) => hash,
+    let file_hash = request.file_hash;
+
+    // 发送接受响应
+    let response = crate::message::DownloadResponse {
+        file_hash,
+        accepted: true,
+        filename: Some(filename.clone()),
+        total_size: Some(file_size),
+        total_chunks: Some(total_chunks),
+        chunk_size: Some(chunk_size),
+    };
+    let response_data = match postcard::to_allocvec(&response) {
+        Ok(d) => d,
         Err(e) => {
-            tracing::warn!("计算文件哈希失败: {}", e);
+            tracing::warn!("序列化 DownloadResponse 失败: {}", e);
             return;
         }
     };
+    if let Err(e) = core
+        .send_text(
+            sender_mldsa_pubkey_hex,
+            ChatMessageType::FileDownloadResponse,
+            response_data,
+        )
+        .await
+    {
+        tracing::warn!("发送 DownloadResponse 失败: {}", e);
+        return;
+    }
 
-    let filename = file_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // === 直连协商 ===
+    let store = core.get_dht_store();
+    if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex) {
+        if let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
+            && !addrs.is_empty()
+        {
+            tracing::info!(
+                "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
+                &sender_mldsa_pubkey_hex[..16],
+                addrs.len()
+            );
+            for addr in &addrs {
+                let dial_addr = addr.clone().with_p2p(recipient_peer_id).unwrap_or(addr.clone());
+                if let Err(e) = core.p2p_handle.tx.try_send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
+                        addr: dial_addr,
+                    }),
+                ) {
+                    tracing::warn!("Failed to send DialAddr during file transfer: {e:?}");
+                }
+            }
+        }
+    }
 
-    // 根据消息类型选择压缩等级（FileStream 使用 zstd level=3）
+    // 逐分片读取并发送
     let compression_level = crate::compression::compression_level(ChatMessageType::FileStream);
-
-    tracing::info!(
-        "开始发送文件: {}, size={}, chunks={}, chunk_size={}, compression_level={}, 已接收={}",
-        filename,
-        file_size,
-        total_chunks,
-        chunk_size,
-        compression_level,
-        received_chunks.len(),
-    );
-
-    // 打开文件
     let mut file = match tokio::fs::File::open(&file_path).await {
         Ok(f) => f,
         Err(e) => {
@@ -548,20 +548,11 @@ async fn handle_file_download_request(
         }
     };
 
-    // 逐分片读取并发送（使用 FileStreamChunk::from_file）
-    // 跳过接收方已接收的分片（断点续传）
     let mut sent_count = 0u32;
     for chunk_index in 0..total_chunks {
-        // 断点续传：如果接收方已接收此分片，跳过
-        if received_chunks.contains(&chunk_index) {
-            tracing::debug!("跳过已接收分片 {}/{}", chunk_index + 1, total_chunks);
-            continue;
-        }
-
         let offset = chunk_index as u64 * chunk_size as u64;
-
         let config = crate::message::ChunkReadConfig {
-            file_id: chunk_response.file_id,
+            file_id: file_hash,
             filename: filename.clone(),
             total_size: file_size,
             total_chunks,
@@ -582,7 +573,6 @@ async fn handle_file_download_request(
                 }
             };
 
-        // 序列化 FileStreamChunk（包含压缩后的 chunk_data）
         let chunk_data = match postcard::to_allocvec(&chunk) {
             Ok(d) => d,
             Err(e) => {
@@ -591,7 +581,6 @@ async fn handle_file_download_request(
             }
         };
 
-        // 发送 FileStream 消息
         if let Err(e) = core
             .send_text(
                 sender_mldsa_pubkey_hex,
@@ -606,32 +595,53 @@ async fn handle_file_download_request(
 
         sent_count += 1;
 
-        tracing::debug!(
-            "已发送分片 {}/{} (offset={}, size={})",
-            chunk_index + 1,
-            total_chunks,
-            offset,
-            bytes_read,
-        );
-
         if chunk.is_last {
             break;
         }
-
-        // 小延迟避免拥塞
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     tracing::info!(
-        "文件发送完成: {}, total_chunks={}, sent_chunks={}, skipped_chunks={}",
+        "文件发送完成: {}, total_chunks={}, sent_chunks={}",
         filename,
         total_chunks,
         sent_count,
-        received_chunks.len(),
+    );
+    core.file_path_map.remove(&file_hash);
+}
+
+/// 处理文件下载响应（接收方收到发送方的同意/拒绝）
+async fn handle_file_download_response(
+    core: &mut ChatCore,
+    data: Vec<u8>,
+) {
+    let response: crate::message::DownloadResponse = match postcard::from_bytes(&data) {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("解析 DownloadResponse 失败: {}", e);
+            return;
+        }
+    };
+
+    if !response.accepted {
+        let file_hash_hex = hex::encode(response.file_hash);
+        tracing::warn!("发送方拒绝了下载请求: file_hash={}..", &file_hash_hex[..16]);
+        core.send_warning_mpsc(format!("发送方拒绝了下载请求")).await;
+        return;
+    }
+
+    tracing::info!(
+        "发送方接受了下载请求: file_hash={}.., filename={}, size={}, chunks={}",
+        &hex::encode(response.file_hash)[..16],
+        response.filename.as_deref().unwrap_or("?"),
+        response.total_size.unwrap_or(0),
+        response.total_chunks.unwrap_or(0),
     );
 
-    // 清理 file_path_map 中的条目，防止内存泄漏
-    core.file_path_map.remove(&chunk_response.file_id);
+    // 创建传输状态，等待 FileStream 分片到达
+    let _ = core
+        .handle_file_download_response(response)
+        .await;
 }
 
 /// 发送签名响应确认
@@ -682,7 +692,7 @@ async fn handle_delivery_receipt(
         Ok(receipt_msg_hash) => {
             tracing::info!("收到送达回执，消息哈希: {}", &receipt_msg_hash[..16]);
 
-            // 查找并标记对应的待发送消息为已发送
+            // 先查找 pending 消息（首次发送尚未标记已发送的情况）
             match storage::list_pending(pool).await {
                 Ok(pending_msgs) => {
                     for msg in &pending_msgs {
@@ -693,22 +703,36 @@ async fn handle_delivery_receipt(
                                 tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
                             } else {
                                 tracing::info!("消息 {} 已通过送达回执标记为已发送", msg.id);
-                                // 通知 UI 消息已送达
-                                core.send_message_mpsc(
-                                    crate::command::IncomingMessage::DeliveryReceipt {
-                                        message_hash: receipt_msg_hash.clone(),
-                                        peer_id: msg.peer_pubkey_hex.clone(),
-                                    },
-                                )
-                                .await;
                             }
-                            break;
+                            core.send_message_mpsc(
+                                crate::command::IncomingMessage::DeliveryReceipt {
+                                    message_hash: receipt_msg_hash.clone(),
+                                    peer_id: msg.peer_pubkey_hex.clone(),
+                                },
+                            )
+                            .await;
+                            return;
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("查询待发送消息列表失败: {}", e);
                 }
+            }
+
+            // 如果 pending 中未找到，可能是已通过 mark_sent_by_hash 标记为已发送
+            // 仍然通知 UI 已送达
+            if let Ok(Some(msg)) = storage::get_message_by_hash(pool, &receipt_msg_hash).await {
+                tracing::info!("消息 {} 已通过 mark_sent_by_hash 标记为已发送，仅通知 UI", msg.id);
+                core.send_message_mpsc(
+                    crate::command::IncomingMessage::DeliveryReceipt {
+                        message_hash: receipt_msg_hash.clone(),
+                        peer_id: msg.peer_pubkey_hex.clone(),
+                    },
+                )
+                .await;
+            } else {
+                tracing::warn!("未找到哈希 {} 对应的消息，送达回执无法匹配", &receipt_msg_hash[..16]);
             }
         }
         Err(e) => {

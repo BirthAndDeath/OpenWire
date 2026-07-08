@@ -49,15 +49,14 @@ pub enum ChatCommand {
     /// 删除身份
     DeleteIdentity { identity_id: String },
 
-    /// 请求文件下载（接收方发起）
-    ///
-    /// 安全说明：下载目录由 SetDownloadDir 命令统一管理，
-    /// 不从请求中接受 download_dir 参数，防止路径遍历攻击。
+/// 请求文件下载（接收方发起）
     RequestFileDownload {
         /// 发送方的 ML-DSA 公钥 hex（谁分享的文件）
         sender_mldsa_pubkey_hex: String,
-        /// 文件唯一标识
-        file_id: [u8; 32],
+        /// 文件的 SHA256 哈希
+        file_hash: [u8; 32],
+        /// 保存路径（含文件名），None 时用默认下载目录
+        save_path: Option<PathBuf>,
     },
 
     /// 设置下载目录
@@ -100,6 +99,21 @@ pub enum ChatCommand {
 
     /// 优雅关闭核心
     Shutdown,
+
+    /// 设置是否允许启用中继服务（前端计费网络检测后调用）
+    SetRelayServerAllowed(bool),
+
+    // ===== 定时器事件（由 timers.rs 触发，不对外暴露） =====
+    /// 定时器：重试在线联系人的待发送消息
+    TimerRetryPendingOnline,
+    /// 定时器：保存路由表到磁盘
+    TimerSaveRoutingTable,
+    /// 定时器：重新发现所有联系人的 DHT 记录
+    TimerDiscoverAllContacts,
+    /// 定时器：清理过期 DHT 记录
+    TimerCleanupDht,
+    /// 定时器：将当前身份重新发布到 DHT
+    TimerPublishIdentity,
 }
 
 /// 收到的消息类型：chat_core 向上层传递的结构化数据

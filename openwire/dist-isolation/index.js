@@ -1,11 +1,3 @@
-/**
- * Tauri Isolation Pattern Hook
- */
-
-// ============================================================
-// Config
-// ============================================================
-
 const ALLOWED_COMMANDS = new Set([
     'send', 'send_file', 'list_contacts', 'list_identities', 'select_identity',
     'delete_identity', 'generate_identity', 'add_contact',
@@ -13,11 +5,10 @@ const ALLOWED_COMMANDS = new Set([
     'request_file_download', 'set_download_dir', 'get_download_dir',
     'load_messages', 'get_identity_qr_data',
     'check_core_ready',
-    'is_keyring_available', 'set_password', 'retry_init',
+    'is_keyring_available',
     'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'plugin:window|set_content_protected'
 ]);
-
 
 const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|', 'plugin:path|'];
 
@@ -46,10 +37,6 @@ const RATE_LIMITS = {
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
-
-// ============================================================
-// Rate limiting state
-// ============================================================
 
 const callRecords = new Map();
 
@@ -81,10 +68,6 @@ setInterval(() => {
         valid.length ? callRecords.set(cmd, valid) : callRecords.delete(cmd);
     }
 }, 60000);
-
-// ============================================================
-// Helpers
-// ============================================================
 
 function sanitize(payload) {
     if (!payload || typeof payload !== 'object') return payload;
@@ -122,10 +105,6 @@ function requiredString(val, name, maxLen) {
     if (maxLen && val.length > maxLen) return `${name} exceeds limit (${maxLen})`;
     return null;
 }
-
-// ============================================================
-// Validators
-// ============================================================
 
 const VALIDATORS = {
     send: (p) => {
@@ -191,12 +170,6 @@ const VALIDATORS = {
     get_identity_qr_data: () => null,
     check_core_ready: () => null,
     is_keyring_available: () => null,
-    set_password: (p) => {
-        if (typeof p.password !== 'string') return 'password must be string';
-        if (p.password.length > 512) return 'password exceeds limit (512)';
-        return null;
-    },
-    retry_init: () => null,
     get_nodes_config: () => null,
     reset_nodes_config: () => null,
     save_nodes_config: (p) => {
@@ -221,11 +194,6 @@ const VALIDATORS = {
         return null;
     },
 };
-
-
-// ============================================================
-// Main hook
-// ============================================================
 
 window.__TAURI_ISOLATION_HOOK__ = (payload) => {
     try {
@@ -262,8 +230,6 @@ window.__TAURI_ISOLATION_HOOK__ = (payload) => {
             }
         }
 
-        // Tauri v2 隔离模式 payload 结构: { cmd, payload: { ...args }, callback, error, options }
-        // 验证器需要从 payload.payload 中读取实际参数
         const args = payload.payload;
 
         const validator = VALIDATORS[cmd];

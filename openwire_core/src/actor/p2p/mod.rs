@@ -11,21 +11,24 @@
 pub mod netevent;
 pub mod swarm_ops;
 
+use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use libp2p::kad::{self, GetRecordOk, QueryResult};
+use libp2p::kad::{self, GetRecordOk, QueryResult, Mode};
+use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{PeerId, Swarm, autonat, dcutr, identify, mdns, relay};
-use redb::Database;
+use libp2p::{PeerId, Swarm, autonat, core, dcutr, identify, mdns, relay};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::{Actor, ActorCommand, ActorHandle};
 use crate::p2p::behaviour::{MyBehaviour, MyBehaviourEvent};
-use crate::p2p::dht::RedbRecordStore;
+use crate::p2p::dht_cache::DhtCache;
 use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
 use crate::p2p::{self, DHT_PROVIDER_CALLBACKS};
 use crate::{ChatMessage, ChatResponse};
@@ -81,6 +84,8 @@ pub enum P2pCommand {
     SaveRoutingTable,
     /// 关闭
     Shutdown,
+    /// 配置中继服务（前端计费网络检测后调用）
+    RelayServerConfig { allowed: bool },
 }
 
 /// P2pActor 发出的事件
@@ -99,7 +104,10 @@ pub enum P2pEvent {
         channel: libp2p::request_response::ResponseChannel<NetEventResponse>,
     },
     /// 连接建立
-    ConnectionEstablished { peer_id: PeerId },
+    ConnectionEstablished {
+        peer_id: PeerId,
+        listen_addrs: Vec<libp2p::Multiaddr>,
+    },
     /// 连接关闭
     ConnectionClosed { peer_id: PeerId },
     /// mDNS 发现
@@ -123,6 +131,23 @@ pub enum P2pEvent {
 }
 
 // ============================================================================
+// AutoRelay 常量
+// ============================================================================
+
+/// Circuit Relay v2 hop protocol ID — 中继服务器必须支持的协议
+static RELAY_HOP_PROTOCOL: LazyLock<libp2p::StreamProtocol> =
+    LazyLock::new(|| libp2p::StreamProtocol::new("/libp2p/circuit/relay/0.2.0"));
+
+/// 监听地址列表最大数量（防止恶意 peer 注入大量地址导致 OOM）
+const MAX_LISTEN_ADDRS: usize = 64;
+
+/// Relay 候选节点最大数量
+const MAX_RELAY_CANDIDATES: usize = 32;
+
+/// DHT 中继节点发现 key — 所有中继节点在此 key 下发布 provider
+const DHT_RELAY_INDEX_KEY: &str = "relay_nodes_public";
+
+// ============================================================================
 // P2pActor 结构体
 // ============================================================================
 
@@ -132,8 +157,8 @@ pub enum P2pEvent {
 pub struct P2pActor {
     /// libp2p 网络 swarm
     swarm: Swarm<MyBehaviour>,
-    /// DHT 数据库连接
-    dht_db: Option<Arc<Database>>,
+    /// DHT 缓存
+    dht_cache: Arc<DhtCache>,
     /// 事件发送通道（向 ChatCore 发送事件）
     event_tx: mpsc::Sender<P2pEvent>,
     /// 数据目录路径
@@ -142,23 +167,57 @@ pub struct P2pActor {
     mdns_refresh_interval: std::time::Duration,
     /// mDNS 缓存
     mdns_cache: lru::LruCache<PeerId, std::time::Instant>,
+    /// 通过 relay 连接的 peers
+    relay_connections: HashSet<PeerId>,
+    /// 当前 Kademlia 模式
+    kademlia_mode: Mode,
+    /// AutoNAT 状态
+    nat_status: autonat::NatStatus,
+    /// 本节点所有监听地址（含直连地址和 /p2p-circuit 中继地址）
+    listen_addrs: HashSet<libp2p::Multiaddr>,
+    /// Relay 节点配置 [(PeerId, Multiaddr)]
+    relay_nodes: Vec<(String, String)>,
+    /// 是否已向 relay 节点发起拨号
+    relay_dialed: bool,
+    /// 通过 Identify 自动发现的 relay 候选节点 (PeerId, first_known_addr)
+    relay_candidates: Vec<(PeerId, libp2p::Multiaddr)>,
+    /// Relay 重连冷却时间（防止无限循环重试）
+    relay_reconnect_cooldown_until: Option<std::time::Instant>,
+    /// Relay 重连尝试次数（指数退避）
+    relay_reconnect_attempt: u32,
+    /// 中继服务端是否已启用
+    relay_server_enabled: bool,
+    /// 是否允许启用中继服务（前端计费网络检测后设置）
+    relay_server_allowed: bool,
 }
 
 impl P2pActor {
     /// 创建新的 P2pActor
     pub fn new(
         swarm: Swarm<MyBehaviour>,
-        dht_db: Option<Arc<Database>>,
+        dht_cache: Arc<DhtCache>,
         data_dir: std::path::PathBuf,
         event_tx: mpsc::Sender<P2pEvent>,
+        relay_nodes: Vec<(String, String)>,
     ) -> Self {
         Self {
             swarm,
-            dht_db,
+            dht_cache,
             event_tx,
             data_dir,
             mdns_refresh_interval: std::time::Duration::from_secs(60 * 60),
             mdns_cache: lru::LruCache::new(std::num::NonZeroUsize::new(2000).unwrap()),
+            relay_connections: HashSet::new(),
+            kademlia_mode: Mode::Server,
+            nat_status: autonat::NatStatus::Unknown,
+            listen_addrs: HashSet::new(),
+            relay_nodes,
+            relay_dialed: false,
+            relay_candidates: Vec::new(),
+            relay_reconnect_cooldown_until: None,
+            relay_reconnect_attempt: 0,
+            relay_server_enabled: false,
+            relay_server_allowed: false,
         }
     }
 
@@ -178,19 +237,46 @@ impl P2pActor {
                     new: new_status,
                 } = event
                 {
+                    let old_status = std::mem::replace(&mut self.nat_status, new_status.clone());
                     match new_status {
-                        // 节点判定为公网可达
-                        autonat::NatStatus::Public(_multiaddr) => {
-
-                            // 在这里可以执行成为中继服务端等操作
+                        autonat::NatStatus::Public(addr) => {
+                            tracing::info!(
+                                "AutoNAT: node is publicly reachable at {:?}",
+                                addr
+                            );
+                            if self.kademlia_mode != Mode::Server {
+                                tracing::info!("AutoNAT: switching Kademlia to Server mode (public)");
+                                self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
+                                self.kademlia_mode = Mode::Server;
+                            }
+                            // 公网节点不需要中继，断开 relay 连接减轻中继压力
+                            if self.relay_dialed {
+                                self.disconnect_relay_nodes();
+                            }
+                            // 公网节点自动启用中继服务（向 DHT 注册 + listen /p2p-circuit）
+                            self.try_enable_relay_server();
                         }
-                        // 节点判定为在 NAT 之后
                         autonat::NatStatus::Private => {
-
-                            // 在这里可以禁用中继服务端，并寻找公共中继
+                            tracing::warn!(
+                                "AutoNAT: node is behind NAT, switching Kademlia to Client mode"
+                            );
+                            // 不再是公网节点，关闭中继服务
+                            self.disable_relay_server();
+                            if self.kademlia_mode != Mode::Client {
+                                tracing::info!("AutoNAT: switching Kademlia to Client mode (NATed)");
+                                self.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Client));
+                                self.kademlia_mode = Mode::Client;
+                            }
+                            // NAT 后节点需要中继连接
+                            self.dial_relay_nodes();
                         }
-                        // 状态未知（初始状态或探测中）
-                        autonat::NatStatus::Unknown => {}
+                        autonat::NatStatus::Unknown => {
+                            if old_status != autonat::NatStatus::Unknown {
+                                tracing::info!("AutoNAT: status unknown (probing in progress)");
+                            }
+                            // 状态未知时也尝试连接中继，确保可达性
+                            self.dial_relay_nodes();
+                        }
                     }
                 }
             }
@@ -341,11 +427,32 @@ impl P2pActor {
                         .kademlia
                         .add_address(&peer_id, multiaddr);
                 }
+                let observed = &info.observed_addr;
+                if !observed.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    self.swarm.add_external_address(observed.clone());
+                    tracing::info!("Added external address from Identify: {observed}");
+                }
                 tracing::info!(
                     "Identified {} with {} protocols",
                     peer_id,
                     info.protocols.len()
                 );
+                // AutoRelay: 检测 peer 是否支持中继 hop 协议
+                if info.protocols.contains(&RELAY_HOP_PROTOCOL) {
+                    let already_known = self.relay_candidates.iter().any(|(pid, _)| *pid == peer_id);
+                    if !already_known && self.relay_candidates.len() < MAX_RELAY_CANDIDATES {
+                        if let Some(first_addr) = info.listen_addrs.first() {
+                            self.relay_candidates.push((peer_id, first_addr.clone()));
+                            tracing::info!("Discovered relay-capable candidate: {} at {}", peer_id, first_addr);
+                        }
+                        // 如果 NAT 后且尚未连接 relay，立即尝试连接
+                        if !self.relay_dialed
+                            && matches!(self.nat_status, autonat::NatStatus::Private | autonat::NatStatus::Unknown)
+                        {
+                            self.dial_relay_nodes();
+                        }
+                    }
+                }
                 self.send_event(P2pEvent::IdentifyReceived {
                     peer_id,
                     listen_addrs: info.listen_addrs,
@@ -354,22 +461,53 @@ impl P2pActor {
             }
 
             // --- 连接建立 ---
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                tracing::info!("Connection established with {}", peer_id);
-                self.send_event(P2pEvent::ConnectionEstablished { peer_id })
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                endpoint,
+                ..
+            } => {
+                let is_relay = match &endpoint {
+                    core::ConnectedPoint::Dialer { address, .. }
+                    | core::ConnectedPoint::Listener { send_back_addr: address, .. } => {
+                        address.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+                    }
+                };
+                if is_relay {
+                    if self.relay_connections.insert(peer_id) {
+                        tracing::info!(
+                            "Relay connection to {}, DCUtR auto-handled by libp2p",
+                            peer_id
+                        );
+                    }
+                    tracing::info!("Relay connection established with {}", peer_id);
+                } else {
+                    tracing::info!("Direct connection established with {}", peer_id);
+                }
+                self.send_event(P2pEvent::ConnectionEstablished {
+                    peer_id,
+                    listen_addrs: self.listen_addrs.iter().cloned().collect(),
+                })
                     .await;
             }
 
             // --- 连接关闭 ---
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::info!("Connection closed with {}", peer_id);
+                self.relay_connections.remove(&peer_id);
                 self.send_event(P2pEvent::ConnectionClosed { peer_id })
                     .await;
             }
 
             // --- 其他事件（日志/忽略）---
             SwarmEvent::NewListenAddr { address, .. } => {
-                tracing::info!("Listening on: {address}");
+                if self.listen_addrs.len() < MAX_LISTEN_ADDRS {
+                    self.listen_addrs.insert(address.clone());
+                }
+                if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    tracing::info!("Relay listen address: {address}");
+                } else {
+                    tracing::info!("Listening on: {address}");
+                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => match peer_id {
                 Some(pid) => tracing::error!("Connect failed to {pid}: {error:?}"),
@@ -395,22 +533,57 @@ impl P2pActor {
                 tracing::info!("Peer {peer_id} new addr: {address}");
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
-                tracing::error!("Address expired: {address}");
+                self.listen_addrs.remove(&address);
+                if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    tracing::info!("Relay reservation expired, removed address: {address}");
+                    // re-reservation attempt: reset and re-dial
+                    self.relay_dialed = false;
+                    // 检查冷却时间，防止绕过退避
+                    let now = std::time::Instant::now();
+                    let in_cooldown = self.relay_reconnect_cooldown_until.is_some_and(|c| now < c);
+                    if !in_cooldown && matches!(self.nat_status, autonat::NatStatus::Private | autonat::NatStatus::Unknown) {
+                        self.dial_relay_nodes();
+                    } else if in_cooldown {
+                        tracing::debug!("ExpiredListenAddr: in cooldown, skipping relay re-dial");
+                    }
+                } else {
+                    tracing::info!("Listen address expired: {address}");
+                }
             }
 
-            // --- Relay 事件 ---
-            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(
+            // --- Relay Client 事件 ---
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(
+                relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+            )) => {
+                tracing::info!("Relay reservation accepted by relay: {}", relay_peer_id);
+                self.relay_reconnect_cooldown_until = None;
+                self.relay_reconnect_attempt = 0;
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(
+                relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
+            )) => {
+                tracing::info!("Outbound circuit established via relay: {}", relay_peer_id);
+                if self.relay_connections.insert(relay_peer_id) {
+                    tracing::info!("Relay connection to {}, DCUtR auto-handled by libp2p", relay_peer_id);
+                }
+            }
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayClient(event)) => {
+                tracing::trace!("Relay client event (unhandled): {:?}", event);
+            }
+
+            // --- Relay Server 事件 ---
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(
                 relay::Event::ReservationReqAccepted { src_peer_id, .. },
             )) => {
-                tracing::info!("Relay reservation accepted for: {}", src_peer_id);
+                tracing::info!("Relay server: reservation accepted from {}", src_peer_id);
             }
-            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(relay::Event::ReservationTimedOut {
-                src_peer_id,
-            })) => {
-                tracing::warn!("Relay reservation timed out for: {}", src_peer_id);
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(
+                relay::Event::ReservationReqDenied { src_peer_id, .. },
+            )) => {
+                tracing::debug!("Relay server: reservation denied for {}", src_peer_id);
             }
-            SwarmEvent::Behaviour(MyBehaviourEvent::Relay(event)) => {
-                tracing::trace!("Relay event (unhandled): {:?}", event);
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(event)) => {
+                tracing::trace!("Relay server event (unhandled): {:?}", event);
             }
 
             // --- DCUtR 事件 ---
@@ -419,6 +592,8 @@ impl P2pActor {
                 result: Ok(_),
             })) => {
                 tracing::info!("DCUtR direct connection upgraded with: {}", remote_peer_id);
+                // 移除 relay connection 标记，直连已建立
+                self.relay_connections.remove(&remote_peer_id);
             }
             SwarmEvent::Behaviour(MyBehaviourEvent::Dcutr(dcutr::Event {
                 remote_peer_id,
@@ -429,6 +604,7 @@ impl P2pActor {
                     remote_peer_id,
                     e
                 );
+                // 不重试：DCUtR failure 通常意味着 NAT 限制无法打洞
             }
 
             _ => {}
@@ -478,12 +654,10 @@ impl P2pActor {
                             &key_str[..16.min(key_str.len())]
                         );
 
-                        // 缓存到本地 DHT 数据库
-                        if let Some(ref db) = self.dht_db {
-                            let store = RedbRecordStore::new(db.clone());
-                            for provider in &providers {
-                                let _ = store.set_pubkey_peerid(key_str, provider);
-                            }
+                        // 缓存到本地 DHT 缓存
+                        let store = &self.dht_cache;
+                        for provider in &providers {
+                            let _ = store.set_pubkey_peerid(key_str, provider);
                         }
 
                         // 通知等待的 oneshot callbacks
@@ -501,6 +675,21 @@ impl P2pActor {
                             providers: providers.iter().copied().collect(),
                         })
                         .await;
+
+                        // 如果是中继节点发现 key，自动连接发现的 relay
+                        if key_str == DHT_RELAY_INDEX_KEY && !self.relay_server_enabled {
+                            for provider in providers.iter().take(4) {
+                                if !self.relay_connections.contains(provider) {
+                                    let pid_str = provider.to_string();
+                                    // 通过 Dial 让 libp2p 自动从路由表解析地址
+                                    let _ = self.swarm.dial(*provider);
+                                    tracing::info!(
+                                        "Discovered relay node via DHT: {}, dialing...",
+                                        pid_str
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
@@ -530,6 +719,168 @@ impl P2pActor {
 
             _ => tracing::trace!("Unhandled Kademlia event: {:?}", kad_event),
         }
+    }
+
+    /// 向所有 relay 节点发起拨号（NAT 后节点需要中继连接）
+    fn dial_relay_nodes(&mut self) {
+        // 检查冷却时间，防止无限重试循环
+        let now = std::time::Instant::now();
+        if let Some(cooldown) = self.relay_reconnect_cooldown_until {
+            if now < cooldown {
+                tracing::debug!(
+                    "Relay reconnect in cooldown, skipping (until {:?})",
+                    cooldown
+                );
+                return;
+            }
+        }
+
+        let has_configured = !self.relay_nodes.is_empty();
+        let has_candidates = !self.relay_candidates.is_empty();
+        if !has_configured && !has_candidates {
+            return;
+        }
+        if self.relay_dialed && !has_candidates {
+            return;
+        }
+        self.relay_dialed = true;
+        let mut dial_success = false;
+        let mut attempted = false;
+
+        // 1. 尝试配置的 relay 节点（静态列表）
+        let configured_nodes = self.relay_nodes.clone();
+        for (relay_peer_id, relay_addr) in &configured_nodes {
+            match relay_addr.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => {
+                    let has_p2p = addr.iter().any(|p| matches!(p, Protocol::P2p(..)));
+                    let full_addr = if has_p2p {
+                        addr.clone()
+                    } else {
+                        match PeerId::from_str(relay_peer_id) {
+                            Ok(pid) => addr.clone().with_p2p(pid).unwrap_or(addr.clone()),
+                            Err(e) => {
+                                tracing::warn!("无效的 relay PeerID '{}': {}", relay_peer_id, e);
+                                continue;
+                            }
+                        }
+                    };
+                    attempted = true;
+                    if self.try_relay_connection(relay_peer_id, &full_addr).is_ok() {
+                        dial_success = true;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("无效的 relay 地址 '{}': {}", relay_addr, e);
+                }
+            }
+        }
+
+        // 2. 尝试通过 Identify 自动发现的 relay 候选节点
+        let candidates = std::mem::take(&mut self.relay_candidates);
+        for (candidate_peer_id, candidate_addr) in &candidates {
+            let has_p2p = candidate_addr.iter().any(|p| matches!(p, Protocol::P2p(..)));
+            let full_addr = if has_p2p {
+                candidate_addr.clone()
+            } else {
+                candidate_addr
+                    .clone()
+                    .with_p2p(*candidate_peer_id)
+                    .unwrap_or(candidate_addr.clone())
+            };
+            let peer_id_str = candidate_peer_id.to_string();
+            attempted = true;
+            if self.try_relay_connection(&peer_id_str, &full_addr).is_ok() {
+                dial_success = true;
+            }
+        }
+
+        // 3. 通过 DHT 查询其他中继节点
+        let _ = self.swarm.behaviour_mut().kademlia.get_providers(libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY));
+
+        if !dial_success && attempted {
+            self.relay_reconnect_attempt += 1;
+            let backoff_secs = 30u64
+                .saturating_mul(2u64.saturating_pow(self.relay_reconnect_attempt.saturating_sub(1)))
+                .min(3600);
+            let msg = format!(
+                "中继连接失败（第{}次）：所有 relay 节点均无法连接，{}s 后重试。NAT 后的节点可能无法被其他节点发现",
+                self.relay_reconnect_attempt, backoff_secs
+            );
+            tracing::warn!("{}", msg);
+            self.relay_reconnect_cooldown_until = Some(now + std::time::Duration::from_secs(backoff_secs));
+            let _ = self.event_tx.try_send(P2pEvent::Log(format!("relay_warning:{}", msg)));
+        } else if dial_success {
+            self.relay_reconnect_attempt = 0;
+        }
+    }
+
+    /// 尝试连接单个 relay 节点：dial + listen_on
+    fn try_relay_connection(&mut self, peer_id_str: &str, full_addr: &libp2p::Multiaddr) -> Result<(), String> {
+        self.swarm.dial(full_addr.clone()).map_err(|e| format!("dial failed: {}", e))?;
+        tracing::info!("Dialed relay node: {}", peer_id_str);
+        let relay_listen = full_addr.clone().with(Protocol::P2pCircuit);
+        match self.swarm.listen_on(relay_listen) {
+            Ok(listener_id) => {
+                tracing::info!("Listening on relay circuit at {}, listener={:?}", peer_id_str, listener_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "listen_on on relay {} failed (dial already succeeded): {:?}",
+                    peer_id_str, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 断开所有 relay 节点的连接（公网节点不需要中继）
+    fn disconnect_relay_nodes(&mut self) {
+        let connected_relays: Vec<PeerId> = self.relay_connections.iter().copied().collect();
+        for pid in &connected_relays {
+            if let Err(e) = self.swarm.disconnect_peer_id(*pid) {
+                tracing::warn!("Failed to disconnect relay {}: {:?}", pid, e);
+            } else {
+                tracing::info!("Disconnected from relay {}", pid);
+            }
+        }
+        self.relay_connections.clear();
+        self.relay_dialed = false;
+        self.relay_candidates.clear();
+    }
+
+    /// 公网节点自动启用中继服务
+    fn try_enable_relay_server(&mut self) {
+        if self.relay_server_enabled {
+            return;
+        }
+        if !self.relay_server_allowed {
+            tracing::debug!("Relay server not allowed (metered network), skipping");
+            return;
+        }
+        // 在 DHT 注册为中继节点，供 NAT 后节点发现
+        let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY);
+        let _ = self.swarm.behaviour_mut().kademlia.start_providing(relay_key);
+        // 监听中继电路地址，接收 reservation 请求
+        match self.swarm.listen_on("/p2p-circuit".parse().unwrap()) {
+            Ok(_) => {
+                tracing::info!("Relay server enabled: listening on /p2p-circuit");
+                self.relay_server_enabled = true;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to listen on /p2p-circuit: {:?}", e);
+            }
+        }
+    }
+
+    /// 关闭中继服务：DHT 反注册 + 移除 listener
+    fn disable_relay_server(&mut self) {
+        if !self.relay_server_enabled {
+            return;
+        }
+        let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY);
+        self.swarm.behaviour_mut().kademlia.stop_providing(&relay_key);
+        self.relay_server_enabled = false;
+        tracing::info!("Relay server disabled (DHT unregistered)");
     }
 
     /// 处理 P2pActor 控制命令
@@ -578,6 +929,18 @@ impl P2pActor {
             }
             P2pCommand::Shutdown => {
                 tracing::info!("P2pActor shutting down...");
+                self.disable_relay_server();
+            }
+            P2pCommand::RelayServerConfig { allowed } => {
+                self.relay_server_allowed = allowed;
+                if allowed {
+                    // 如果当前是公网状态，尝试重新启用中继
+                    if matches!(self.nat_status, autonat::NatStatus::Public(_)) {
+                        self.try_enable_relay_server();
+                    }
+                } else {
+                    self.disable_relay_server();
+                }
             }
         }
     }
@@ -638,7 +1001,7 @@ pub fn start_p2p_actor(
                         match cmd {
                             ActorCommand::Custom(P2pCommand::Shutdown) => {
                                 tracing::info!("P2pActor 收到关闭命令");
-                                // 保存路由表
+                                actor.disable_relay_server();
                                 let cache_path = actor.data_dir.join("routing_table.cache");
                                 p2p::save_routing_table(&mut actor.swarm, &cache_path);
                                 break;
@@ -654,6 +1017,7 @@ pub fn start_p2p_actor(
                 // 处理取消信号
                 _ = cancellation_token.cancelled() => {
                     tracing::info!("P2pActor 收到取消信号");
+                    actor.disable_relay_server();
                     let cache_path = actor.data_dir.join("routing_table.cache");
                     p2p::save_routing_table(&mut actor.swarm, &cache_path);
                     break;

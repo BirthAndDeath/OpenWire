@@ -5,7 +5,10 @@ use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt};
-//✅稳定中，已复查 注意:用户应当保护好自己的日志文件，避免泄露敏感信息。日志路径应当设置在安全的位置，并且权限应当正确配置以防止未授权访问。
+//✅稳定中，已基本复查。因为是内部使用，不存在过大风险。
+//注意使用规范:用户应当保护好自己的日志文件，避免泄露敏感信息。
+//日志路径应当设置在安全的位置，并且权限应当正确配置以防止未授权访问。
+//对日志信息也应当进行一定过滤之后在传入，减少风险和储存空间消耗
 // 标记是否已初始化
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 // 文件日志 guard（仅在文件日志模式下持有）

@@ -18,12 +18,12 @@ impl ChatCore {
         mlkem_pubkey_hex: &str,
     ) {
         // 通过 P2pActor 发布身份到 DHT
-        let _ = self.p2p_handle.send(
+        let _ = self.p2p_handle.tx.try_send(
             crate::actor::ActorCommand::Custom(P2pCommand::PublishIdentity {
                 mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
                 mlkem_pubkey_hex: mlkem_pubkey_hex.to_string(),
             }),
-        ).await;
+        );
 
         tracing::info!(
             "Published identity to DHT network: {} (ML-KEM: {})",

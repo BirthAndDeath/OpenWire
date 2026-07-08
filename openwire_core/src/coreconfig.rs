@@ -1,27 +1,23 @@
 use std::path::PathBuf;
 
+/// 默认 WebSocket 信令服务器（Cloudflare Workers）
+/// 海外用户可直接使用，国内用户请设 `signaling_server = None`
+pub const DEFAULT_SIGNALING_SERVER: &str = "openwire-server.3589206993.workers.dev";
+
 /// 核心配置：初始化参数集合
 #[derive(Default, Clone)]
 pub struct CoreConfig {
-    /// 数据目录路径，示例: "/path/to/data"
     pub data_dir: PathBuf,
-    /// 日志文件路径，None 表示标准输出
     pub path_to_log: Option<PathBuf>,
-    /// 日志级别，如 "info", "debug", "warn"
     pub log_level: Option<String>,
-    /// 文件下载目录（默认: data_dir/downloads）
     pub download_dir: Option<PathBuf>,
-    /// 用户密码派生密钥 hex（前端用 Argon2id 处理后的 256 位密钥）
-    /// 用于 Keyring 不可用时的降级加密文件存储
-    pub passwd: Option<String>,
-    /// Relay 中继节点列表：[(PeerId, Multiaddr)]
-    /// 用于 NAT 穿透，节点会尝试通过这些 relay 建立中继连接。
-    /// 如果为空，则不使用 relay。
     pub relay_nodes: Vec<(String, String)>,
-    /// Bootstrap 引导节点列表：[(PeerId, Multiaddr)]
-    /// 用于 Kademlia DHT 网络引导。
-    /// 如果为空，使用默认的 IPFS bootstrap 节点。
     pub bootstrap_nodes: Vec<(String, String)>,
+    /// WebSocket 信令服务器主机，如 "openwire-server.3589206993.workers.dev"
+    /// 设为 `None` 可禁用信令功能（国内用户建议禁用）
+    pub signaling_server: Option<String>,
+    /// 信令房间名（可选），不设置则用 ML-DSA 公钥前 16 字符
+    pub signaling_room: Option<String>,
 }
 
 impl CoreConfig {
@@ -43,25 +39,25 @@ impl CoreConfig {
         if path_to_log.is_none() {
             return Self {
                 data_dir: data_dir.into(),
-
                 path_to_log: None,
                 log_level: None,
                 download_dir: None,
-                passwd: None,
                 relay_nodes: Vec::new(),
                 bootstrap_nodes: Vec::new(),
+                signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),
+                signaling_room: None,
             };
         }
 
         Self {
             data_dir: data_dir.into(),
-
             path_to_log: Some(path_to_log.unwrap().into()),
             log_level: log_level.map(|s| s.into()),
             download_dir: None,
-            passwd: None,
             relay_nodes: Vec::new(),
             bootstrap_nodes: Vec::new(),
+            signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),
+            signaling_room: None,
         }
     }
 

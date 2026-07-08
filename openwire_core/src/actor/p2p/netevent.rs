@@ -15,10 +15,8 @@ use crate::p2p::netevent::NetEventRequest;
 /// 处理收到的 FriendOnline 通知
 ///
 /// 已停用：RedbRecordStore 不再作为 Kademlia 储存使用。
-/// FriendOnline 的实际处理逻辑在 event_loop.rs 中直接操作 swarm。
 #[allow(dead_code)]
 pub fn handle_friend_online(
-    _kademlia: &mut (),  // 原为 kad::Behaviour<RedbRecordStore>，已停用
     request: &NetEventRequest,
     store: Option<Arc<redb::Database>>,
 ) {
@@ -43,16 +41,13 @@ pub fn handle_friend_online(
         peer_id_str
     );
 
-    // 如果本地 DHT 数据库可用，缓存对方的信息
     if let Some(ref db) = store {
-        let record_store = crate::p2p::dht::RedbRecordStore::new(db.clone());
+        let record_store = crate::server_redb_store::RedbRecordStore::new(db.clone());
 
-        // 缓存 PeerID 映射
         if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
             let _ = record_store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
         }
 
-        // 检查是否已有 ML-KEM 公钥，如果没有则记录日志（网络查询在 event_loop 中处理）
         let has_mlkem = record_store
             .get_mlkem_pubkey(mldsa_pubkey_hex)
             .ok()

@@ -54,6 +54,24 @@ pub struct ChunkResponse {
     pub received_chunks: Vec<u32>,
 }
 
+/// 文件下载请求（接收方 → 发送方）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadRequest {
+    /// 要下载的文件的 SHA256 哈希
+    pub file_hash: [u8; 32],
+}
+
+/// 文件下载响应（发送方 → 接收方）
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownloadResponse {
+    pub file_hash: [u8; 32],
+    pub accepted: bool,
+    pub filename: Option<String>,
+    pub total_size: Option<u64>,
+    pub total_chunks: Option<u32>,
+    pub chunk_size: Option<u32>,
+}
+
 // ========== 文件哈希信息方法 ==========
 
 impl FileHashInfo {

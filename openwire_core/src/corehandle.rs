@@ -62,12 +62,13 @@ impl CoreHandle {
     pub async fn request_file_download(
         &self,
         sender_mldsa_pubkey_hex: &str,
-        file_id: [u8; 32],
-        _download_dir: Option<PathBuf>,
+        file_hash: [u8; 32],
+        save_path: Option<PathBuf>,
     ) -> bool {
         self.send_cmd(ChatCommand::RequestFileDownload {
             sender_mldsa_pubkey_hex: sender_mldsa_pubkey_hex.to_string(),
-            file_id,
+            file_hash,
+            save_path,
         })
         .await
     }
@@ -156,6 +157,11 @@ impl CoreHandle {
         let _ = self.try_send_cmd(ChatCommand::Shutdown);
     }
 
+    /// 设置是否允许启用中继服务（计费网络检测）
+    pub fn set_relay_server_allowed(&self, allowed: bool) {
+        self.try_send_cmd(ChatCommand::SetRelayServerAllowed(allowed));
+    }
+
     /// 发送文件（计算文件 hash、注册文件路径、发送 FileHash 消息）
     pub async fn send_file(&self, mldsa_pubkey_hex: &str, file_path: &std::path::Path) -> bool {
         let file_hash = match crate::transfer::compute_file_hash(file_path).await {
@@ -180,6 +186,18 @@ impl CoreHandle {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
+
+        // 记录到已发送文件历史
+        if let Some(pool) = crate::storage::pool() {
+            let _ = crate::storage::add_sent_file(
+                pool,
+                &file_hash,
+                file_path.to_str().unwrap_or(""),
+                &filename,
+                total_size,
+            )
+            .await;
+        }
 
         let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
         let file_info_bytes = match postcard::to_allocvec(&file_info) {

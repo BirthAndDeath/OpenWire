@@ -6,7 +6,7 @@ use crate::{
     command::{FileTransferProgress, MessageEvent},
     core::ChatCore,
     error::CoreError,
-    message::{ChatMessageType, ChunkResponse, FileStreamChunk},
+    message::{ChatMessageType, FileStreamChunk},
     transfer::{FileTransferState, TransferStatus},
 };
 
@@ -86,35 +86,30 @@ impl ChatCore {
     pub(crate) async fn handle_file_download_request(
         &mut self,
         sender_mldsa_pubkey_hex: &str,
-        file_id: [u8; 32],
-        _download_dir: Option<PathBuf>,
+        file_hash: [u8; 32],
+        save_path: Option<PathBuf>,
     ) {
-        let file_id_hex = hex::encode(file_id);
+        let file_hash_hex = hex::encode(file_hash);
 
-        // 安全说明：忽略远端传入的 download_dir 参数，防止攻击者通过恶意请求覆盖下载目录
-        // download_dir 仅由本地配置控制，不可被远端消息修改
-        // 参见安全审计：任意文件写入 / 路径遍历漏洞
-
-        // 检查是否已有相同 file_id 的传输在进行中
-        if self.file_transfers.contains_key(&file_id_hex) {
+        // 检查是否已有相同 file_hash 的传输在进行中
+        if self.file_transfers.contains_key(&file_hash_hex) {
             tracing::warn!(
-                "File transfer already in progress for file_id: {}",
-                &file_id_hex[..16]
+                "File transfer already in progress for file_hash: {}..",
+                &file_hash_hex[..16]
             );
-            let msg = format!("文件 {}.. 已在下载中", &file_id_hex[..16]);
+            let msg = format!("文件 {}.. 已在下载中", &file_hash_hex[..16]);
             self.send_warning_mpsc(msg).await;
             return;
         }
 
-        // 并发传输限制：检查当前活跃传输数是否达到上限
-        // 防止过多并发传输耗尽系统资源（磁盘 IO、网络带宽）
+        // 并发传输限制
         let active_count = self.file_transfers.len();
         if active_count >= crate::transfer::MAX_CONCURRENT_TRANSFERS {
             tracing::warn!(
-                "并发传输数已达上限 ({}/{}), 拒绝新的下载请求 file_id: {}..",
+                "并发传输数已达上限 ({}/{}), 拒绝新的下载请求 file_hash: {}..",
                 active_count,
                 crate::transfer::MAX_CONCURRENT_TRANSFERS,
-                &file_id_hex[..16]
+                &file_hash_hex[..16]
             );
             let msg = format!(
                 "并发下载数已达上限 ({}), 请等待当前下载完成后再试",
@@ -124,16 +119,47 @@ impl ChatCore {
             return;
         }
 
+        // 确定保存目录
+        let download_dir = match &save_path {
+            Some(path) => {
+                if path.is_dir() {
+                    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                    let base = std::fs::canonicalize(&self.download_dir)
+                        .unwrap_or_else(|_| self.download_dir.clone());
+                    if canonical.starts_with(&base) {
+                        canonical
+                    } else {
+                        tracing::warn!(
+                            "save_path {:?} outside download_dir {:?}, falling back to default",
+                            canonical, base
+                        );
+                        self.download_dir.clone()
+                    }
+                } else if let Some(parent) = path.parent() {
+                    let canonical_parent =
+                        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+                    let base = std::fs::canonicalize(&self.download_dir)
+                        .unwrap_or_else(|_| self.download_dir.clone());
+                    if canonical_parent.starts_with(&base) {
+                        parent.to_path_buf()
+                    } else {
+                        tracing::warn!(
+                            "save_path {:?} outside download_dir {:?}, falling back to default",
+                            path, base
+                        );
+                        self.download_dir.clone()
+                    }
+                } else {
+                    self.download_dir.clone()
+                }
+            }
+            None => self.download_dir.clone(),
+        };
+
         // 断点续传：检查本地是否存在部分下载的临时文件
-        let temp_path = self
-            .download_dir
-            .join(format!(".{}.tmp", &file_id_hex[..16]));
-        // 分片状态文件：持久化已接收的分片列表
-        let state_path = self
-            .download_dir
-            .join(format!(".{}.state", &file_id_hex[..16]));
+        let temp_path = download_dir.join(format!(".{}.tmp", &file_hash_hex[..16]));
+        let state_path = download_dir.join(format!(".{}.state", &file_hash_hex[..16]));
         let existing_received_chunks: HashSet<u32> = if temp_path.exists() && state_path.exists() {
-            // 从状态文件中恢复已接收的分片列表
             match std::fs::read_to_string(&state_path) {
                 Ok(content) => {
                     let chunks: HashSet<u32> = content
@@ -156,39 +182,34 @@ impl ChatCore {
             HashSet::new()
         };
 
-        // 创建传输状态（clone received_chunks 用于后续构建 ChunkResponse）
+        // 创建传输状态
         let received_vec: Vec<u32> = existing_received_chunks.iter().copied().collect();
         let state = FileTransferState {
-            file_id,
-            filename: String::new(), // 将在收到第一个分片时更新
+            file_id: file_hash,
+            filename: String::new(),
             total_size: 0,
             total_chunks: 0,
             chunk_size: 0,
-            file_hash: [0u8; 32],
+            file_hash,
             received_chunks: existing_received_chunks,
             temp_path: temp_path.clone(),
             output_path: PathBuf::new(),
             status: TransferStatus::Requesting,
             started_at: Instant::now(),
         };
-        self.file_transfers.insert(file_id_hex.clone(), state);
+        self.file_transfers.insert(file_hash_hex.clone(), state);
 
-        // 发送 FileDownloadRequest（包含 ChunkResponse，携带已接收分片列表）
-        // 发送方会根据 received_chunks 只发送缺失的分片，实现断点续传
-        let chunk_response = ChunkResponse {
-            file_id,
-            received_chunks: received_vec,
-        };
-        let data = match postcard::to_allocvec(&chunk_response) {
+        // 发送简化版 DownloadRequest
+        let request = crate::message::DownloadRequest { file_hash };
+        let data = match postcard::to_allocvec(&request) {
             Ok(d) => d,
             Err(e) => {
-                tracing::error!("Failed to serialize ChunkResponse: {e}");
-                self.file_transfers.remove(&file_id_hex);
+                tracing::error!("Failed to serialize DownloadRequest: {e}");
+                self.file_transfers.remove(&file_hash_hex);
                 return;
             }
         };
 
-        // 通过 send_text 发送 FileDownloadRequest 消息
         if let Err(e) = self
             .send_text(
                 sender_mldsa_pubkey_hex,
@@ -198,15 +219,68 @@ impl ChatCore {
             .await
         {
             tracing::error!("Failed to send FileDownloadRequest: {e}");
-            self.file_transfers.remove(&file_id_hex);
+            self.file_transfers.remove(&file_hash_hex);
             let msg = format!("文件下载请求发送失败: {}", e);
             self.send_warning_mpsc(msg).await;
         } else {
             tracing::info!(
-                "File download request sent for file_id: {}..",
-                &file_id_hex[..16]
+                "File download request sent for file_hash: {}..",
+                &file_hash_hex[..16]
             );
         }
+    }
+
+    /// 处理文件下载响应（接收方收到发送方的同意）
+    pub(crate) async fn handle_file_download_response(
+        &mut self,
+        response: crate::message::DownloadResponse,
+    ) {
+        let file_hash_hex = hex::encode(response.file_hash);
+        let Some(state) = self.file_transfers.get_mut(&file_hash_hex) else {
+            tracing::warn!(
+                "收到 DownloadResponse 但无对应传输状态: file_hash={}..",
+                &file_hash_hex[..16]
+            );
+            return;
+        };
+
+        let filename = response.filename.unwrap_or_else(|| "unknown".to_string());
+        let total_size = response.total_size.unwrap_or(0);
+        let total_chunks = response.total_chunks.unwrap_or(0);
+        let chunk_size = response.chunk_size.unwrap_or(0);
+
+        state.filename = filename.clone();
+        state.total_size = total_size;
+        state.total_chunks = total_chunks;
+        state.chunk_size = chunk_size;
+
+        // 检查文件是否已存在
+        let output_path = self.download_dir.join(&filename);
+        if output_path.exists() {
+            if let Ok(existing_hash) = crate::transfer::compute_file_hash(&output_path).await {
+                if existing_hash == response.file_hash {
+                    tracing::info!(
+                        "文件已存在且哈希匹配，跳过下载: {:?}",
+                        output_path
+                    );
+                    self.file_transfers.remove(&file_hash_hex);
+                    let msg = format!("文件已存在: {}", filename);
+                    self.send_log_mpsc(msg).await;
+                    return;
+                }
+            }
+        }
+
+        state.output_path = output_path;
+        state.status = crate::transfer::TransferStatus::Downloading { received_bytes: 0 };
+
+        tracing::info!(
+            "开始接收文件: {}, size={}, chunks={}, chunk_size={}",
+            filename,
+            total_size,
+            total_chunks,
+            chunk_size,
+        );
     }
 
     /// 处理文件流分片写入（接收方收到 FileStream 分片后写入临时文件）
@@ -398,8 +472,7 @@ impl ChatCore {
             };
             if let Err(e) = self
                 .tx_message
-                .send(MessageEvent::FileTransferProgress(progress_event))
-                .await
+                .try_send(MessageEvent::FileTransferProgress(progress_event))
             {
                 tracing::error!("Failed to send file transfer progress: {e}");
             }
@@ -540,8 +613,7 @@ impl ChatCore {
         };
         if let Err(e) = self
             .tx_message
-            .send(MessageEvent::FileTransferProgress(progress_event))
-            .await
+            .try_send(MessageEvent::FileTransferProgress(progress_event))
         {
             tracing::error!("Failed to send file transfer progress: {e}");
         }
@@ -632,8 +704,7 @@ impl ChatCore {
             };
             if let Err(e) = self
                 .tx_message
-                .send(MessageEvent::FileTransferProgress(complete_event))
-                .await
+                .try_send(MessageEvent::FileTransferProgress(complete_event))
             {
                 tracing::error!("Failed to send file transfer complete: {e}");
             }

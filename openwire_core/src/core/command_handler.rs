@@ -1,3 +1,5 @@
+use crate::actor::p2p::P2pCommand;
+use crate::actor::ActorCommand;
 use crate::{command::ChatCommand, core::ChatCore, error::CoreError};
 
 impl ChatCore {
@@ -63,9 +65,10 @@ impl ChatCore {
             ChatCommand::DeleteIdentity { identity_id } => self.delete_identity(identity_id).await,
             ChatCommand::RequestFileDownload {
                 sender_mldsa_pubkey_hex,
-                file_id,
+                file_hash,
+                save_path,
             } => {
-                self.handle_file_download_request(&sender_mldsa_pubkey_hex, file_id, None)
+                self.handle_file_download_request(&sender_mldsa_pubkey_hex, file_hash, save_path)
                     .await;
             }
             ChatCommand::SetDownloadDir { path } => {
@@ -98,6 +101,35 @@ impl ChatCore {
                 tracing::warn!(
                     "Shutdown command reached handle_command (should be handled in run_inner)"
                 );
+            }
+            ChatCommand::SetRelayServerAllowed(allowed) => {
+                if let Err(e) = self.p2p_handle.tx.try_send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::RelayServerConfig { allowed }),
+                ) {
+                    tracing::warn!("Failed to send RelayServerConfig: {e:?}");
+                }
+            }
+            // ===== 定时器事件处理 =====
+            ChatCommand::TimerRetryPendingOnline => {
+                self.retry_pending_for_online_peers().await;
+            }
+            ChatCommand::TimerSaveRoutingTable => {
+                if let Err(e) = self.p2p_handle.tx.try_send(
+                    crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
+                ) {
+                    tracing::warn!("Failed to send periodic SaveRoutingTable: {e:?}");
+                }
+            }
+            ChatCommand::TimerDiscoverAllContacts => {
+                self.discover_all_contacts().await;
+                // 连接维护后触发离线消息重试
+                self.retry_pending_messages().await;
+            }
+            ChatCommand::TimerCleanupDht => {
+                self.cleanup_expired_dht_records();
+            }
+            ChatCommand::TimerPublishIdentity => {
+                self.publish_current_identity_to_dht();
             }
         }
     }

@@ -9,6 +9,7 @@
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
   import Toast from "./Toast.svelte";
+  import NotificationBadge from "./NotificationBadge.svelte";
   import AddFriendModal from "./AddFriendModal.svelte";
   interface IdentityDto {
     id: number;
@@ -28,11 +29,28 @@
   }
 
   let warning = $state<string>("");
-  // 显示 warning 的统一函数
+  let onNotif: ((msg: string) => void) | undefined = $state();
+  let notifBuffer: string[] = [];
+
   const showWarning = (message: string, duration: number = 5000) => {
     warning = message;
+    if (onNotif) {
+      onNotif(message);
+    } else {
+      notifBuffer.push(message);
+    }
     console.warn("Warning:", message);
   };
+
+  // 当 onNotif 就绪时，flush 缓冲队列
+  $effect(() => {
+    if (onNotif) {
+      for (const msg of notifBuffer) {
+        onNotif(msg);
+      }
+      notifBuffer = [];
+    }
+  });
 
   // 语言选项
   const languages = [
@@ -107,14 +125,6 @@
     }[]
   >([]);
 
-  // === 启动密码输入模态框状态 ===
-  let showPasswordModal = $state(false);
-  let passwordModalStatus = $state<"input" | "retrying" | "success" | "failed">(
-    "input",
-  );
-  let passwordModalError = $state("");
-  let startupPassword = $state("");
-
   // === 核心是否已就绪（后端核心初始化完成） ===
   let coreReady = $state(false);
 
@@ -123,7 +133,6 @@
     let unlistenWarning: (() => void) | undefined;
     let unlistenMessage: (() => void) | undefined;
     let unlistenFileProgress: (() => void) | undefined;
-    let unlistenNeedPassword: (() => void) | undefined;
     let unlistenCoreReady: (() => void) | undefined;
     let unlistenDeliveryReceipt: (() => void) | undefined;
     let unlistenOnlineStatus: (() => void) | undefined;
@@ -134,19 +143,10 @@
       // 监听 core-ready 事件（核心初始化完成后由后端发送）
       // 注意：Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
       // 事件可能丢失。因此同时使用 check_core_ready 命令轮询作为可靠兜底。
-      unlistenCoreReady = await listen<boolean>("core-ready", () => {
+unlistenCoreReady = await listen<boolean>("core-ready", () => {
         coreReady = true;
-        // 核心就绪后加载数据
         loadContacts();
         loadCurrentIdentity();
-      });
-
-      // 监听 need-password 事件（Keyring 不可用时由后端发送）
-      unlistenNeedPassword = await listen<boolean>("need-password", () => {
-        showPasswordModal = true;
-        passwordModalStatus = "input";
-        passwordModalError = "";
-        startupPassword = "";
       });
 
       unlistenWarning = await listen<string>("warning", (e) => {
@@ -255,15 +255,12 @@
         return;
       }
       try {
-        const ready = await invoke<boolean>("check_core_ready");
-        if (ready) {
-          coreReady = true;
-          clearInterval(pollingTimer);
-          loadContacts();
-          loadCurrentIdentity();
-        }
-      } catch (e) {
-        console.warn("check_core_ready 调用失败:", e);
+        await invoke("check_core_ready");
+        coreReady = true;
+        clearInterval(pollingTimer);
+        loadContacts();
+        loadCurrentIdentity();
+      } catch {
       }
     }, 200);
 
@@ -272,7 +269,6 @@
       unlistenWarning?.();
       unlistenMessage?.();
       unlistenFileProgress?.();
-      unlistenNeedPassword?.();
       unlistenCoreReady?.();
       unlistenDeliveryReceipt?.();
       unlistenOnlineStatus?.();
@@ -341,32 +337,9 @@
     goto("/settings");
   }
 
-  // 跳转到身份管理页面
+// 跳转到身份管理页面
   function goToIdentity() {
     goto("/identity");
-  }
-
-  // 启动密码输入提交处理
-  async function handleStartupPassword(password: string) {
-    passwordModalStatus = "retrying";
-    passwordModalError = "";
-    try {
-      // 先设置密码到 AppData
-      await invoke("set_password", { password });
-      // 后端轮询会自动检测到密码已设置并重试初始化
-      // 等待一小段时间让后端处理
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      // 检查是否 still needed（如果后端轮询成功，need_password 会被设为 false）
-      // 如果后端轮询超时或失败，用户可能需要重新输入
-      passwordModalStatus = "success";
-      // 延迟关闭模态框
-      setTimeout(() => {
-        showPasswordModal = false;
-      }, 1500);
-    } catch (e) {
-      passwordModalStatus = "failed";
-      passwordModalError = `密码设置失败: ${e}`;
-    }
   }
 </script>
 
@@ -456,72 +429,6 @@
     onFriendAdded={loadContacts}
   />
 
-  <!-- 启动密码输入模态框（Keyring 不可用时弹出） -->
-  {#if showPasswordModal}
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="password-modal-overlay" onclick={() => {}} onkeydown={() => {}}>
-      <div
-        class="password-modal"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={() => {}}
-      >
-        <h2>{$_("need_password_title")}</h2>
-        <p class="password-modal-desc">{$_("need_password_desc")}</p>
-
-        {#if passwordModalStatus === "input"}
-          <div class="startup-password-input">
-            <input
-              id="startup-password"
-              type="password"
-              bind:value={startupPassword}
-              placeholder={$_("password_placeholder")}
-              autocomplete="current-password"
-              onkeydown={(e) => {
-                if (e.key === "Enter" && startupPassword.length >= 8) {
-                  handleStartupPassword(startupPassword);
-                }
-              }}
-            />
-            {#if passwordModalError}
-              <p class="startup-password-error">{passwordModalError}</p>
-            {/if}
-            <button
-              class="startup-password-btn"
-              disabled={startupPassword.length < 8}
-              onclick={() => handleStartupPassword(startupPassword)}
-            >
-              {$_("need_password_retry")}
-            </button>
-          </div>
-        {:else if passwordModalStatus === "retrying"}
-          <div class="password-modal-status">
-            <span class="spinner"></span>
-            <p>{$_("need_password_retrying")}</p>
-          </div>
-        {:else if passwordModalStatus === "success"}
-          <div class="password-modal-status success">
-            <span class="checkmark">✓</span>
-            <p>{$_("need_password_success")}</p>
-          </div>
-        {:else if passwordModalStatus === "failed"}
-          <div class="password-modal-status failed">
-            <span class="cross">✗</span>
-            <p>{$_("need_password_failed")}</p>
-            {#if passwordModalError}
-              <p class="password-modal-error">{passwordModalError}</p>
-            {/if}
-            <button
-              class="password-modal-retry-btn"
-              onclick={() => (passwordModalStatus = "input")}
-            >
-              {$_("need_password_retry")}
-            </button>
-          </div>
-        {/if}
-      </div>
-    </div>
-  {/if}
-
   <div
     class="resizer-v"
     style="left: {sidebarW}px"
@@ -543,6 +450,7 @@
     </div>
 
     <Toast message={warning || ""} />
+    <NotificationBadge onNotification={(cb) => { onNotif = cb; }} />
 
     <div
       class="resizer-h"
@@ -727,163 +635,5 @@
     background: var(--border-color);
     color: #3b82f6;
     border-color: #3b82f6;
-  }
-
-  /* 启动密码输入模态框 */
-  .password-modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(4px);
-  }
-
-  .password-modal {
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: 16px;
-    padding: 32px;
-    max-width: 420px;
-    width: 90%;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-  }
-
-  .password-modal h2 {
-    margin: 0 0 8px 0;
-    font-size: 20px;
-    color: var(--text-primary);
-  }
-
-  .password-modal-desc {
-    margin: 0 0 24px 0;
-    font-size: 14px;
-    color: var(--text-secondary);
-    line-height: 1.5;
-  }
-
-  .startup-password-input {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .startup-password-input input {
-    width: 100%;
-    padding: 12px;
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    font-size: 16px;
-    box-sizing: border-box;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-
-  .startup-password-input input:focus {
-    border-color: #3b82f6;
-  }
-
-  .startup-password-btn {
-    width: 100%;
-    padding: 12px;
-    border: none;
-    border-radius: 8px;
-    background: #3b82f6;
-    color: white;
-    font-size: 16px;
-    cursor: pointer;
-    transition: background 0.2s;
-  }
-
-  .startup-password-btn:hover:not(:disabled) {
-    background: #2563eb;
-  }
-
-  .startup-password-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .startup-password-error {
-    color: #ef4444;
-    font-size: 13px;
-    margin: 0;
-  }
-
-  .password-modal-status {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    padding: 24px 0;
-    text-align: center;
-  }
-
-  .password-modal-status p {
-    margin: 0;
-    color: var(--text-primary);
-    font-size: 15px;
-  }
-
-  .password-modal-status .spinner {
-    width: 32px;
-    height: 32px;
-    border: 3px solid var(--border-color);
-    border-top-color: #3b82f6;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
-  }
-
-  .password-modal-status .checkmark {
-    font-size: 32px;
-    color: #10b981;
-  }
-
-  .password-modal-status .cross {
-    font-size: 32px;
-    color: #ef4444;
-  }
-
-  .password-modal-status.success p {
-    color: #10b981;
-  }
-
-  .password-modal-status.failed p {
-    color: #ef4444;
-  }
-
-  .password-modal-error {
-    color: #ef4444;
-    font-size: 13px;
-    margin: 0;
-  }
-
-  .password-modal-retry-btn {
-    padding: 8px 24px;
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    cursor: pointer;
-    font-size: 14px;
-    transition: all 0.2s;
-  }
-
-  .password-modal-retry-btn:hover {
-    border-color: #3b82f6;
-    color: #3b82f6;
   }
 </style>

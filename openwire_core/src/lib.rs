@@ -25,6 +25,8 @@ pub use vstd::prelude::*;
 pub mod message;
 /// P2P 网络模块
 pub mod p2p;
+/// 基于 Redb 的持久化 DHT 记录存储（供服务器节点使用）
+pub mod server_redb_store;
 /// 签名模块（ML-DSA）
 pub mod signature;
 /// 存储模块（SQLite）
@@ -41,7 +43,6 @@ pub use identity::{
     load_or_generate_complete_identity,
 };
 pub use message::{ChatMessage, ChatMessageType, ChatResponse, OnlineStatusPayload};
-pub use p2p::lookup_peerid_by_pubkey;
 pub use signature::{
     generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_hex, verify_signature,
 };

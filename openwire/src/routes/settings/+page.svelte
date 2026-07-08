@@ -17,7 +17,6 @@
     downloadDir as getSystemDownloadDir,
     documentDir as getSystemDocumentDir,
   } from "@tauri-apps/api/path";
-  import PasswordInput from "../../lib/PasswordInput.svelte";
 
   // 语言选项
   const languages = [
@@ -576,28 +575,23 @@
         {/if}
       </section>
 
-      <!-- 密码设置（仅 Keyring 不可用时显示） -->
-      {#if keyringCheckDone && !keyringAvailable}
-        <section class="settings-section">
-          <h2>{$_("password_settings")}</h2>
-          <p class="section-desc">
-            {$_("password_settings_desc")}
-          </p>
-          <PasswordInput />
-        </section>
-      {:else if keyringCheckDone && keyringAvailable}
-        <!-- Keyring 可用时显示提示信息 -->
-        <section class="settings-section">
-          <h2>{$_("password_settings")}</h2>
-          <p class="section-desc">
-            {$_("password_settings_desc")}
-          </p>
+      <!-- 安全设置：Keyring 状态 -->
+      <section class="settings-section">
+        <h2>{$_("security_settings")}</h2>
+        {#if keyringCheckDone && keyringAvailable}
           <div class="keyring-available-note">
             <span class="keyring-icon">🔑</span>
             <span>{$_("keyring_available_note")}</span>
           </div>
-        </section>
-      {/if}
+        {:else if keyringCheckDone && !keyringAvailable}
+          <div class="keyring-unavailable-note">
+            <span class="keyring-icon">⚠️</span>
+            <span>{$_("keyring_unavailable_note")}</span>
+          </div>
+        {:else}
+          <p class="loading-hint">{$_("checking_keyring")}...</p>
+        {/if}
+      </section>
     </main>
   </div>
 {/if}

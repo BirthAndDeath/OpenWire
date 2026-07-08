@@ -28,22 +28,16 @@ impl ChatCore {
         is_retry: bool,
     ) -> Result<String, CoreError> {
         let pubkey_short = &mldsa_pubkey_hex[..16];
-        let data_preview = if data.len() <= 64 {
-            String::from_utf8_lossy(&data).to_string()
-        } else {
-            format!("{}...", hex::encode(&data[..32]))
-        };
         tracing::debug!(
-            "send_text_impl: is_retry={}, msgtype={:?}, data_len={}, data_preview={}",
+            "send_text_impl: is_retry={}, msgtype={:?}, data_len={}",
             is_retry,
             msgtype,
             data.len(),
-            data_preview
         );
 
         // 通过 DHT 查找接收方当前的 PeerID（临时传输层标识）
         let recipient_peer_id = {
-            let store = self.get_dht_store()?;
+            let store = self.get_dht_store();
             match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
                 Ok(Some(peer_id)) => {
                     tracing::debug!(
@@ -71,9 +65,8 @@ impl ChatCore {
                                 peer_id
                             );
                             // 将找到的 PeerID 缓存到本地 DHT 数据库，供后续使用
-                            if let Ok(store) = self.get_dht_store() {
-                                let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
-                            }
+                            let store = self.get_dht_store();
+                            let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
                             peer_id
                         }
                         None => {
@@ -144,10 +137,13 @@ impl ChatCore {
         // 发送消息到网络
         self.send_message(recipient_peer_id, message).await;
 
-        // 不再立即标记为已发送。消息保持 pending 状态，
-        // 由对方发回的 DeliveryReceipt 送达回执标记为已送达。
-        // 如果网络发送失败，retry_pending_messages 会重试。
-        // retry 路径（is_retry=true）由 retry_pending_messages 自行 mark_sent。
+        // 首次发送成功后立即标记为已发送，防止重制定时器重复发送消息
+        // 重试路径由 retry_single_pending_message 中的 mark_sent 按 ID 标记
+        if !is_retry {
+            if let Some(pool) = storage::pool() {
+                let _ = storage::mark_sent_by_hash(pool, &message_hash).await;
+            }
+        }
 
         Ok(message_hash)
     }
@@ -185,7 +181,7 @@ impl ChatCore {
         // 步骤 1：从 DHT 本地数据库查询（优先级最高）
         // DHT 本地数据库中的 ML-KEM 公钥在 select_identity 时实时更新，
         // 而 contacts 表中的公钥仅在添加联系人时写入一次，不会自动更新。
-        let store = self.get_dht_store()?;
+        let store = self.get_dht_store();
         match store.get_mlkem_pubkey(mldsa_pubkey_hex) {
             Ok(Some(mlkem_hex)) if !mlkem_hex.is_empty() => {
                 tracing::info!("Found ML-KEM pubkey for {} via DHT local DB", pubkey_short);
@@ -193,10 +189,10 @@ impl ChatCore {
                 let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
                 let _ = self
                     .p2p_handle
-                    .send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+                    .tx
+                    .try_send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
                         key: mlkem_key,
-                    }))
-                    .await;
+                    }));
                 return hex::decode(&mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
             }
             _ => {
@@ -290,10 +286,10 @@ impl ChatCore {
             };
 
             tracing::debug!(
-                "save_pending_message: msgtype={:?}, hash_method=hash_input, hash={}.., content_preview={}",
+                "save_pending_message: msgtype={:?}, hash={}.., data_len={}",
                 msgtype,
                 &message_hash[..16],
-                &content[..content.len().min(50)]
+                data.len(),
             );
 
             match storage::add_message_with_hash(
@@ -341,10 +337,10 @@ impl ChatCore {
             };
 
             tracing::debug!(
-                "save_pending_message_with_hash: msgtype={:?}, hash_method=ChatMessage.hash, hash={}.., content_preview={}",
+                "save_pending_message_with_hash: msgtype={:?}, hash={}.., data_len={}",
                 msgtype,
                 &message_hash[..16],
-                &content[..content.len().min(50)]
+                data.len(),
             );
 
             match storage::add_message_with_hash(
@@ -397,115 +393,100 @@ impl ChatCore {
         tracing::info!("开始重试 {} 条待发送消息", pending_msgs.len());
 
         for msg in &pending_msgs {
-            let msgtype = detect_msgtype(&msg.content);
-
-            // === 修复：从 content 字段恢复原始数据 ===
-            // content 存储格式：
-            //   Text 消息：原始文本字符串
-            //   非 Text 消息："[N] {hex(data)}" 格式
-            let original_data = if msgtype == ChatMessageType::Text {
-                // Text 消息：content 就是原始文本
-                msg.content.as_bytes().to_vec()
-            } else {
-                // 非 Text 消息：从 "[N] {hex}" 格式中提取 hex 并解码
-                match msg.content.find(']') {
-                    Some(pos) => {
-                        let hex_part = msg.content[pos + 1..].trim();
-                        match hex::decode(hex_part) {
-                            Ok(decoded) => {
-                                tracing::debug!(
-                                    "retry_pending: 从 content 解码原始数据, msg.id={}, msgtype={:?}, decoded_len={}",
-                                    msg.id,
-                                    msgtype,
-                                    decoded.len()
-                                );
-                                decoded
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "retry_pending: 解码非 Text 消息 content 失败, msg.id={}, msgtype={:?}, error={}, content={}",
-                                    msg.id,
-                                    msgtype,
-                                    e,
-                                    &msg.content[..msg.content.len().min(100)]
-                                );
-                                // 回退：直接使用 content 的 bytes（兼容旧数据）
-                                msg.content.as_bytes().to_vec()
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            "retry_pending: 非 Text 消息 content 格式异常, msg.id={}, msgtype={:?}, content={}",
-                            msg.id,
-                            msgtype,
-                            &msg.content[..msg.content.len().min(100)]
-                        );
-                        msg.content.as_bytes().to_vec()
-                    }
-                }
-            };
-
-            tracing::debug!(
-                "retry_pending: msg.id={}, msgtype={:?}, original_data_len={}, content_len={}",
-                msg.id,
-                msgtype,
-                original_data.len(),
-                msg.content.len(),
-            );
-
-            // 先检查本地 DHT 数据库中是否有接收方的 PeerID
-            let has_local_peerid = match self.get_dht_store() {
-                Ok(store) => match store.get_peerid_by_pubkey(&msg.peer_pubkey_hex) {
-                    Ok(Some(_)) => true,
-                    _ => false,
-                },
-                Err(_) => false,
-            };
-
-            if !has_local_peerid {
-                tracing::debug!(
-                    "离线消息 {}: 联系人 {}.. 的 PeerID 尚未缓存到本地，发送 DHT 发现命令",
-                    msg.id,
-                    &msg.peer_pubkey_hex[..16]
-                );
-                let _ = self.core_handle.cmd_tx.try_send(
-                    crate::command::ChatCommand::DiscoverContact {
-                        mldsa_pubkey_hex: msg.peer_pubkey_hex.clone(),
-                        name: None,
-                    },
-                );
-                continue;
-            }
-
-            match self
-                .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true)
-                .await
-            {
-                Ok(message_hash) => {
-                    tracing::info!(
-                        "离线消息 {} 发送成功, hash={}..",
-                        msg.id,
-                        &message_hash[..16]
-                    );
-                    // === 修复：更新数据库中的 message_hash 为 ChatMessage.hash ===
-                    // 之前通过 save_pending_message 保存时，hash 是 hash_input 格式
-                    // 现在发送成功后，更新为 ChatMessage.hash，以便 delivery receipt 能匹配
-                    if let Err(e) = storage::update_message_hash(pool, msg.id, &message_hash).await
-                    {
-                        tracing::warn!("更新消息 {} 的 hash 失败: {}", msg.id, e);
-                    }
-                    if let Err(e) = storage::mark_sent(pool, msg.id).await {
-                        tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("离线消息 {} 发送失败: {}", msg.id, e);
-                }
+            if let Err(e) = self.retry_single_pending_message(pool, msg).await {
+                tracing::warn!("重试消息 {} 失败: {}", msg.id, e);
             }
         }
 
         tracing::info!("离线消息重试完成");
+    }
+
+    async fn retry_single_pending_message(
+        &mut self,
+        pool: &sqlx::Pool<sqlx::sqlite::Sqlite>,
+        msg: &storage::Message,
+    ) -> Result<(), CoreError> {
+        let msgtype = detect_msgtype(&msg.content);
+
+        let original_data = if msgtype == ChatMessageType::Text {
+            msg.content.as_bytes().to_vec()
+        } else {
+            match msg.content.find(']') {
+                Some(pos) => {
+                    let hex_part = msg.content[pos + 1..].trim();
+                    match hex::decode(hex_part) {
+                        Ok(decoded) => decoded,
+                        Err(_) => msg.content.as_bytes().to_vec(),
+                    }
+                }
+                None => msg.content.as_bytes().to_vec(),
+            }
+        };
+
+        let has_local_peerid = self
+            .get_dht_store()
+            .get_peerid_by_pubkey(&msg.peer_pubkey_hex)
+            .ok()
+            .flatten()
+            .is_some();
+
+        if !has_local_peerid {
+            return Err(CoreError::ContactOffline(format!(
+                "联系人 {} 当前不在线（本地未缓存 PeerID），不重试",
+                &msg.peer_pubkey_hex[..16]
+            )));
+        }
+
+        let message_hash = self
+            .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true)
+            .await?;
+
+        tracing::info!(
+            "离线消息 {} 发送成功, hash={}..",
+            msg.id,
+            &message_hash[..16]
+        );
+        storage::update_message_hash(pool, msg.id, &message_hash).await?;
+        storage::mark_sent(pool, msg.id).await?;
+
+        Ok(())
+    }
+
+    /// 重试指定联系人的待发送消息
+    /// 用于 FriendOnline 事件，只重试该联系人的消息，避免重复发送
+    pub(crate) async fn retry_pending_for_peer(&mut self, peer_pubkey_hex: &str) {
+        let pool = match storage::pool() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("数据库不可用，无法重试待发送消息");
+                return;
+            }
+        };
+
+        let pending_msgs = match storage::list_pending_by_peer(pool, peer_pubkey_hex).await {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                tracing::warn!("查询待发送消息列表失败: {}", e);
+                return;
+            }
+        };
+
+        if pending_msgs.is_empty() {
+            tracing::debug!("联系人 {}.. 没有待发送的消息", &peer_pubkey_hex[..16]);
+            return;
+        }
+
+        tracing::info!(
+            "开始重试联系人 {}.. 的 {} 条待发送消息",
+            &peer_pubkey_hex[..16],
+            pending_msgs.len()
+        );
+
+        for msg in &pending_msgs {
+            if let Err(e) = self.retry_single_pending_message(pool, msg).await {
+                tracing::warn!("重试给 {}.. 的消息 {} 失败: {}", &peer_pubkey_hex[..16], msg.id, e);
+            }
+        }
     }
 
     /// 仅向当前在线的好友重试待发送消息
@@ -513,12 +494,12 @@ impl ChatCore {
     /// 与 retry_pending_messages() 的区别：
     /// - 只处理接收方 PeerID 在 connected_peers 中（当前在线）的消息
     /// - 对不在线的联系人跳过，不发起 DHT 查询（避免无效网络开销）
-    /// - 由主循环中 15 秒间隔的定时器触发，替代 ConnectionEstablished 过早的重试
+    /// - 由主循环中 1 秒间隔的定时器触发，替代 ConnectionEstablished 过早的重试
     ///
     /// # 设计说明
     /// 当对方上线后，FriendOnline 通知会缓存 (公钥→PeerID) 映射到 DHT 本地数据库，
     /// 但 FriendOnline 可能延迟或丢失。此定时器确保：
-    ///   1. FriendOnline 到达后最多 15 秒内重试成功
+    ///   1. FriendOnline 到达后最多 1 秒内重试成功
     ///   2. FriendOnline 丢失时不会永久等待，下一次定时器触发即可重试
     ///   3. 只触达在线节点，不会对离线联系人做无效的 DHT 网络查询
     pub(crate) async fn retry_pending_for_online_peers(&mut self) {
@@ -542,33 +523,30 @@ impl ChatCore {
             return;
         }
 
-        // 只保留接收方 PeerID 在 connected_peers 中（当前在线）的消息
         let online_pending: Vec<_> = pending_msgs
             .into_iter()
             .filter(|msg| {
-                match self.get_dht_store() {
-                    Ok(store) => match store.get_peerid_by_pubkey(&msg.peer_pubkey_hex) {
-                        Ok(Some(peer_id)) => {
-                            let online = self.connected_peers.contains(&peer_id);
-                            if !online {
-                                tracing::debug!(
-                                    "待发消息 {} 的接收方 {}.. 不在线，跳过",
-                                    msg.id,
-                                    &msg.peer_pubkey_hex[..16]
-                                );
-                            }
-                            online
-                        }
-                        _ => {
+                let store = self.get_dht_store();
+                match store.get_peerid_by_pubkey(&msg.peer_pubkey_hex) {
+                    Ok(Some(peer_id)) => {
+                        let online = self.connected_peers.contains_key(&peer_id);
+                        if !online {
                             tracing::debug!(
-                                "待发消息 {} 的接收方 {}.. PeerID 未缓存，跳过",
+                                "待发消息 {} 的接收方 {}.. 不在线，跳过",
                                 msg.id,
                                 &msg.peer_pubkey_hex[..16]
                             );
-                            false
                         }
-                    },
-                    Err(_) => false,
+                        online
+                    }
+                    _ => {
+                        tracing::debug!(
+                            "待发消息 {} 的接收方 {}.. PeerID 未缓存，跳过",
+                            msg.id,
+                            &msg.peer_pubkey_hex[..16]
+                        );
+                        false
+                    }
                 }
             })
             .collect();
@@ -585,48 +563,10 @@ impl ChatCore {
         );
 
         for msg in &online_pending {
-            let msgtype = detect_msgtype(&msg.content);
-
-            // 从 content 字段恢复原始数据（与 retry_pending_messages 逻辑一致）
-            let original_data = if msgtype == ChatMessageType::Text {
-                msg.content.as_bytes().to_vec()
-            } else {
-                match msg.content.find(']') {
-                    Some(pos) => {
-                        let hex_part = msg.content[pos + 1..].trim();
-                        match hex::decode(hex_part) {
-                            Ok(decoded) => decoded,
-                            Err(_) => msg.content.as_bytes().to_vec(),
-                        }
-                    }
-                    None => msg.content.as_bytes().to_vec(),
-                }
-            };
-
-            match self
-                .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true)
-                .await
-            {
-                Ok(message_hash) => {
-                    tracing::info!(
-                        "定时重试: 在线消息 {} 发送成功, hash={}..",
-                        msg.id,
-                        &message_hash[..16]
-                    );
-                    if let Err(e) = storage::update_message_hash(pool, msg.id, &message_hash).await {
-                        tracing::warn!("更新消息 {} 的 hash 失败: {}", msg.id, e);
-                    }
-                    if let Err(e) = storage::mark_sent(pool, msg.id).await {
-                        tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("定时重试: 在线消息 {} 发送失败: {}", msg.id, e);
-                }
+            if let Err(e) = self.retry_single_pending_message(pool, msg).await {
+                tracing::warn!("定时重试: 消息 {} 失败: {}", msg.id, e);
             }
         }
-
-        tracing::info!("定时重试完成");
     }
 
     /// 通过 DHT 网络查询或已建立的连接查找对方的 PeerID
@@ -651,7 +591,7 @@ impl ChatCore {
     /// 并触发 retry_pending_messages 重试。
     ///
     /// 此函数不会 await 网络查询结果，确保不阻塞事件循环。
-    async fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
+    pub(crate) async fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
         // === 步骤 1：检查内存缓存 peerid_to_pubkey ===
         // gossipsub 在线状态通知和 identify 协议会更新此缓存，比 DHT 数据库更快
         for (peer_id, pubkey_hex) in &self.peerid_to_pubkey {
@@ -668,35 +608,34 @@ impl ChatCore {
         // === 步骤 2：检查已建立的连接 ===
         // 遍历 connected_peers，通过 DHT 本地数据库反向查找每个已连接 PeerID
         // 对应的 ML-DSA 公钥，看是否匹配目标公钥
-        if let Ok(store) = self.get_dht_store() {
-            let connected: Vec<libp2p::PeerId> = self.connected_peers.iter().copied().collect();
-            for peer_id in &connected {
-                // 反向查找：检查这个已连接的 PeerID 是否对应目标 ML-DSA 公钥
-                match store.get_pubkey_by_peerid(peer_id) {
-                    Ok(Some(pubkey_hex)) if pubkey_hex == mldsa_pubkey_hex => {
-                        tracing::info!(
-                            "dht_lookup_peerid: 通过 connected_peers 找到 {}.. -> PeerID={}",
-                            &mldsa_pubkey_hex[..16],
-                            peer_id
-                        );
-                        return Some(*peer_id);
-                    }
-                    _ => continue,
-                }
-            }
-
-            // === 步骤 3：查询本地 DHT 数据库 ===
-            match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
-                Ok(Some(peer_id)) => {
+        let store = self.get_dht_store();
+        let connected: Vec<libp2p::PeerId> = self.connected_peers.keys().copied().collect();
+        for peer_id in &connected {
+            // 反向查找：检查这个已连接的 PeerID 是否对应目标 ML-DSA 公钥
+            match store.get_pubkey_by_peerid(peer_id) {
+                Ok(Some(pubkey_hex)) if pubkey_hex == mldsa_pubkey_hex => {
                     tracing::info!(
-                        "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
+                        "dht_lookup_peerid: 通过 connected_peers 找到 {}.. -> PeerID={}",
                         &mldsa_pubkey_hex[..16],
                         peer_id
                     );
-                    return Some(peer_id);
+                    return Some(*peer_id);
                 }
-                _ => {}
+                _ => continue,
             }
+        }
+
+        // === 步骤 3：查询本地 DHT 数据库 ===
+        match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
+            Ok(Some(peer_id)) => {
+                tracing::info!(
+                    "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
+                    &mldsa_pubkey_hex[..16],
+                    peer_id
+                );
+                return Some(peer_id);
+            }
+            _ => {}
         }
 
         // === 步骤 4：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===

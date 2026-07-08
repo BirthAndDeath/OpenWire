@@ -1,6 +1,6 @@
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, AeadCore, KeyInit},
+    aead::{Aead, KeyInit},
 };
 use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey, ML_KEM_768};
 use blake3;
@@ -67,8 +67,7 @@ pub fn encrypt_message(
     let aes_key = derive_aes_key_from_mlkem(shared_secret.as_ref());
 
     // 3. 生成随机 nonce
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes = rand::random();
+    let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // 4. 使用 AES-GCM 加密数据

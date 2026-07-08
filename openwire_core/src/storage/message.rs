@@ -282,8 +282,23 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageR
 
 // ========== 待发送消息管理（离线消息队列） ==========
 
-/// 获取所有待发送消息（离线消息队列）
-pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
+/// 获取指定联系人的待发送消息
+    pub async fn list_pending_by_peer(
+        pool: &Pool<Sqlite>,
+        peer_pubkey_hex: &str,
+    ) -> StorageResult<Vec<Message>> {
+        sqlx::query_as::<_, Message>(
+            r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
+              FROM messages WHERE pending = 1 AND peer_pubkey_hex = ?1 ORDER BY ts"#,
+        )
+        .bind(peer_pubkey_hex)
+        .fetch_all(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// 获取所有待发送消息（离线消息队列）
+    pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     sqlx::query_as::<_, Message>(
         r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
           FROM messages WHERE pending = 1 ORDER BY ts"#,
@@ -332,6 +347,21 @@ pub async fn mark_failed(pool: &Pool<Sqlite>, msg_id: i64) -> StorageResult<bool
         .await?
         .rows_affected();
     Ok(rows > 0)
+}
+
+/// 通过 message_hash 查询消息（不区分 pending 状态）
+pub async fn get_message_by_hash(
+    pool: &Pool<Sqlite>,
+    message_hash: &str,
+) -> StorageResult<Option<Message>> {
+    sqlx::query_as::<_, Message>(
+        r#"SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, ts, pending, message_hash
+          FROM messages WHERE message_hash = ?1 LIMIT 1"#,
+    )
+    .bind(message_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
 }
 
 /// 通过 message_hash 标记消息为已发送（用于首次发送成功后标记）

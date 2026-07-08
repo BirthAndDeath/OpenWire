@@ -34,12 +34,11 @@ impl ChatCore {
                 self.reinitialize_swarm();
 
                 // 立即发布新身份到 DHT
-                if let Ok(store) = self.get_dht_store() {
-                    if let Some(peer_id) = self.current_peer_id {
-                        let _ = store.set_pubkey_peerid(&mldsa_id, &peer_id);
-                    }
-                    let _ = store.set_mlkem_pubkey(&mldsa_id, &mlkem_id);
+                let store = self.get_dht_store();
+                if let Some(peer_id) = self.current_peer_id {
+                    let _ = store.set_pubkey_peerid(&mldsa_id, &peer_id);
                 }
+                let _ = store.set_mlkem_pubkey(&mldsa_id, &mlkem_id);
 
                 // 更新数据库中的当前身份标记
                 if let Some(pool) = storage::pool() {
@@ -76,7 +75,6 @@ impl ChatCore {
         let mldsa_handle = match rootcell::identity::PrivateKeyHandle::load(
             &self.data_dir.to_string_lossy(),
             &format!("{}_mldsa", identity_id),
-            None,
         ) {
             Ok(handle) => handle,
             Err(e) => {
@@ -147,10 +145,9 @@ impl ChatCore {
         };
         let peer_id = keypair.public().to_peer_id();
 
-        let dht_db = self.dht_db.clone().unwrap();
-        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let dht_cache = self.dht_cache.clone();
         let bootstrap_nodes: Vec<(String, String)> = Vec::new();
-        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
+        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), &bootstrap_nodes) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to reinitialize swarm: {e}");
@@ -173,9 +170,10 @@ impl ChatCore {
         let (p2p_event_tx, p2p_event_rx) = tokio::sync::mpsc::channel(super::CHANNEL_CAPACITY);
         let p2p_actor = crate::actor::p2p::P2pActor::new(
             swarm,
-            self.dht_db.clone(),
+            self.dht_cache.clone(),
             self.data_dir.clone(),
             p2p_event_tx,
+            self.relay_nodes.clone(),
         );
         let p2p_handle = crate::actor::p2p::start_p2p_actor(
             p2p_actor,
@@ -186,10 +184,9 @@ impl ChatCore {
         self.rx_p2p_event = p2p_event_rx;
 
         // 7. 立即发布新身份到 DHT
-        if let Ok(store) = self.get_dht_store() {
-            let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
-            let _ = store.set_mlkem_pubkey(&mldsa_pubkey_hex, &mlkem_pubkey_hex);
-        }
+        let store = self.get_dht_store();
+        let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
+        let _ = store.set_mlkem_pubkey(&mldsa_pubkey_hex, &mlkem_pubkey_hex);
 
         tracing::info!(
             "Runtime identity switch complete: ML-DSA={}, ML-KEM={}, PeerID={}",
@@ -208,11 +205,10 @@ impl ChatCore {
                 Ok(_) => {
                     tracing::info!("Deleted identity: {}", identity_id);
 
-                    // 清理本地 DHT 数据库
-                    if let Ok(store) = self.get_dht_store() {
-                        let _ = store.remove_pubkey_peerid(&identity_id);
-                        let _ = store.remove_mlkem_pubkey(&identity_id);
-                    }
+                    // 清理本地 DHT 缓存
+                    let store = self.get_dht_store();
+                    let _ = store.remove_pubkey_peerid(&identity_id);
+                    let _ = store.remove_mlkem_pubkey(&identity_id);
 
                     // 发布空记录到 Kademlia 网络（墓碑记录）
                     self.publish_tombstone_records(&identity_id).await;
@@ -242,7 +238,6 @@ impl ChatCore {
         match rootcell::identity::PrivateKeyHandle::load(
             &self.data_dir.to_string_lossy(),
             &format!("{}_mldsa", identity_id),
-            None,
         ) {
             Ok(handle) => {
                 self.mldsa_private_key = Some(Zeroizing::new(handle.get_private_key().to_vec()));
@@ -255,13 +250,12 @@ impl ChatCore {
 
     /// 重新初始化 swarm（生成新 PeerID）
     fn reinitialize_swarm(&mut self) {
-        let dht_db = self.dht_db.clone().unwrap();
-        let relay_nodes: Vec<(String, String)> = Vec::new();
+        let dht_cache = self.dht_cache.clone();
         let bootstrap_nodes: Vec<(String, String)> = Vec::new();
         match identity::generate_temporary_peerid() {
             Ok(keypair) => {
                 let peer_id = keypair.public().to_peer_id();
-                match p2p::swarm_init(&self.data_dir, keypair.clone(), dht_db, &relay_nodes, &bootstrap_nodes) {
+                match p2p::swarm_init(&self.data_dir, keypair.clone(), &bootstrap_nodes) {
                     Ok(swarm) => {
                         self.identity_keypair = keypair;
                         self.current_peer_id = Some(peer_id);
@@ -271,9 +265,10 @@ impl ChatCore {
                             tokio::sync::mpsc::channel(super::CHANNEL_CAPACITY);
                         let p2p_actor = crate::actor::p2p::P2pActor::new(
                             swarm,
-                            self.dht_db.clone(),
+                            self.dht_cache.clone(),
                             self.data_dir.clone(),
                             p2p_event_tx,
+                            self.relay_nodes.clone(),
                         );
                         let p2p_handle = crate::actor::p2p::start_p2p_actor(
                             p2p_actor,
@@ -299,14 +294,14 @@ impl ChatCore {
     /// 发布空记录到 Kademlia 网络（墓碑记录）
     async fn publish_tombstone_records(&mut self, identity_id: &str) {
         // 通过 P2pActor 发布墓碑记录（空 ML-KEM 公钥表示删除）
-        let _ = self.p2p_handle.send(
+        let _ = self.p2p_handle.tx.try_send(
             crate::actor::ActorCommand::Custom(
                 crate::actor::p2p::P2pCommand::PublishIdentity {
                     mldsa_pubkey_hex: identity_id.to_string(),
                     mlkem_pubkey_hex: String::new(),
                 },
             ),
-        ).await;
+        );
         tracing::info!(
             "Published tombstone records to DHT network for deleted identity: {}",
             &identity_id[..16]

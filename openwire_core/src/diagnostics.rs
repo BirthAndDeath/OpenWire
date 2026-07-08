@@ -25,7 +25,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{crypto, p2p, signature};
+use crate::{crypto, signature};
+use crate::p2p::dht_cache::DhtCache;
 
 // ============================================================================
 // 诊断结果类型
@@ -92,89 +93,45 @@ impl DiagnosticReport {
 ///
 /// # 参数
 /// - `data_dir`: 数据目录路径
-/// - `dht_db`: 可选的共享 DHT 数据库连接
+/// - `dht_cache`: 可选的 DHT 内存缓存
 ///
 /// # 返回
 /// 诊断报告
-pub fn diagnose_dht(data_dir: &Path, dht_db: Option<Arc<redb::Database>>) -> DiagnosticReport {
+pub fn diagnose_dht(data_dir: &Path, dht_cache: Option<Arc<DhtCache>>) -> DiagnosticReport {
     let mut report = DiagnosticReport::new();
 
-    // 1. 检查 DHT 数据库文件
-    diagnose_dht_database(&mut report, data_dir, dht_db.clone());
+    // 1. 检查 DHT 缓存
+    diagnose_dht_database(&mut report, dht_cache.clone());
 
     // 2. 检查路由表缓存
     diagnose_routing_table_cache(&mut report, data_dir);
 
     // 3. 检查 DHT 存储记录
-    diagnose_dht_records(&mut report, dht_db);
+    diagnose_dht_records(&mut report, dht_cache);
 
     report
 }
 
-/// 诊断 DHT 数据库状态
+/// 诊断 DHT 缓存状态
 fn diagnose_dht_database(
     report: &mut DiagnosticReport,
-    data_dir: &Path,
-    dht_db: Option<Arc<redb::Database>>,
+    dht_cache: Option<Arc<DhtCache>>,
 ) {
-    let dht_path = data_dir.join("dht.redb");
-
-    // 检查文件是否存在
-    let file_exists = dht_path.exists();
-    let file_size = if file_exists {
-        match std::fs::metadata(&dht_path) {
-            Ok(meta) => meta.len(),
-            Err(e) => {
-                report.add(DiagnosticItem {
-                    name: "DHT 数据库文件访问",
-                    passed: false,
-                    detail: format!("无法访问 DHT 数据库文件: {}", e),
-                    suggestion: Some("检查文件权限和路径是否正确".to_string()),
-                });
-                return;
-            }
-        }
-    } else {
-        report.add(DiagnosticItem {
-            name: "DHT 数据库文件存在",
-            passed: false,
-            detail: format!("DHT 数据库文件不存在: {:?}", dht_path),
-            suggestion: Some(
-                "程序启动时会自动创建 DHT 数据库，如果尚未启动请先运行程序".to_string(),
-            ),
-        });
-        return;
-    };
-
-    // 尝试打开数据库
-    let db_result = if let Some(db) = dht_db {
-        Ok(db.clone())
-    } else {
-        redb::Database::open(&dht_path).map(Arc::new)
-    };
-
-    match db_result {
-        Ok(_db) => {
-            report.add(DiagnosticItem {
-                name: "DHT 数据库状态",
-                passed: true,
-                detail: format!(
-                    "DHT 数据库文件存在，大小: {} 字节 ({} KB)",
-                    file_size,
-                    file_size / 1024
-                ),
-                suggestion: None,
-            });
-        }
-        Err(e) => {
-            report.add(DiagnosticItem {
-                name: "DHT 数据库状态",
-                passed: false,
-                detail: format!("无法打开 DHT 数据库: {}", e),
-                suggestion: Some("尝试删除 dht.redb 文件后重新启动程序".to_string()),
-            });
-        }
-    }
+    let has_cache = dht_cache.is_some();
+    report.add(DiagnosticItem {
+        name: "DHT 缓存状态",
+        passed: has_cache,
+        detail: if has_cache {
+            "DHT 内存缓存可用，所有身份映射和公钥缓存存储在内存中".to_string()
+        } else {
+            "DHT 内存缓存不可用，请先初始化 ChatCore".to_string()
+        },
+        suggestion: if has_cache {
+            None
+        } else {
+            Some("请先初始化 ChatCore".to_string())
+        },
+    });
 }
 
 /// 诊断路由表缓存
@@ -219,35 +176,51 @@ fn diagnose_routing_table_cache(report: &mut DiagnosticReport, data_dir: &Path) 
 }
 
 /// 诊断 DHT 存储记录
-fn diagnose_dht_records(report: &mut DiagnosticReport, dht_db: Option<Arc<redb::Database>>) {
-    let db = match dht_db {
-        Some(db) => db,
+fn diagnose_dht_records(report: &mut DiagnosticReport, dht_cache: Option<Arc<DhtCache>>) {
+    let store = match dht_cache {
+        Some(cache) => cache,
         None => {
             report.add(DiagnosticItem {
                 name: "DHT 存储记录",
                 passed: false,
-                detail: "DHT 数据库连接不可用，无法查询存储记录".to_string(),
+                detail: "DHT 内存缓存不可用，无法查询存储记录".to_string(),
                 suggestion: Some("请先初始化 ChatCore".to_string()),
             });
             return;
         }
     };
 
-    let store = p2p::dht::RedbRecordStore::new(db);
-
-    // 查询 pubkey→peerid 映射数
+    // 查询 pubkey->peerid 映射数
     match store.get_all_pubkeys() {
         Ok(pubkeys) => {
             let count = pubkeys.len();
             report.add(DiagnosticItem {
                 name: "DHT 身份注册",
                 passed: true,
-                detail: format!("本地 DHT 数据库中已注册 {} 个 ML-DSA 公钥", count),
+                detail: format!("本地 DHT 缓存中已注册 {} 个 ML-DSA 公钥", count),
                 suggestion: if count == 0 {
                     Some("尚未注册任何身份到 DHT，请先添加联系人或启动程序".to_string())
                 } else {
                     None
                 },
+            });
+
+            // 查询 ML-KEM 公钥缓存数
+            let mut mlkem_count = 0;
+            for pk in &pubkeys {
+                if let Ok(Some(_)) = store.get_mlkem_pubkey(pk) {
+                    mlkem_count += 1;
+                }
+            }
+            report.add(DiagnosticItem {
+                name: "DHT ML-KEM 公钥缓存",
+                passed: true,
+                detail: format!(
+                    "本地 DHT 缓存中已缓存 {} 个 ML-KEM 公钥（共 {} 个身份）",
+                    mlkem_count,
+                    pubkeys.len()
+                ),
+                suggestion: None,
             });
         }
         Err(e) => {
@@ -804,22 +777,101 @@ fn diagnose_pubkey_validation(report: &mut DiagnosticReport) {
 }
 
 // ============================================================================
+// NAT 遍历诊断
+// ============================================================================
+
+/// NAT 遍历诊断输入（从 P2pActor 收集的运行时状态）
+#[derive(Debug, Clone, Default)]
+pub struct NatTraversalInput {
+    /// AutoNAT 状态："Public", "Private", "Unknown"
+    pub nat_status: String,
+    /// 通过 relay 连接的 peer 数量
+    pub relay_connection_count: usize,
+    /// Kademlia 模式："Client", "Server"
+    pub kademlia_mode: String,
+    /// 外部地址数
+    pub external_address_count: usize,
+}
+
+/// 诊断 NAT 遍历状态
+fn diagnose_nat_traversal(report: &mut DiagnosticReport, input: &NatTraversalInput) {
+    let is_public = input.nat_status == "Public";
+    report.add(DiagnosticItem {
+        name: "AutoNAT 状态",
+        passed: true,
+        detail: format!("AutoNAT 状态: {}", input.nat_status),
+        suggestion: if input.nat_status == "Unknown" {
+            Some("AutoNAT 仍在探测中，通常需要 30-60 秒".to_string())
+        } else if is_public {
+            None
+        } else {
+            Some("NAT 后的节点通过 relay 和 DCUtR 进行连接".to_string())
+        },
+    });
+
+    let has_relay = input.relay_connection_count > 0;
+    report.add(DiagnosticItem {
+        name: "Relay 连接",
+        passed: has_relay || is_public,
+        detail: format!("通过 relay 连接的 peers: {}", input.relay_connection_count),
+        suggestion: if !has_relay && !is_public {
+            Some("NAT 后节点需要至少一个 relay 连接，检查 relay 节点配置".to_string())
+        } else {
+            None
+        },
+    });
+
+    let is_server = input.kademlia_mode == "Server";
+    let mode_ok = is_public == is_server;
+    report.add(DiagnosticItem {
+        name: "Kademlia 模式适配性",
+        passed: mode_ok,
+        detail: format!(
+            "Kademlia 模式: {}（AutoNAT: {}）",
+            input.kademlia_mode, input.nat_status
+        ),
+        suggestion: if !mode_ok {
+            Some("Kademlia 模式与 NAT 状态不匹配，建议重启或手动调整".to_string())
+        } else {
+            None
+        },
+    });
+
+    report.add(DiagnosticItem {
+        name: "外部地址",
+        passed: input.external_address_count > 0 || !is_public,
+        detail: format!(
+            "外部地址数: {}（通过 Identify 收集）",
+            input.external_address_count
+        ),
+        suggestion: if input.external_address_count == 0 && is_public {
+            Some("公网节点尚无外部地址，等待 Identify 协议交换".to_string())
+        } else {
+            None
+        },
+    });
+}
+
+// ============================================================================
 // 综合诊断
 // ============================================================================
 
-/// 运行所有诊断（DHT + 加密）
+/// 运行所有诊断（DHT + 加密 + NAT 遍历）
 ///
 /// # 参数
 /// - `data_dir`: 数据目录路径
-/// - `dht_db`: 可选的共享 DHT 数据库连接
+/// - `dht_cache`: 可选的共享 DHT 缓存
+/// - `nat_input`: 可选的 NAT 遍历诊断输入
 ///
 /// # 返回
 /// 综合诊断报告
-pub fn diagnose_all(data_dir: &Path, dht_db: Option<Arc<redb::Database>>) -> DiagnosticReport {
+pub fn diagnose_all(
+    data_dir: &Path,
+    dht_cache: Option<Arc<DhtCache>>,
+    nat_input: Option<NatTraversalInput>,
+) -> DiagnosticReport {
     let mut report = DiagnosticReport::new();
-
-    // DHT 诊断
-    let dht_report = diagnose_dht(data_dir, dht_db);
+    let dht_report = diagnose_dht(data_dir, dht_cache);
     for item in dht_report.items {
         report.add(item);
     }
@@ -828,6 +880,11 @@ pub fn diagnose_all(data_dir: &Path, dht_db: Option<Arc<redb::Database>>) -> Dia
     let crypto_report = diagnose_crypto();
     for item in crypto_report.items {
         report.add(item);
+    }
+
+    // NAT 遍历诊断
+    if let Some(ref nat) = nat_input {
+        diagnose_nat_traversal(&mut report, nat);
     }
 
     report
@@ -946,7 +1003,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join("openwire_diagnose_all_test");
         let _ = std::fs::create_dir_all(&temp_dir);
 
-        let report = diagnose_all(&temp_dir, None);
+        let report = diagnose_all(&temp_dir, None, None);
         assert!(!report.items.is_empty(), "综合诊断应有结果");
 
         // 加密部分应全部通过

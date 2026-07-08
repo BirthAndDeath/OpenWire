@@ -22,13 +22,14 @@ use crate::{
     log::init_logger,
     message::{ChatMessage, ChatMessageType},
     p2p, storage,
+    p2p::dht_cache::DhtCache,
     transfer::FileTransferState,
 };
 /// 命令处理
 pub mod command_handler;
 /// 联系人操作
 pub mod contact_ops;
-/// DHT 操作（停用）
+/// DHT 操作（身份发布至 Kademlia 网络）
 pub mod dht_ops;
 /// 事件处理
 pub mod event_loop;
@@ -38,6 +39,8 @@ pub mod file_transfer;
 pub mod identity_ops;
 /// 消息操作
 pub mod message_ops;
+/// 定时器任务（独立 tokio::spawn）
+pub mod timers;
 
 /// 聊天核心：管理 P2P 网络、命令处理、消息分发
 ///
@@ -81,10 +84,12 @@ pub struct ChatCore {
     pub(crate) file_transfers: HashMap<String, FileTransferState>,
     /// 文件路径映射（file_id -> 本地文件路径），用于发送方查找文件
     pub(crate) file_path_map: HashMap<[u8; 32], PathBuf>,
-    /// 缓存的 DHT 数据库连接（避免每次发送消息都打开/关闭数据库）
-    pub(crate) dht_db: Option<std::sync::Arc<redb::Database>>,
-    /// 已建立连接的 PeerID 集合（用于在线状态计数）
-    pub(crate) connected_peers: std::collections::HashSet<PeerId>,
+    /// 内存 DHT 缓存
+    pub(crate) dht_cache: Arc<DhtCache>,
+    /// 已建立连接的 PeerID 及其连接数（用于在线状态计数）
+    /// 使用 HashMap<PeerId, usize> 以支持每个 Peer 有多条连接（如 mDNS 双端互拨）
+    /// ConnectionEstablished 时 +1，ConnectionClosed 时 -1，减到 0 才移除
+    pub(crate) connected_peers: std::collections::HashMap<PeerId, usize>,
     /// PeerID → ML-DSA 公钥 hex 的内存缓存
     ///
     /// 在 ConnectionEstablished 时从 DHT 反向查找并缓存，
@@ -102,6 +107,8 @@ pub struct ChatCore {
     /// 此字段在 try_init() 中初始化，生命周期与 ChatCore 实例相同。
     /// 每次会话重新生成 ML-KEM 密钥对时，此字段也会更新。
     pub(crate) mlkem_decap_key: Option<DecapsulationKey>,
+    /// 配置的中继节点列表 [(PeerId, Multiaddr)]
+    pub(crate) relay_nodes: Vec<(String, String)>,
 }
 
 impl ChatCore {
@@ -140,23 +147,13 @@ impl ChatCore {
         // 加载 ML-DSA 私钥并缓存到内存（避免每次发送消息都访问 Keyring）
         // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
         let mldsa_private_key = {
-            let mut handle = rootcell::identity::PrivateKeyHandle::load(
+            let handle = rootcell::identity::PrivateKeyHandle::load(
                 &cfg.data_dir.to_string_lossy(),
                 &format!("{}_mldsa", mldsa_identity_id),
-                cfg.passwd.as_deref(),
             )
             .map_err(|e| {
                 CoreError::InitFailed(format!("Failed to load ML-DSA private key: {}", e))
             })?;
-
-            // 如果当前是密码派生模式但 Keyring 可用，自动升级到 Keyring 存储
-            if let Err(e) = handle.try_upgrade_to_keyring() {
-                tracing::warn!(
-                    "Failed to upgrade private key for {} to Keyring: {}",
-                    &mldsa_identity_id[..16],
-                    e
-                );
-            }
 
             Zeroizing::new(handle.get_private_key().to_vec())
         };
@@ -168,21 +165,8 @@ impl ChatCore {
         let peer_id = keypair.public().to_peer_id();
         tracing::info!("Generated temporary PeerID for transport: {}", peer_id);
 
-        // 先初始化 DHT 数据库连接（共享连接池），再传入 swarm_init，
-        // 避免 swarm_init 内部 create_kademlia_with_validator 再次打开同一文件导致锁冲突。
-        let dht_db = {
-            let dht_path = cfg.data_dir.join("dht.redb");
-            let db = if dht_path.exists() {
-                redb::Database::open(&dht_path).map_err(|e| {
-                    CoreError::InitFailed(format!("无法打开 DHT 数据库 {:?}: {}", dht_path, e))
-                })?
-            } else {
-                redb::Database::create(&dht_path).map_err(|e| {
-                    CoreError::InitFailed(format!("无法创建 DHT 数据库 {:?}: {}", dht_path, e))
-                })?
-            };
-            Some(Arc::new(db))
-        };
+        // 初始化内存 DHT 缓存
+        let dht_cache = DhtCache::new();
 
         // 启动时清理 contacts 表中过时的 ML-KEM 公钥
         // 每次启动都会生成新的临时 ML-KEM 密钥对，旧的 ML-KEM 公钥已失效。
@@ -203,8 +187,6 @@ impl ChatCore {
         let swarm = p2p::swarm_init(
             &cfg.data_dir,
             keypair.clone(),
-            dht_db.clone().unwrap(),
-            &relay_nodes,
             &bootstrap_nodes,
         )
         .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
@@ -240,9 +222,27 @@ impl ChatCore {
         let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
 
         // 创建 P2pActor 并启动
-        let p2p_actor = P2pActor::new(swarm, dht_db.clone(), cfg.data_dir.clone(), p2p_event_tx);
+        let p2p_actor = P2pActor::new(swarm, dht_cache.clone(), cfg.data_dir.clone(), p2p_event_tx, cfg.relay_nodes.clone());
         let p2p_handle =
             crate::actor::p2p::start_p2p_actor(p2p_actor, CHANNEL_CAPACITY, shutdown_token.clone());
+
+        // 可选：启动 WebSocket 信令 Actor
+        if let Some(sig_host) = &cfg.signaling_server {
+            let room = cfg.signaling_room.clone()
+                .unwrap_or_else(|| mldsa_identity_id[..16].to_string());
+            tracing::info!("SignalingActor starting: server={sig_host}, room={room}");
+            let (_sig_event_tx, _sig_event_rx) = mpsc::channel::<crate::actor::signaling::SignalingEvent>(8);
+            let signal_actor = crate::actor::signaling::SignalingActor::new(
+                sig_host.clone(),
+                room,
+                peer_id,
+                p2p_handle.tx.clone(),
+                _sig_event_tx,
+                shutdown_token.clone(),
+            );
+            signal_actor.start();
+            tracing::info!("SignalingActor started");
+        }
 
         Ok(ChatCore {
             p2p_handle,
@@ -264,20 +264,17 @@ impl ChatCore {
             download_dir,
             file_transfers: HashMap::new(),
             file_path_map: HashMap::new(),
-            dht_db,
-            connected_peers: std::collections::HashSet::new(),
+            dht_cache,
+            connected_peers: std::collections::HashMap::new(),
             peerid_to_pubkey: HashMap::new(),
             mlkem_decap_key: Some(mlkem_decap_key),
+            relay_nodes: cfg.relay_nodes.clone(),
         })
     }
 
-    /// 获取缓存的 DHT 数据库连接，返回 RedbRecordStore
-    /// 如果数据库连接不可用，返回错误
-    pub(crate) fn get_dht_store(&self) -> CoreResult<p2p::dht::RedbRecordStore> {
-        match self.dht_db {
-            Some(ref db) => Ok(p2p::dht::RedbRecordStore::new(db.clone())),
-            None => Err(CoreError::DhtDatabaseNotInitialized),
-        }
+    /// 获取 DHT 缓存
+    pub(crate) fn get_dht_store(&self) -> &DhtCache {
+        &self.dht_cache
     }
 
     /// 获取消息接收通道（用于外部 UI 接收核心事件）
@@ -331,29 +328,21 @@ impl ChatCore {
         .map_err(CoreError::MessageError)
     }
 
-    /// 发送日志事件到外部通道
+    /// 发送日志事件到外部通道（try_send 避免阻塞事件循环）
     pub(crate) async fn send_log_mpsc(&mut self, data: String) {
-        if let Err(e) = self.tx_message.send(MessageEvent::Log(data)).await {
-            tracing::error!("Failed to send log message: {e}");
-        }
+        let _ = self.tx_message.try_send(MessageEvent::Log(data));
     }
 
-    /// 发送警告事件到外部通道
+    /// 发送警告事件到外部通道（try_send 避免阻塞事件循环）
     pub(crate) async fn send_warning_mpsc(&mut self, data: String) {
-        if let Err(e) = self.tx_message.send(MessageEvent::Warning(data)).await {
-            tracing::error!("Failed to send warning message: {e}");
-        }
+        let _ = self.tx_message.try_send(MessageEvent::Warning(data));
     }
 
-    /// 发送新消息事件到外部通道
+    /// 发送新消息事件到外部通道（try_send 避免阻塞事件循环）
     pub async fn send_message_mpsc(&mut self, msg: crate::command::IncomingMessage) {
-        if let Err(e) = self
+        let _ = self
             .tx_message
-            .send(MessageEvent::ReceiveMessage(msg))
-            .await
-        {
-            tracing::error!("Failed to send message event: {e}");
-        }
+            .try_send(MessageEvent::ReceiveMessage(msg));
     }
 
     /// 发送在线状态更新事件（独立事件，不混入消息历史）
@@ -361,15 +350,8 @@ impl ChatCore {
     /// 将当前所有已连接 PeerID 反向解析为 ML-DSA 公钥 hex，
     /// 发送给上层 UI 以便显示每个联系人的在线/离线状态。
     pub(crate) async fn send_online_status(&mut self) {
-        // 将 connected_peers (HashSet<PeerId>) 解析为 ML-DSA 公钥 hex 列表
         let online_contacts = self.resolve_online_contacts();
-        if let Err(e) = self
-            .tx_message
-            .send(MessageEvent::OnlineStatus { online_contacts })
-            .await
-        {
-            tracing::error!("Failed to send online status event: {e}");
-        }
+        let _ = self.tx_message.try_send(MessageEvent::OnlineStatus { online_contacts });
     }
 
     /// 解析当前所有已连接 PeerID 对应的 ML-DSA 公钥 hex
@@ -377,24 +359,21 @@ impl ChatCore {
     /// 优先使用内存缓存 `peerid_to_pubkey`，如果缓存中没有则回退到 DHT 查询。
     /// 找到后自动写入缓存，避免后续重复查询。
     fn resolve_online_contacts(&self) -> Vec<String> {
-        let store = self.get_dht_store().ok();
+        let store = self.get_dht_store();
         let mut online = Vec::with_capacity(self.connected_peers.len());
-        for peer_id in &self.connected_peers {
+        for peer_id in self.connected_peers.keys() {
             // 1. 优先使用内存缓存
             if let Some(pubkey_hex) = self.peerid_to_pubkey.get(peer_id) {
                 online.push(pubkey_hex.clone());
                 continue;
             }
             // 2. 回退到 DHT 查询
-            if let Some(ref store) = store {
-                match store.get_pubkey_by_peerid(peer_id) {
-                    Ok(Some(pubkey_hex)) => {
-                        online.push(pubkey_hex);
-                    }
-                    _ => {
-                        // PeerID 尚未关联到任何 ML-DSA 公钥
-                        tracing::trace!("Peer {peer_id} has no pubkey mapping yet");
-                    }
+            match store.get_pubkey_by_peerid(peer_id) {
+                Ok(Some(pubkey_hex)) => {
+                    online.push(pubkey_hex);
+                }
+                _ => {
+                    tracing::trace!("Peer {peer_id} has no pubkey mapping yet");
                 }
             }
         }
@@ -413,7 +392,7 @@ impl ChatCore {
     ) {
         let is_new = self.peerid_to_pubkey.insert(peer_id, pubkey_hex).is_none();
         // 如果这是新映射且该 PeerID 当前已连接，刷新在线状态
-        if is_new && self.connected_peers.contains(&peer_id) {
+        if is_new && self.connected_peers.contains_key(&peer_id) {
             self.send_online_status().await;
         }
     }

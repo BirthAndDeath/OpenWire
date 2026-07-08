@@ -14,7 +14,8 @@ registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
 [env]
 AWS_LC_SYS_PREBUILT_NASM = "1"
 [build]
-
+[cache]
+cache.auto-clean-frequency = "1d"
 #以下是可选加速编译配置，可自行更改，更改请勿提交，除非是团队协作需要，防止影响编译
 #[target.'cfg(target_os = "linux")']
 #linker = "clang"

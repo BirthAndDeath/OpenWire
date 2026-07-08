@@ -38,6 +38,12 @@ pub async fn init_path(path: &Path) -> StorageResult<()> {
             "Database path must be a file".to_string(),
         ));
     }
+
+    if DB_POOL.get().is_some() {
+        tracing::info!("数据库连接池已存在，跳过重复初始化");
+        return Ok(());
+    }
+
     let is_new = !path.exists();
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -143,24 +149,7 @@ pub async fn delete_identity(
         &format!("{}_mlkem", identity_id),
     );
 
-    // 2. 清理 DHT 中的记录（PUBKEY_PEERID_TABLE 和 PUBKEY_MLKEM_TABLE）
-    // DHT 数据库由主进程持有，此处尝试打开清理；若被锁则跳过（非关键操作）
-    let dht_path = data_dir.join("dht.redb");
-    if dht_path.exists() {
-        match redb::Database::open(&dht_path) {
-            Ok(db) => {
-                use std::sync::Arc;
-                let store = crate::p2p::dht::RedbRecordStore::new(Arc::new(db));
-                let _ = store.remove_pubkey_peerid(identity_id);
-                let _ = store.remove_mlkem_pubkey(identity_id);
-            }
-            Err(e) => {
-                tracing::warn!("无法打开 DHT 数据库清理记录（可能已被主进程锁定）: {}", e);
-            }
-        }
-    }
-
-    // 3. 删除数据库记录
+    // 2. 删除数据库记录
     let rows = sqlx::query("DELETE FROM identities WHERE identity_id = ?")
         .bind(identity_id)
         .execute(pool)

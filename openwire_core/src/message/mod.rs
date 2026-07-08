@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 文件流子模块
 pub mod file_stream;
 pub use file_stream::{
-    ChunkReadConfig, ChunkResponse, FileHashInfo, FileStreamChunk, FileStreamMeta,
+    ChunkReadConfig, ChunkResponse, DownloadRequest, DownloadResponse, FileHashInfo,
+    FileStreamChunk, FileStreamMeta,
 };
 
 /// 消息最大允许年龄（秒）
@@ -31,6 +32,8 @@ pub enum ChatMessageType {
     DeliveryReceipt = 4,
     /// 在线状态通知（通过 gossipsub 发布/订阅）
     OnlineStatus = 5,
+    /// 文件下载响应（发送方同意/拒绝）
+    FileDownloadResponse = 6,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

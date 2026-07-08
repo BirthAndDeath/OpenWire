@@ -6,6 +6,8 @@ mod identity;
 mod message;
 /// 数据库迁移模块
 mod migrations;
+/// 已发送文件历史模块
+mod sent_file;
 /// 统计查询模块
 mod stats;
 
@@ -20,7 +22,9 @@ pub use identity::{
 };
 pub use message::{
     Message, add_message, add_message_with_hash, add_messages_batch, delete_message,
-    delete_messages_batch, delete_messages_by_peer, get_last_message, get_message, get_messages,
-    get_messages_range, list_failed, list_pending, mark_failed, mark_pending, mark_sent,
-    mark_sent_batch, mark_sent_by_hash, update_message_hash,
+    delete_messages_batch, delete_messages_by_peer, get_last_message, get_message,
+    get_message_by_hash, get_messages, get_messages_range, list_failed, list_pending,
+    list_pending_by_peer, mark_failed, mark_pending, mark_sent, mark_sent_batch,
+    mark_sent_by_hash, update_message_hash,
 };
+pub use sent_file::{add_sent_file, get_sent_file};

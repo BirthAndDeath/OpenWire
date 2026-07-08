@@ -39,8 +39,10 @@ pub struct MyBehaviour {
     pub autonat: autonat::Behaviour,
     // Identify 协议（地址/协议交换）
     pub identify: identify::Behaviour,
-    // Relay 协议（NAT 穿透，可选）
-    pub relay: relay::Behaviour,
+    // Relay 协议（NAT 穿透，Client模式）
+    pub relay_client: relay::client::Behaviour,
+    // Relay Server 模式（为他人提供中继，公网节点自动启用）
+    pub relay_server: relay::Behaviour,
     // DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,
 
