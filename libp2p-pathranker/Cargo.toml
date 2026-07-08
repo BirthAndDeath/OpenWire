@@ -13,7 +13,7 @@ libp2p = { version = "0.56.0", features = ["request-response", "tokio", "tcp", "
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 rand = "0.8"
-lru = "0.12"
+lru = "0.18"
 tokio.workspace = true
 tracing.workspace = true
 
