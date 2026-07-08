@@ -16,6 +16,7 @@ const MESSAGE_MAX_AGE_SECS: u64 = 60 * 60;
 /// 消息未来时间容差（秒）
 const MESSAGE_FUTURE_TOLERANCE_SECS: u64 = 60;
 
+/// 聊天消息类型（消息种类标识）
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 #[non_exhaustive]

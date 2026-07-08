@@ -9,32 +9,49 @@ use crate::error::{FileTransferError, FileTransferResult};
 /// 文件哈希信息（FileHash 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileHashInfo {
+    /// 文件唯一标识（SHA256）
     pub file_id: [u8; 32],
+    /// 原始文件名
     pub filename: String,
+    /// 文件总大小（字节）
     pub total_size: u64,
+    /// 完整文件 SHA256
     pub file_hash: [u8; 32],
 }
 
 /// 文件流元数据（FileStream 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileStreamMeta {
+    /// 文件唯一标识（SHA256）
     pub file_id: [u8; 32],
+    /// 原始文件名
     pub filename: String,
+    /// 文件总大小（字节）
     pub total_size: u64,
+    /// 总分片数
     pub total_chunks: u32,
+    /// 分片大小（字节）
     pub chunk_size: u32,
+    /// 完整文件 SHA256
     pub file_hash: [u8; 32],
 }
 
 /// 文件流分片（FileStream 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileStreamChunk {
+    /// 文件唯一标识（SHA256）
     pub file_id: [u8; 32],
+    /// 原始文件名
     pub filename: String,
+    /// 文件总大小（字节）
     pub total_size: u64,
+    /// 总分片数
     pub total_chunks: u32,
+    /// 分片大小（字节）
     pub chunk_size: u32,
+    /// 分片序号
     pub chunk_index: u32,
+    /// 文件读取偏移量
     pub offset: u64,
     /// 压缩后的分片数据（使用 zstd 压缩）
     pub chunk_data: Vec<u8>,
@@ -49,6 +66,7 @@ pub struct FileStreamChunk {
 /// 分片接收确认（文件下载请求的响应）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChunkResponse {
+    /// 文件唯一标识（SHA256）
     pub file_id: [u8; 32],
     /// 已接收的分片序号列表（用于断点续传）
     pub received_chunks: Vec<u32>,
@@ -64,11 +82,17 @@ pub struct DownloadRequest {
 /// 文件下载响应（发送方 → 接收方）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DownloadResponse {
+    /// 文件的 SHA256 哈希
     pub file_hash: [u8; 32],
+    /// 发送方是否接受下载请求
     pub accepted: bool,
+    /// 原始文件名（接受时返回）
     pub filename: Option<String>,
+    /// 文件总大小（接受时返回）
     pub total_size: Option<u64>,
+    /// 总分片数（接受时返回）
     pub total_chunks: Option<u32>,
+    /// 分片大小（接受时返回）
     pub chunk_size: Option<u32>,
 }
 

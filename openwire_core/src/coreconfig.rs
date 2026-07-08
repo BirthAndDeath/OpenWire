@@ -7,11 +7,17 @@ pub const DEFAULT_SIGNALING_SERVER: &str = "openwire-server.3589206993.workers.d
 /// 核心配置：初始化参数集合
 #[derive(Default, Clone)]
 pub struct CoreConfig {
+    /// 数据目录路径
     pub data_dir: PathBuf,
+    /// 日志文件路径（可选）
     pub path_to_log: Option<PathBuf>,
+    /// 日志级别（可选）
     pub log_level: Option<String>,
+    /// 下载目录（可选）
     pub download_dir: Option<PathBuf>,
+    /// 中继节点列表 [(PeerId, Multiaddr)]
     pub relay_nodes: Vec<(String, String)>,
+    /// 引导节点列表 [(PeerId, Multiaddr)]
     pub bootstrap_nodes: Vec<(String, String)>,
     /// WebSocket 信令服务器主机，如 "openwire-server.3589206993.workers.dev"
     /// 设为 `None` 可禁用信令功能（国内用户建议禁用）

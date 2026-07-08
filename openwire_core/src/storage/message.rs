@@ -5,6 +5,7 @@ use crate::error::{StorageError, StorageResult};
 #[derive(Debug, Clone, FromRow)]
 /// 消息结构
 pub struct Message {
+    /// 消息自增 ID
     pub id: i64,
     /// 己方身份
     pub owner_identity_id: String,
@@ -235,6 +236,7 @@ pub async fn add_messages_batch(
     Ok(ids)
 }
 
+/// 批量标记消息为已发送（pending = 0）
 pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<u64> {
     if ids.is_empty() {
         return Ok(0);
@@ -258,6 +260,7 @@ pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<
     Ok(query.execute(pool).await?.rows_affected())
 }
 
+/// 批量删除消息
 pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<u64> {
     if ids.is_empty() {
         return Ok(0);

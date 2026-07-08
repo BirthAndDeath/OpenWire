@@ -21,25 +21,46 @@ use libp2p::{Multiaddr, PeerId};
 /// 信令事件：通知 ChatCore 信令层的状态变化
 #[derive(Debug, Clone)]
 pub enum SignalingEvent {
-    PeerDiscovered { peer_id: PeerId, addrs: Vec<Multiaddr> },
-    PeerLost { peer_id: PeerId },
+    /// 发现新对端节点
+    PeerDiscovered {
+        /// 发现的节点 PeerId
+        peer_id: PeerId,
+        /// 该节点已知的监听地址列表
+        addrs: Vec<Multiaddr>,
+    },
+    /// 对端节点离开
+    PeerLost {
+        /// 离开的节点 PeerId
+        peer_id: PeerId,
+    },
+    /// 已连接到信令服务器
     Connected,
+    /// 与信令服务器断开连接
     Disconnected,
+    /// 发生错误
     Error(String),
 }
 
 /// WebSocket 信令 Actor
 pub struct SignalingActor {
+    /// 信令服务器主机名
     server_host: String,
+    /// 信令房间名
     room: String,
+    /// 本节点 PeerId
     peer_id: PeerId,
+    /// 监听地址更新通道发送端
     listen_addrs_tx: watch::Sender<Vec<Multiaddr>>,
+    /// P2pActor 命令通道发送端
     p2p_cmd_tx: mpsc::Sender<ActorCommand<P2pCommand>>,
+    /// 信令事件通道发送端
     event_tx: mpsc::Sender<SignalingEvent>,
+    /// 关闭信号 token
     shutdown_token: CancellationToken,
 }
 
 impl SignalingActor {
+    /// 创建新的 SignalingActor
     pub fn new(
         server_host: impl Into<String>,
         room: impl Into<String>,

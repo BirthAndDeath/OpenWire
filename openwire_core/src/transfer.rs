@@ -63,7 +63,10 @@ pub enum TransferStatus {
     /// 等待发送方响应
     Requesting,
     /// 正在接收
-    Downloading { received_bytes: u64 },
+    Downloading {
+        /// 已接收的字节数
+        received_bytes: u64,
+    },
     /// 接收完成
     Completed,
     /// 失败（无额外数据，错误信息通过日志记录）

@@ -21,6 +21,7 @@ pub struct DhtCache {
 }
 
 impl DhtCache {
+    /// 创建新的 DHT 缓存
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             pubkey_peerid: DashMap::new(),
@@ -29,6 +30,7 @@ impl DhtCache {
         })
     }
 
+    /// 设置 pubkey ↔ peerid 映射
     pub fn set_pubkey_peerid(&self, pubkey_hex: &str, peer_id: &PeerId) -> DhtResult<()> {
         if self.pubkey_peerid.len() >= MAX_PUBKEY_PEERID && !self.pubkey_peerid.contains_key(pubkey_hex)
         {
@@ -44,6 +46,7 @@ impl DhtCache {
         Ok(())
     }
 
+    /// 通过 pubkey 查询对应的 peerid
     pub fn get_peerid_by_pubkey(&self, pubkey_hex: &str) -> DhtResult<Option<PeerId>> {
         let result = self.pubkey_peerid.get(pubkey_hex).and_then(|v| {
             v.value().parse::<PeerId>().ok()
@@ -51,6 +54,7 @@ impl DhtCache {
         Ok(result)
     }
 
+    /// 通过 peerid 查询对应的 pubkey
     pub fn get_pubkey_by_peerid(&self, peer_id: &PeerId) -> DhtResult<Option<String>> {
         let peer_id_str = peer_id.to_string();
         let result = self
@@ -61,11 +65,13 @@ impl DhtCache {
         Ok(result)
     }
 
+    /// 删除 pubkey ↔ peerid 映射
     pub fn remove_pubkey_peerid(&self, pubkey_hex: &str) -> DhtResult<()> {
         self.pubkey_peerid.remove(pubkey_hex);
         Ok(())
     }
 
+    /// 获取所有已缓存的 pubkey 列表
     pub fn get_all_pubkeys(&self) -> DhtResult<Vec<String>> {
         let keys: Vec<String> = self
             .pubkey_peerid
@@ -75,6 +81,7 @@ impl DhtCache {
         Ok(keys)
     }
 
+    /// 设置 ML-DSA 公钥 → ML-KEM 公钥映射
     pub fn set_mlkem_pubkey(
         &self,
         mldsa_pubkey_hex: &str,
@@ -94,6 +101,7 @@ impl DhtCache {
         Ok(())
     }
 
+    /// 通过 ML-DSA 公钥查询对应的 ML-KEM 公钥
     pub fn get_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<Option<String>> {
         let result = self
             .mlkem_pubkeys
@@ -102,11 +110,13 @@ impl DhtCache {
         Ok(result)
     }
 
+    /// 删除 ML-DSA 公钥 → ML-KEM 公钥映射
     pub fn remove_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<()> {
         self.mlkem_pubkeys.remove(mldsa_pubkey_hex);
         Ok(())
     }
 
+    /// 添加 peer 的 Multiaddr 到缓存
     pub fn add_multiaddr(&self, peer_id: &PeerId, multiaddr: &libp2p::Multiaddr) -> DhtResult<()> {
         let key = peer_id.to_string();
         let addr_str = multiaddr.to_string();
@@ -130,6 +140,7 @@ impl DhtCache {
         Ok(())
     }
 
+    /// 从缓存中删除 peer 的某个 Multiaddr
     pub fn remove_multiaddr(
         &self,
         peer_id: &PeerId,
@@ -147,6 +158,7 @@ impl DhtCache {
         Ok(())
     }
 
+    /// 获取 peer 缓存的所有 Multiaddr
     pub fn get_multiaddrs(&self, peer_id: &PeerId) -> DhtResult<Vec<libp2p::Multiaddr>> {
         let key = peer_id.to_string();
         let result = self.multiaddrs.get(&key).map_or(Vec::new(), |addrs| {

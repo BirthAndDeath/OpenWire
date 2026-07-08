@@ -90,6 +90,7 @@ impl RedbRecordStore {
         f(&read_txn)
     }
 
+    /// 添加 peer 的 Multiaddr 到 Redb 持久化存储
     pub fn add_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
@@ -113,6 +114,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 从 Redb 持久化存储中删除 peer 的某个 Multiaddr
     pub fn remove_multiaddr(&self, peer_id: &PeerId, multiaddr: &Multiaddr) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         let multiaddr_str = multiaddr.to_string();
@@ -137,6 +139,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 从 Redb 持久化存储获取 peer 的所有 Multiaddr
     pub fn get_multiaddrs(&self, peer_id: &PeerId) -> DhtResult<Vec<Multiaddr>> {
         let peer_id_str = peer_id.to_string();
         self.with_read_txn(|read_txn| {
@@ -150,6 +153,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 从 Redb 持久化存储随机获取 peer 的一个 Multiaddr
     pub fn get_random_multiaddr(&self, peer_id: &PeerId) -> DhtResult<Option<Multiaddr>> {
         let mut addrs = self.get_multiaddrs(peer_id)?;
         if addrs.is_empty() {
@@ -160,6 +164,7 @@ impl RedbRecordStore {
         Ok(Some(addrs[0].clone()))
     }
 
+    /// 设置 pubkey ↔ peerid 映射到 Redb 持久化存储
     pub fn set_pubkey_peerid(&self, pubkey_hex: &str, peer_id: &PeerId) -> DhtResult<()> {
         let peer_id_str = peer_id.to_string();
         self.with_write_txn(|write_txn| {
@@ -169,6 +174,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 通过 pubkey 从 Redb 持久化存储查询对应 peerid
     pub fn get_peerid_by_pubkey(&self, pubkey_hex: &str) -> DhtResult<Option<PeerId>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
@@ -184,6 +190,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 通过 peerid 从 Redb 持久化存储查询对应 pubkey
     pub fn get_pubkey_by_peerid(&self, peer_id: &PeerId) -> DhtResult<Option<String>> {
         let peer_id_str = peer_id.to_string();
         self.with_read_txn(|read_txn| {
@@ -198,6 +205,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 删除 pubkey ↔ peerid 映射
     pub fn remove_pubkey_peerid(&self, pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
@@ -206,6 +214,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 获取所有已缓存的 pubkey 列表
     pub fn get_all_pubkeys(&self) -> DhtResult<Vec<String>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
@@ -218,6 +227,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 设置 ML-DSA 公钥 → ML-KEM 公钥映射到 Redb 持久化存储
     pub fn set_mlkem_pubkey(
         &self,
         mldsa_pubkey_hex: &str,
@@ -230,6 +240,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 通过 ML-DSA 公钥从 Redb 持久化存储查询对应 ML-KEM 公钥
     pub fn get_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<Option<String>> {
         self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_MLKEM_TABLE)?;
@@ -241,6 +252,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 删除 ML-DSA 公钥 → ML-KEM 公钥映射
     pub fn remove_mlkem_pubkey(&self, mldsa_pubkey_hex: &str) -> DhtResult<()> {
         self.with_write_txn(|write_txn| {
             let mut table = write_txn.open_table(PUBKEY_MLKEM_TABLE)?;
@@ -249,6 +261,7 @@ impl RedbRecordStore {
         })
     }
 
+    /// 清理已过期的 DHT 记录与 provider 记录，返回 (清理的记录数, 清理的 provider 数)
     pub fn cleanup_expired_records(&self) -> DhtResult<(usize, usize)> {
         let mut records_cleaned = 0;
         let mut providers_cleaned = 0;

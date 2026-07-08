@@ -3,12 +3,18 @@ use sqlx::{FromRow, Pool, Sqlite};
 use crate::error::StorageResult;
 
 #[derive(Debug, Clone, FromRow)]
+/// 联系人记录
 pub struct Contact {
-    pub mldsa_pubkey_hex: String,          // 对方 ML-DSA 公钥 hex
-    pub owner_identity_id: String,         // 所属身份（己方公钥 hex）
-    pub name: Option<String>,              // 联系人名称
-    pub mlkem_public_key: Option<Vec<u8>>, // ML-KEM 公钥（临时密钥交换，每次会话可更新）
-    pub added_at: i64,                     // 添加时间
+    /// 对方 ML-DSA 公钥 hex
+    pub mldsa_pubkey_hex: String,
+    /// 所属身份（己方公钥 hex）
+    pub owner_identity_id: String,
+    /// 联系人名称
+    pub name: Option<String>,
+    /// ML-KEM 公钥（临时密钥交换，每次会话可更新）
+    pub mlkem_public_key: Option<Vec<u8>>,
+    /// 添加时间（Unix 时间戳）
+    pub added_at: i64,
 }
 
 // ========== 联系人管理 ==========

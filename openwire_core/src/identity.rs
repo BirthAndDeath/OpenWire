@@ -5,17 +5,23 @@ use zeroize::Zeroizing;
 
 use crate::{coreconfig::CoreConfig, storage};
 
+/// 生成临时 PeerId（ed25519 密钥对）
 pub fn generate_temporary_peerid() -> crate::error::IdentityResult<identity::Keypair> {
     let keypair = identity::Keypair::generate_ed25519();
     Ok(keypair)
 }
 
+/// 完整身份信息（ML-DSA 签名 + ML-KEM 封装密钥）
 pub struct CompleteIdentity {
+    /// ML-DSA 公钥（用于身份标识与消息验签）
     pub mldsa_public_key: Zeroizing<Vec<u8>>,
+    /// ML-KEM 公钥（用于临时密钥交换）
     pub mlkem_public_key: Vec<u8>,
+    /// ML-KEM 解封装密钥（会话级，缓存在内存中）
     pub mlkem_decap_key: DecapsulationKey,
 }
 
+/// 生成新的完整身份并设为当前身份
 pub async fn generate_complete_identity(
     cfg: &CoreConfig,
 ) -> crate::error::IdentityResult<CompleteIdentity> {
@@ -71,6 +77,7 @@ pub async fn generate_complete_identity(
     })
 }
 
+/// 加载当前身份；若不存在或加载失败则生成新身份
 pub async fn load_or_generate_complete_identity(
     cfg: &CoreConfig,
 ) -> crate::error::IdentityResult<CompleteIdentity> {
@@ -133,6 +140,7 @@ pub async fn load_or_generate_complete_identity(
     }
 }
 
+/// 从私钥字节中提取公钥
 pub fn extract_public_key_from_private(
     private_key_bytes: &[u8],
     is_mldsa: bool,

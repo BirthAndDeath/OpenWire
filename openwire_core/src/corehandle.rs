@@ -4,8 +4,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{ChatCommand, ChatMessageType};
 
+/// 核心句柄，封装向核心发送命令的通道与优雅关闭信号
 #[derive(Debug, Clone)]
 pub struct CoreHandle {
+    /// 命令发送通道，用于向核心发送 ChatCommand
     pub cmd_tx: mpsc::Sender<crate::ChatCommand>,
     /// 关闭信号 token，用于在 Drop 时优雅停止后台任务（如 DHT 注册循环）
     pub shutdown_token: CancellationToken,
@@ -44,15 +46,18 @@ impl CoreHandle {
         .await
     }
 
+    /// 生成新身份
     pub async fn generate_identity(&self) -> bool {
         self.send_cmd(ChatCommand::GenerateIdentity).await
     }
 
+    /// 选择当前身份
     pub async fn select_identity(&self, identity_id: String) -> bool {
         self.send_cmd(ChatCommand::SelectIdentity { identity_id })
             .await
     }
 
+    /// 删除身份
     pub async fn delete_identity(&self, identity_id: String) -> bool {
         self.send_cmd(ChatCommand::DeleteIdentity { identity_id })
             .await

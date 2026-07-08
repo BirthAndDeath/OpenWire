@@ -12,11 +12,17 @@ use tokio::sync::oneshot;
 /// - chat_core 自身不依赖 serde_json，仅使用 serde derive
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileTransferProgress {
+    /// 文件名
     pub filename: String,
+    /// 当前已完成的分片索引
     pub chunk_index: u32,
+    /// 分片总数
     pub total_chunks: u32,
+    /// 已接收的字节数
     pub received_bytes: u64,
+    /// 文件总大小（字节）
     pub total_size: u64,
+    /// 状态："downloading" | "completed" | "error"
     pub status: String, // "downloading" | "completed" | "error"
 }
 
@@ -27,7 +33,9 @@ pub enum ChatCommand {
     SendMessage {
         /// 接收方的 ML-DSA 公钥 hex（唯一标识联系人，用于查找 PeerID）
         mldsa_pubkey_hex: String,
+        /// 消息类型
         msgtype: ChatMessageType,
+        /// 消息负载数据
         data: Vec<u8>,
     },
 
@@ -37,6 +45,7 @@ pub enum ChatCommand {
         mldsa_pubkey_hex: String,
         /// 联系人的 ML-KEM 公钥（临时密钥交换）
         mlkem_public_key: Vec<u8>,
+        /// 联系人名称（可选）
         name: Option<String>,
         /// 响应通道：操作完成后发送结果 (true=成功, false=失败)
         resp: oneshot::Sender<bool>,
@@ -45,9 +54,15 @@ pub enum ChatCommand {
     /// 生成新身份
     GenerateIdentity,
     /// 选择当前身份
-    SelectIdentity { identity_id: String },
+    SelectIdentity {
+        /// 要选择的身份 ID
+        identity_id: String,
+    },
     /// 删除身份
-    DeleteIdentity { identity_id: String },
+    DeleteIdentity {
+        /// 要删除的身份 ID
+        identity_id: String,
+    },
 
 /// 请求文件下载（接收方发起）
     RequestFileDownload {
@@ -60,7 +75,10 @@ pub enum ChatCommand {
     },
 
     /// 设置下载目录
-    SetDownloadDir { path: PathBuf },
+    SetDownloadDir {
+        /// 下载目录路径
+        path: PathBuf,
+    },
 
     /// 注册文件供下载（发送方在发送 FileHash 后调用，记录文件路径）
     RegisterFileForDownload {

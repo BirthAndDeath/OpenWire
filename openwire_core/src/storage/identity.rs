@@ -132,6 +132,7 @@ pub async fn list_identities(pool: &Pool<Sqlite>) -> StorageResult<Vec<Identity>
     .map_err(Into::into)
 }
 
+/// 删除身份（同时删除加密的私钥文件）
 pub async fn delete_identity(
     pool: &Pool<Sqlite>,
     data_dir: &Path,

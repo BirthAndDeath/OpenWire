@@ -44,40 +44,64 @@ use self::swarm_ops as p2p_swarm_ops;
 pub enum P2pCommand {
     /// 发送消息到网络
     SendMessage {
+        /// 目标节点 PeerId
         peer_id: PeerId,
+        /// 要发送的消息
         message: ChatMessage,
     },
     /// 发送 NetEvent 请求
     SendNetEvent {
+        /// 目标节点 PeerId
         peer_id: PeerId,
+        /// 要发送的 NetEvent 请求
         request: NetEventRequest,
     },
     /// 发送 NetEvent 响应
     SendNetEventResponse {
+        /// 用于回送响应的请求-响应通道
         channel: libp2p::request_response::ResponseChannel<NetEventResponse>,
+        /// 要发送的 NetEvent 响应
         response: NetEventResponse,
     },
     /// 发布身份到 DHT
     PublishIdentity {
+        /// ML-DSA 公钥 hex
         mldsa_pubkey_hex: String,
+        /// ML-KEM 公钥 hex
         mlkem_pubkey_hex: String,
     },
     /// 发起 GetProviders 查询
-    GetProviders { key: String },
+    GetProviders {
+        /// DHT 查询键
+        key: String,
+    },
     /// 发起 GetRecord 查询
-    GetRecord { key: String },
+    GetRecord {
+        /// DHT 查询键
+        key: String,
+    },
     /// 添加地址到 Kademlia 路由表
     AddKademliaAddress {
+        /// 目标节点 PeerId
         peer_id: PeerId,
+        /// 要添加的地址
         addr: libp2p::Multiaddr,
     },
     /// 拨号
-    Dial { peer_id: PeerId },
+    Dial {
+        /// 要拨号的目标节点 PeerId
+        peer_id: PeerId,
+    },
     /// 拨号到地址
-    DialAddr { addr: libp2p::Multiaddr },
+    DialAddr {
+        /// 要拨号的地址
+        addr: libp2p::Multiaddr,
+    },
     /// 发送 rr_msg 响应确认
     SendResponse {
+        /// 用于回送响应的请求-响应通道
         channel: libp2p::request_response::ResponseChannel<ChatResponse>,
+        /// 要发送的聊天响应
         response: ChatResponse,
     },
     /// 保存路由表
@@ -85,7 +109,10 @@ pub enum P2pCommand {
     /// 关闭
     Shutdown,
     /// 配置中继服务（前端计费网络检测后调用）
-    RelayServerConfig { allowed: bool },
+    RelayServerConfig {
+        /// 是否允许启用中继服务
+        allowed: bool,
+    },
 }
 
 /// P2pActor 发出的事件
@@ -93,39 +120,67 @@ pub enum P2pCommand {
 pub enum P2pEvent {
     /// 收到消息
     MessageReceived {
+        /// 发送方 PeerId
         peer: PeerId,
+        /// 收到的消息
         message: ChatMessage,
+        /// 用于回送响应的请求-响应通道
         channel: libp2p::request_response::ResponseChannel<ChatResponse>,
     },
     /// 收到 NetEvent 请求
     NetEventRequestReceived {
+        /// 发送方 PeerId
         peer: PeerId,
+        /// 收到的 NetEvent 请求
         request: NetEventRequest,
+        /// 用于回送响应的请求-响应通道
         channel: libp2p::request_response::ResponseChannel<NetEventResponse>,
     },
     /// 连接建立
     ConnectionEstablished {
+        /// 已建立连接的节点 PeerId
         peer_id: PeerId,
+        /// 本节点的监听地址列表
         listen_addrs: Vec<libp2p::Multiaddr>,
     },
     /// 连接关闭
-    ConnectionClosed { peer_id: PeerId },
+    ConnectionClosed {
+        /// 已关闭连接的节点 PeerId
+        peer_id: PeerId,
+    },
     /// mDNS 发现
     MdnsDiscovered {
+        /// 发现的节点 PeerId
         peer_id: PeerId,
+        /// 发现的地址
         addr: libp2p::Multiaddr,
     },
     /// mDNS 过期
-    MdnsExpired { peer_id: PeerId },
+    MdnsExpired {
+        /// 过期的节点 PeerId
+        peer_id: PeerId,
+    },
     /// Identify 事件
     IdentifyReceived {
+        /// 对端节点 PeerId
         peer_id: PeerId,
+        /// 对端节点的监听地址列表
         listen_addrs: Vec<libp2p::Multiaddr>,
     },
     /// Kademlia GetProviders 结果
-    GetProvidersResult { key: String, providers: Vec<PeerId> },
+    GetProvidersResult {
+        /// DHT 查询键
+        key: String,
+        /// 发现的 provider 节点列表
+        providers: Vec<PeerId>,
+    },
     /// Kademlia GetRecord 结果
-    GetRecordResult { key: String, value: Vec<u8> },
+    GetRecordResult {
+        /// DHT 查询键
+        key: String,
+        /// 查询到的记录值
+        value: Vec<u8>,
+    },
     /// 日志
     Log(String),
 }
