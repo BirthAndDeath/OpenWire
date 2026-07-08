@@ -4936,6 +4936,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "openwire-server-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "openwire_server_common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openwire_cli"
 version = "0.1.0"
 dependencies = [
@@ -4989,6 +5000,17 @@ dependencies = [
  "tracing-subscriber",
  "vstd",
  "zeroize",
+]
+
+[[package]]
+name = "openwire_server_common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libp2p",
+ "openwire_core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

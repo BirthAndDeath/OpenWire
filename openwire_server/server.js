@@ -4,7 +4,6 @@
 // Clients connect via `ws://1.2.3.4:port/api/signal/:room`
 
 const http = require("http");
-const crypto = require("crypto");
 
 const PORT = parseInt(process.argv[2]) || 8080;
 
@@ -59,26 +58,6 @@ const server = http.createServer((req, res) => {
 });
 
 // ── WebSocket signaling ───────────────────────────────────
-server.on("upgrade", (req, socket, head) => {
-  let url = new URL(req.url, `http://${req.headers.host}`);
-  let [_, part1, part2, room] = url.pathname.split("/");
-
-  if (part1 !== "api" || part2 !== "signal" || !room) {
-    socket.destroy();
-    return;
-  }
-
-  const ws = require("ws");  // lazy require
-  const wss = new ws.WebSocket({ server: server, handleProtocols: () => "json" });
-  
-  // Actually, we need to handle the upgrade manually for path-based routing.
-  // Let's use a simpler approach: create a WebSocket.Server per room on demand.
-});
-
-// Because http.createServer + ws.Server is awkward with per-path routing,
-// let's use a different approach ─ a simple manual upgrade.
-// Run this file with: npm install ws
-
 const { WebSocketServer } = require("ws");
 
 const wss = new WebSocketServer({ server, path: undefined });

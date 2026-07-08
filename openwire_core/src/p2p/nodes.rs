@@ -25,9 +25,19 @@ pub struct NodesConfig {
 impl Default for NodesConfig {
     fn default() -> Self {
         Self {
-            // 暂无公共 relay 节点，需要部署独立中继服务器。
-            // 部署后在此添加 [(PeerId, Multiaddr)]。
-            relay_nodes: vec![],
+            // ============================================================
+            // OpenWire 公共中继节点
+            // ============================================================
+            relay_nodes: vec![
+                [
+                    "12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P".to_string(),
+                    "/ip4/206.237.12.198/tcp/44909".to_string(),
+                ],
+                [
+                    "12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P".to_string(),
+                    "/ip4/206.237.12.198/udp/44909/quic-v1".to_string(),
+                ],
+            ],
             bootstrap_nodes: vec![
                 // ============================================================
                 // IPFS 官方 bootstrap 节点（dnsaddr 方式）

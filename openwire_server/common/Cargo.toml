@@ -1,0 +1,11 @@
+[package]
+name = "openwire_server_common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openwire_core = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = "1.0.103"

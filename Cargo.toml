@@ -1,5 +1,5 @@
 [workspace]
-members = ["openwire_core", "rootcell", "openwire_cli", "openwire/src-tauri", "libp2p-pathranker"]
+members = ["openwire_core", "rootcell", "openwire_cli", "openwire/src-tauri", "libp2p-pathranker", "openwire_server/common", "openwire_server/server_cli"]
 resolver = "3"
 
 [workspace.dependencies]
