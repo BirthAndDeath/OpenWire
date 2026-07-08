@@ -12,7 +12,6 @@ registry = "sparse+https://mirrors.sjtug.sjtu.edu.cn/crates.io-index/"
 
 [net]
 [env]
-AWS_LC_SYS_PREBUILT_NASM = "1"
 [build]
 [cache]
 cache.auto-clean-frequency = "1d"

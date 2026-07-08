@@ -33,7 +33,7 @@ redb = "4.1.0"
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 async-compression = { version = "0.4.42", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
-keyring = { version = "4.1.2" }
+keyring = { version = "4.1.4" }
 async-trait = "0.1.89"
 vstd = "0.0.0-2026-06-14-0213"
 tokio-tungstenite = "0.24"
