@@ -19,7 +19,9 @@ pub mod diagnostics;
 pub mod error;
 /// 身份管理（ML-DSA + ML-KEM）
 pub mod identity;
+/// 日志模块 ✅稳定
 mod log;
+
 pub use vstd::prelude::*;
 /// 消息结构定义
 pub mod message;
