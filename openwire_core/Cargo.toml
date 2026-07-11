@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 [features]
 
-default = ["sqlite_history_storage", "mem_dht", "redb_dht"]
+default = ["mem_dht", "redb_dht"]
 #sqlite_history_storage = []
 mem_dht = ["dashmap"]
 redb_dht = ["redb"]
