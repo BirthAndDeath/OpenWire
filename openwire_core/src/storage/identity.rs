@@ -8,8 +8,8 @@ use tracing;
 
 use crate::error::{StorageError, StorageResult};
 
-static DB_POOL: std::sync::OnceLock<Pool<Sqlite>> = std::sync::OnceLock::new();
-
+//此文件提供对身份进行操作的函数
+//通过初步审查✅
 /// 身份信息
 #[derive(Debug, Clone, FromRow)]
 pub struct Identity {
@@ -21,70 +21,6 @@ pub struct Identity {
     pub is_current: i32,
     /// 创建时间
     pub created_at: i64,
-}
-
-// ========== 初始化 ==========
-
-/// 从 CoreConfig 初始化数据库连接池
-pub async fn init(cfg: &CoreConfig) -> StorageResult<()> {
-    let db_path = cfg.data_dir.join("database.sqlite");
-    init_path(&db_path).await
-}
-
-/// 从指定路径初始化数据库连接池
-pub async fn init_path(path: &Path) -> StorageResult<()> {
-    if path.is_dir() {
-        return Err(StorageError::InvalidPath(
-            "Database path must be a file".to_string(),
-        ));
-    }
-
-    if DB_POOL.get().is_some() {
-        tracing::info!("数据库连接池已存在，跳过重复初始化");
-        return Ok(());
-    }
-
-    let is_new = !path.exists();
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(7)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(7))
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-                .pragma("cache_size", "-64000")
-                .pragma("mmap_size", "268435456")
-                .pragma("journal_size_limit", "67108864")
-                .pragma("temp_store", "memory")
-                .optimize_on_close(true, None)
-                .busy_timeout(Duration::from_secs(5)),
-        )
-        .await?;
-
-    sqlx::query("SELECT 1").execute(&pool).await?;
-
-    if is_new {
-        super::migrations::run(&pool).await?;
-        tracing::info!("New database initialized");
-    }
-
-    DB_POOL
-        .set(pool)
-        .map_err(|_| StorageError::PoolAlreadyInitialized)?;
-    Ok(())
-}
-
-/// 获取数据库连接池
-pub fn pool() -> Option<&'static Pool<Sqlite>> {
-    DB_POOL.get()
 }
 
 // ========== 身份管理（以 ML-DSA 公钥为唯一身份标识） ==========

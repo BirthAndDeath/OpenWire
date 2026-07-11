@@ -39,16 +39,13 @@ pub async fn generate_complete_identity(
     let data_dir = cfg.data_dir.to_string_lossy().to_string();
     let identifier = format!("{}_mldsa", identity_id);
 
-    let _handle = rootcell::identity::PrivateKeyHandle::save(
-        &data_dir,
-        &identifier,
-        &mldsa_secret_key,
-    )
-    .map_err(|e| {
-        crate::error::IdentityError::RootCellIdentityLoadFailed(Box::new(
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-        ))
-    })?;
+    let _handle =
+        rootcell::identity::PrivateKeyHandle::save(&data_dir, &identifier, &mldsa_secret_key)
+            .map_err(|e| {
+                crate::error::IdentityError::RootCellIdentityLoadFailed(Box::new(
+                    std::io::Error::other(e.to_string()),
+                ))
+            })?;
     drop(_handle);
 
     tracing::info!("ML-DSA identity saved: {}", &identity_id[..16]);
@@ -85,7 +82,10 @@ pub async fn load_or_generate_complete_identity(
     tracing::info!("Loading or generating complete identity");
 
     if let Some(identity_id) = storage::get_current_identity(pool).await? {
-        tracing::info!("Found current identity in database: {}..", &identity_id[..16]);
+        tracing::info!(
+            "Found current identity in database: {}..",
+            &identity_id[..16]
+        );
 
         let data_dir = cfg.data_dir.to_string_lossy().to_string();
         match rootcell::identity::PrivateKeyHandle::load(

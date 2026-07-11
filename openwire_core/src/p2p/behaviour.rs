@@ -20,7 +20,6 @@ use libp2p::{
 /// - `identify`: 地址/协议交换
 /// - `relay`: NAT 穿透中继
 /// - `dcutr`: 直连升级
-
 /// libp2p 网络行为组合（由 NetworkBehaviour derive 生成事件枚举）
 #[derive(NetworkBehaviour)]
 #[allow(missing_docs)]

@@ -162,3 +162,14 @@ fn validate_log_path(path: &Path) -> crate::error::LogResult<PathBuf> {
 
     Ok(canonical)
 }
+/// 截断字符串到指定长度用于日志显示
+use std::borrow::Cow;
+
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> Cow<'_, str> {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.chars().take(max_len).collect())
+    }
+}

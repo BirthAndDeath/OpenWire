@@ -1,5 +1,4 @@
 use crate::actor::p2p::P2pCommand;
-use crate::actor::ActorCommand;
 use crate::{command::ChatCommand, core::ChatCore, error::CoreError};
 
 impl ChatCore {
@@ -103,9 +102,13 @@ impl ChatCore {
                 );
             }
             ChatCommand::SetRelayServerAllowed(allowed) => {
-                if let Err(e) = self.p2p_handle.tx.try_send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::RelayServerConfig { allowed }),
-                ) {
+                if let Err(e) = self
+                    .p2p_handle
+                    .tx
+                    .try_send(crate::actor::ActorCommand::Custom(
+                        P2pCommand::RelayServerConfig { allowed },
+                    ))
+                {
                     tracing::warn!("Failed to send RelayServerConfig: {e:?}");
                 }
             }
@@ -114,9 +117,13 @@ impl ChatCore {
                 self.retry_pending_for_online_peers().await;
             }
             ChatCommand::TimerSaveRoutingTable => {
-                if let Err(e) = self.p2p_handle.tx.try_send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::SaveRoutingTable),
-                ) {
+                if let Err(e) = self
+                    .p2p_handle
+                    .tx
+                    .try_send(crate::actor::ActorCommand::Custom(
+                        P2pCommand::SaveRoutingTable,
+                    ))
+                {
                     tracing::warn!("Failed to send periodic SaveRoutingTable: {e:?}");
                 }
             }

@@ -6,6 +6,5 @@ edition = "2024"
 [dependencies]
 openwire_server_common = { path = "../common" }
 tokio = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 anyhow = "1.0.103"

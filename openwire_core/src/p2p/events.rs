@@ -1,8 +1,6 @@
 use crate::actor::p2p::P2pCommand;
 use crate::error::{P2pError, P2pResult};
-use crate::{
-    ChatCore, ChatMessage, ChatMessageType, ChatResponse, crypto, storage,
-};
+use crate::{ChatCore, ChatMessage, ChatMessageType, ChatResponse, crypto, storage};
 
 // ========== 消息接收处理 ==========
 
@@ -94,10 +92,8 @@ pub async fn handle_incoming_request(
 
     // 解密并处理消息
     // handle_decrypted_message 返回 true 表示解密成功，false 表示失败
-    let decryption_success = handle_decrypted_message(
-        core, pool, peer, &request, &sender_mldsa_pubkey_hex,
-    )
-    .await;
+    let decryption_success =
+        handle_decrypted_message(core, pool, peer, &request, &sender_mldsa_pubkey_hex).await;
 
     // 只有解密成功后才发送送达回执
     if decryption_success && request.msgtype == ChatMessageType::Text {
@@ -108,54 +104,54 @@ pub async fn handle_incoming_request(
         // 通过 DHT 查找发送方的 PeerID 和 ML-KEM 公钥，并发回加密的回执
         let store = core.get_dht_store();
         if let Ok(Some(sender_peer_id)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
-                // 获取发送方的 ML-KEM 公钥，用于加密回执数据
-                let sender_mlkem_pubkey = match store.get_mlkem_pubkey(&sender_mldsa_pubkey_hex) {
-                    Ok(Some(hex_str)) if !hex_str.is_empty() => match hex::decode(&hex_str) {
-                        Ok(key) => key,
-                        Err(e) => {
-                            tracing::warn!("发送方 ML-KEM 公钥 hex 解码失败: {}", e);
-                            return;
-                        }
-                    },
-                    _ => {
-                        tracing::warn!(
-                            "未找到发送方 {} 的 ML-KEM 公钥，无法加密送达回执",
-                            &sender_mldsa_pubkey_hex[..16]
-                        );
-                        return;
-                    }
-                };
-
-                // 用发送方的 ML-KEM 公钥加密回执数据
-                let encrypted_receipt =
-                    match crypto::encrypt_message(receipt_data.as_bytes(), &sender_mlkem_pubkey) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!("加密送达回执失败: {}", e);
-                            return;
-                        }
-                    };
-
-                let receipt_msg = match core
-                    .build_signed_message(ChatMessageType::DeliveryReceipt, encrypted_receipt)
-                    .await
-                {
-                    Ok(msg) => msg,
+            // 获取发送方的 ML-KEM 公钥，用于加密回执数据
+            let sender_mlkem_pubkey = match store.get_mlkem_pubkey(&sender_mldsa_pubkey_hex) {
+                Ok(Some(hex_str)) if !hex_str.is_empty() => match hex::decode(&hex_str) {
+                    Ok(key) => key,
                     Err(e) => {
-                        tracing::warn!("构建送达回执消息失败: {}", e);
+                        tracing::warn!("发送方 ML-KEM 公钥 hex 解码失败: {}", e);
+                        return;
+                    }
+                },
+                _ => {
+                    tracing::warn!(
+                        "未找到发送方 {} 的 ML-KEM 公钥，无法加密送达回执",
+                        &sender_mldsa_pubkey_hex[..16]
+                    );
+                    return;
+                }
+            };
+
+            // 用发送方的 ML-KEM 公钥加密回执数据
+            let encrypted_receipt =
+                match crypto::encrypt_message(receipt_data.as_bytes(), &sender_mlkem_pubkey) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!("加密送达回执失败: {}", e);
                         return;
                     }
                 };
-                core.send_message(sender_peer_id, receipt_msg).await;
-                tracing::info!("已向 {} 发送加密的送达回执", &sender_mldsa_pubkey_hex[..16]);
-            } else {
-                tracing::debug!(
-                    "未找到发送方 {} 的 PeerID，无法发送送达回执",
-                    &sender_mldsa_pubkey_hex[..16]
-                );
-            }
+
+            let receipt_msg = match core
+                .build_signed_message(ChatMessageType::DeliveryReceipt, encrypted_receipt)
+                .await
+            {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!("构建送达回执消息失败: {}", e);
+                    return;
+                }
+            };
+            core.send_message(sender_peer_id, receipt_msg).await;
+            tracing::info!("已向 {} 发送加密的送达回执", &sender_mldsa_pubkey_hex[..16]);
+        } else {
+            tracing::debug!(
+                "未找到发送方 {} 的 PeerID，无法发送送达回执",
+                &sender_mldsa_pubkey_hex[..16]
+            );
         }
     }
+}
 
 /// 验证消息签名和新鲜度
 ///
@@ -427,10 +423,7 @@ async fn handle_file_download_request(
     };
 
     let file_hash_hex = hex::encode(request.file_hash);
-    tracing::info!(
-        "收到文件下载请求: file_hash={}..",
-        &file_hash_hex[..16]
-    );
+    tracing::info!("收到文件下载请求: file_hash={}..", &file_hash_hex[..16]);
 
     // 查 sent_files 历史验证合法性，数据库不可用时降级到 file_path_map
     let sent_file = match storage::pool() {
@@ -472,15 +465,17 @@ async fn handle_file_download_request(
         return;
     };
 
-    let filename = sent_file
-        .map(|s| s.filename)
-        .unwrap_or_else(|| file_path.file_name()
+    let filename = sent_file.map(|s| s.filename).unwrap_or_else(|| {
+        file_path
+            .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string());
+            .to_string()
+    });
 
     // 接受请求：注册到 file_path_map 供分片发送使用
-    core.file_path_map.insert(request.file_hash, file_path.clone());
+    core.file_path_map
+        .insert(request.file_hash, file_path.clone());
 
     // 获取文件信息
     let metadata = match tokio::fs::metadata(&file_path).await {
@@ -526,24 +521,28 @@ async fn handle_file_download_request(
 
     // === 直连协商 ===
     let store = core.get_dht_store();
-    if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex) {
-        if let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
-            && !addrs.is_empty()
-        {
-            tracing::info!(
-                "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
-                &sender_mldsa_pubkey_hex[..16],
-                addrs.len()
-            );
-            for addr in &addrs {
-                let dial_addr = addr.clone().with_p2p(recipient_peer_id).unwrap_or(addr.clone());
-                if let Err(e) = core.p2p_handle.tx.try_send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
-                        addr: dial_addr,
-                    }),
-                ) {
-                    tracing::warn!("Failed to send DialAddr during file transfer: {e:?}");
-                }
+    if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex)
+        && let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
+        && !addrs.is_empty()
+    {
+        tracing::info!(
+            "文件传输：尝试与 {}.. 建立直连，发现 {} 个地址",
+            &sender_mldsa_pubkey_hex[..16],
+            addrs.len()
+        );
+        for addr in &addrs {
+            let dial_addr = addr
+                .clone()
+                .with_p2p(recipient_peer_id)
+                .unwrap_or(addr.clone());
+            if let Err(e) = core
+                .p2p_handle
+                .tx
+                .try_send(crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
+                    addr: dial_addr,
+                }))
+            {
+                tracing::warn!("Failed to send DialAddr during file transfer: {e:?}");
             }
         }
     }
@@ -619,7 +618,10 @@ async fn handle_file_download_request(
             }
         }
         if !send_ok {
-            tracing::error!("发送文件分片 {} 失败（3次尝试均已失败），传输中止", chunk_index);
+            tracing::error!(
+                "发送文件分片 {} 失败（3次尝试均已失败），传输中止",
+                chunk_index
+            );
             return;
         }
 
@@ -641,10 +643,7 @@ async fn handle_file_download_request(
 }
 
 /// 处理文件下载响应（接收方收到发送方的同意/拒绝）
-async fn handle_file_download_response(
-    core: &mut ChatCore,
-    data: Vec<u8>,
-) {
+async fn handle_file_download_response(core: &mut ChatCore, data: Vec<u8>) {
     let response: crate::message::DownloadResponse = match postcard::from_bytes(&data) {
         Ok(resp) => resp,
         Err(e) => {
@@ -656,7 +655,8 @@ async fn handle_file_download_response(
     if !response.accepted {
         let file_hash_hex = hex::encode(response.file_hash);
         tracing::warn!("发送方拒绝了下载请求: file_hash={}..", &file_hash_hex[..16]);
-        core.send_warning_mpsc(format!("发送方拒绝了下载请求")).await;
+        core.send_warning_mpsc(format!("发送方拒绝了下载请求"))
+            .await;
         return;
     }
 
@@ -669,9 +669,7 @@ async fn handle_file_download_response(
     );
 
     // 创建传输状态，等待 FileStream 分片到达
-    let _ = core
-        .handle_file_download_response(response)
-        .await;
+    let _ = core.handle_file_download_response(response).await;
 }
 
 /// 发送签名响应确认
@@ -690,12 +688,12 @@ async fn send_response(
     // 注意：这里需要将 response channel 发送给 P2pActor 来处理
     // 由于 send_response 需要访问 swarm，而 ChatCore 不再持有 swarm，
     // 我们需要通过 P2pActor 来发送响应
-    let _ = core.p2p_handle.send(
-        crate::actor::ActorCommand::Custom(P2pCommand::SendResponse {
-            channel,
-            response,
-        }),
-    ).await;
+    let _ = core
+        .p2p_handle
+        .send(crate::actor::ActorCommand::Custom(
+            P2pCommand::SendResponse { channel, response },
+        ))
+        .await;
 }
 
 /// 构建带 ML-DSA 签名的 ChatResponse
@@ -753,16 +751,20 @@ async fn handle_delivery_receipt(
             // 如果 pending 中未找到，可能是已通过 mark_sent_by_hash 标记为已发送
             // 仍然通知 UI 已送达
             if let Ok(Some(msg)) = storage::get_message_by_hash(pool, &receipt_msg_hash).await {
-                tracing::info!("消息 {} 已通过 mark_sent_by_hash 标记为已发送，仅通知 UI", msg.id);
-                core.send_message_mpsc(
-                    crate::command::IncomingMessage::DeliveryReceipt {
-                        message_hash: receipt_msg_hash.clone(),
-                        peer_id: msg.peer_pubkey_hex.clone(),
-                    },
-                )
+                tracing::info!(
+                    "消息 {} 已通过 mark_sent_by_hash 标记为已发送，仅通知 UI",
+                    msg.id
+                );
+                core.send_message_mpsc(crate::command::IncomingMessage::DeliveryReceipt {
+                    message_hash: receipt_msg_hash.clone(),
+                    peer_id: msg.peer_pubkey_hex.clone(),
+                })
                 .await;
             } else {
-                tracing::warn!("未找到哈希 {} 对应的消息，送达回执无法匹配", &receipt_msg_hash[..16]);
+                tracing::warn!(
+                    "未找到哈希 {} 对应的消息，送达回执无法匹配",
+                    &receipt_msg_hash[..16]
+                );
             }
         }
         Err(e) => {

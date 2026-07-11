@@ -21,8 +21,9 @@ use crate::{
     identity,
     log::init_logger,
     message::{ChatMessage, ChatMessageType},
-    p2p, storage,
+    p2p,
     p2p::dht_cache::DhtCache,
+    storage,
     transfer::FileTransferState,
 };
 /// 命令处理
@@ -186,12 +187,8 @@ impl ChatCore {
         let relay_nodes: Vec<(String, String)> = cfg.relay_nodes.clone();
         let bootstrap_nodes: Vec<(String, String)> = cfg.bootstrap_nodes.clone();
 
-        let swarm = p2p::swarm_init(
-            &cfg.data_dir,
-            keypair.clone(),
-            &bootstrap_nodes,
-        )
-        .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
+        let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), &bootstrap_nodes)
+            .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -224,27 +221,15 @@ impl ChatCore {
         let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
 
         // 创建 P2pActor 并启动
-        let p2p_actor = P2pActor::new(swarm, dht_cache.clone(), cfg.data_dir.clone(), p2p_event_tx, cfg.relay_nodes.clone());
+        let p2p_actor = P2pActor::new(
+            swarm,
+            dht_cache.clone(),
+            cfg.data_dir.clone(),
+            p2p_event_tx,
+            cfg.relay_nodes.clone(),
+        );
         let p2p_handle =
             crate::actor::p2p::start_p2p_actor(p2p_actor, CHANNEL_CAPACITY, shutdown_token.clone());
-
-        // 可选：启动 WebSocket 信令 Actor
-        if let Some(sig_host) = &cfg.signaling_server {
-            let room = cfg.signaling_room.clone()
-                .unwrap_or_else(|| mldsa_identity_id[..16].to_string());
-            tracing::info!("SignalingActor starting: server={sig_host}, room={room}");
-            let (_sig_event_tx, _sig_event_rx) = mpsc::channel::<crate::actor::signaling::SignalingEvent>(8);
-            let signal_actor = crate::actor::signaling::SignalingActor::new(
-                sig_host.clone(),
-                room,
-                peer_id,
-                p2p_handle.tx.clone(),
-                _sig_event_tx,
-                shutdown_token.clone(),
-            );
-            signal_actor.start();
-            tracing::info!("SignalingActor started");
-        }
 
         Ok(ChatCore {
             p2p_handle,
@@ -343,9 +328,7 @@ impl ChatCore {
 
     /// 发送新消息事件到外部通道（try_send 避免阻塞事件循环）
     pub async fn send_message_mpsc(&mut self, msg: crate::command::IncomingMessage) {
-        let _ = self
-            .tx_message
-            .try_send(MessageEvent::ReceiveMessage(msg));
+        let _ = self.tx_message.try_send(MessageEvent::ReceiveMessage(msg));
     }
 
     /// 发送在线状态更新事件（独立事件，不混入消息历史）
@@ -354,7 +337,9 @@ impl ChatCore {
     /// 发送给上层 UI 以便显示每个联系人的在线/离线状态。
     pub(crate) async fn send_online_status(&mut self) {
         let online_contacts = self.resolve_online_contacts();
-        let _ = self.tx_message.try_send(MessageEvent::OnlineStatus { online_contacts });
+        let _ = self
+            .tx_message
+            .try_send(MessageEvent::OnlineStatus { online_contacts });
     }
 
     /// 解析当前所有已连接 PeerID 对应的 ML-DSA 公钥 hex

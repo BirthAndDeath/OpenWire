@@ -1,4 +1,5 @@
 //! OpenWire 核心库，处理后端可复用代码工作
+//! ✅
 #![warn(missing_docs)]
 /// Actor 模块（P2P 事件循环 Actor 模式）
 pub mod actor;

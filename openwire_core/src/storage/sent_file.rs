@@ -1,7 +1,7 @@
 use sqlx::{Pool, Sqlite};
 
 use crate::error::StorageResult;
-
+//✅
 #[derive(Debug, Clone, sqlx::FromRow)]
 /// 已发送文件记录
 pub struct SentFile {

@@ -25,8 +25,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{crypto, signature};
 use crate::p2p::dht_cache::DhtCache;
+use crate::{crypto, signature};
 
 // ============================================================================
 // 诊断结果类型
@@ -113,10 +113,7 @@ pub fn diagnose_dht(data_dir: &Path, dht_cache: Option<Arc<DhtCache>>) -> Diagno
 }
 
 /// 诊断 DHT 缓存状态
-fn diagnose_dht_database(
-    report: &mut DiagnosticReport,
-    dht_cache: Option<Arc<DhtCache>>,
-) {
+fn diagnose_dht_database(report: &mut DiagnosticReport, dht_cache: Option<Arc<DhtCache>>) {
     let has_cache = dht_cache.is_some();
     report.add(DiagnosticItem {
         name: "DHT 缓存状态",

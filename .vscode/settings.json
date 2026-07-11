@@ -7,7 +7,7 @@
   },
   // 检查配置
   "rust-analyzer.checkOnSave": true,
-  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.command": "check",
   // 补全与辅助
   "rust-analyzer.completion.autoimport.enable": true,
   "rust-analyzer.assist.emitMustUse": true,

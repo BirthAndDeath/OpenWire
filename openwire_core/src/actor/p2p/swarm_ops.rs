@@ -5,6 +5,7 @@
 
 use libp2p::{PeerId, Swarm};
 
+use crate::log::truncate_str;
 use crate::p2p::behaviour::MyBehaviour;
 use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
 use crate::{ChatMessage, ChatResponse};
@@ -15,10 +16,7 @@ use crate::{ChatMessage, ChatResponse};
 
 /// 通过 rr_msg 协议发送消息
 pub fn send_message(swarm: &mut Swarm<MyBehaviour>, peer_id: &PeerId, message: ChatMessage) {
-    swarm
-        .behaviour_mut()
-        .rr_msg
-        .send_request(peer_id, message);
+    swarm.behaviour_mut().rr_msg.send_request(peer_id, message);
 }
 
 /// 通过 rr_netevent 协议发送 NetEvent 请求
@@ -137,7 +135,11 @@ pub fn get_record(swarm: &mut Swarm<MyBehaviour>, key: &str) {
 }
 
 /// 添加地址到 Kademlia 路由表
-pub fn add_kademlia_address(swarm: &mut Swarm<MyBehaviour>, peer_id: &PeerId, addr: libp2p::Multiaddr) {
+pub fn add_kademlia_address(
+    swarm: &mut Swarm<MyBehaviour>,
+    peer_id: &PeerId,
+    addr: libp2p::Multiaddr,
+) {
     swarm.behaviour_mut().kademlia.add_address(peer_id, addr);
 }
 
@@ -158,18 +160,5 @@ pub fn dial_addr(swarm: &mut Swarm<MyBehaviour>, addr: libp2p::Multiaddr) {
     match swarm.dial(addr.clone()) {
         Ok(()) => tracing::debug!("正在拨号地址: {}", addr),
         Err(e) => tracing::debug!("拨号地址 {} 失败: {}", addr, e),
-    }
-}
-
-// ============================================================================
-// 工具函数
-// ============================================================================
-
-/// 截断字符串到指定长度用于日志显示
-fn truncate_str(s: &str, max_len: usize) -> &str {
-    if s.len() >= max_len {
-        &s[..max_len]
-    } else {
-        s
     }
 }
