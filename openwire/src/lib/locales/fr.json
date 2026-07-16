@@ -98,5 +98,8 @@
     "config_saved_restart": "✅ Configuration sauvegardée. Redémarrez l'application pour appliquer les changements.",
     "config_save_failed": "❌ Échec de la sauvegarde",
     "restart_hint": "⚠️ La configuration des nœuds a été modifiée. Redémarrez l'application pour appliquer les changements.",
-    "loading_nodes": "Chargement de la configuration..."
+    "loading_nodes": "Chargement de la configuration...",
+    "sent_files": "Fichiers envoyés",
+    "no_sent_files": "Aucun fichier envoyé",
+    "revoke": "Révoquer"
 }

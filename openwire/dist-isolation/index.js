@@ -7,6 +7,7 @@ const ALLOWED_COMMANDS = new Set([
     'check_core_ready',
     'is_keyring_available',
     'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
+    'list_sent_files', 'delete_sent_file',
     'plugin:window|set_content_protected'
 ]);
 
@@ -15,7 +16,8 @@ const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dial
 const SENSITIVE_COMMANDS = new Set([
     'send', 'send_file', 'delete_identity', 'select_identity',
     'generate_identity', 'add_contact', 'delete_contact',
-    'request_file_download', 'set_download_dir'
+    'request_file_download', 'delete_sent_file',
+    'set_download_dir'
 ]);
 
 const RATE_LIMITS = {
@@ -34,6 +36,8 @@ const RATE_LIMITS = {
     load_messages: { maxCalls: 60, windowMs: 60000 },
     get_identity_qr_data: { maxCalls: 30, windowMs: 60000 },
     check_core_ready: { maxCalls: 300, windowMs: 60000 },
+    list_sent_files: { maxCalls: 60, windowMs: 60000 },
+    delete_sent_file: { maxCalls: 10, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -172,6 +176,14 @@ const VALIDATORS = {
     is_keyring_available: () => null,
     get_nodes_config: () => null,
     reset_nodes_config: () => null,
+    list_sent_files: () => null,
+    delete_sent_file: (p) => {
+        let err = requiredString(p.fileHashHex, 'fileHashHex');
+        if (err) return err;
+        if (!isHex(p.fileHashHex)) return 'fileHashHex must be hex';
+        if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
+        return null;
+    },
     save_nodes_config: (p) => {
         if (!Array.isArray(p.relayNodes)) return 'relayNodes must be an array';
         if (!Array.isArray(p.bootstrapNodes)) return 'bootstrapNodes must be an array';

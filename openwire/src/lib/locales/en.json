@@ -98,5 +98,11 @@
     "config_saved_restart": "✅ Config saved. Restart the app for changes to take effect.",
     "config_save_failed": "❌ Save failed",
     "restart_hint": "⚠️ Node config has been modified. Restart the app for changes to take effect.",
-    "loading_nodes": "Loading node config..."
+    "loading_nodes": "Loading node config...",
+    "sent_files": "Sent Files",
+    "no_sent_files": "No sent files",
+    "revoke": "Revoke",
+    "filename": "Filename",
+    "size": "Size",
+    "sent_at": "Sent At"
 }

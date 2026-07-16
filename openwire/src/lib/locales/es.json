@@ -98,5 +98,8 @@
     "config_saved_restart": "✅ Configuración guardada. Reinicie la aplicación para aplicar los cambios.",
     "config_save_failed": "❌ Error al guardar",
     "restart_hint": "⚠️ La configuración de nodos ha sido modificada. Reinicie la aplicación para que los cambios surtan efecto.",
-    "loading_nodes": "Cargando configuración de nodos..."
+    "loading_nodes": "Cargando configuración de nodos...",
+    "sent_files": "Enviados",
+    "no_sent_files": "No hay archivos enviados",
+    "revoke": "Revocar"
 }

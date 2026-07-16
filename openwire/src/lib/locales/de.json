@@ -98,5 +98,8 @@
     "config_saved_restart": "✅ Konfiguration gespeichert. Starten Sie die App neu, um die Änderungen zu übernehmen.",
     "config_save_failed": "❌ Speichern fehlgeschlagen",
     "restart_hint": "⚠️ Die Knotenkonfiguration wurde geändert. Starten Sie die App neu, um die neuen Einstellungen zu übernehmen.",
-    "loading_nodes": "Lade Knotenkonfiguration..."
+    "loading_nodes": "Lade Knotenkonfiguration...",
+    "sent_files": "Gesendete Dateien",
+    "no_sent_files": "Keine gesendeten Dateien",
+    "revoke": "Widerrufen"
 }

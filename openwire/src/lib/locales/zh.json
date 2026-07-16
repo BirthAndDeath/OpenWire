@@ -98,5 +98,11 @@
     "config_saved_restart": "✅ 节点配置已保存，重启应用后生效",
     "config_save_failed": "❌ 保存失败",
     "restart_hint": "⚠️ 节点配置已修改，重启应用后新配置才会生效",
-    "loading_nodes": "加载节点配置中..."
+    "loading_nodes": "加载节点配置中...",
+    "sent_files": "已发送文件",
+    "no_sent_files": "暂无已发送文件",
+    "revoke": "撤销",
+    "filename": "文件名",
+    "size": "大小",
+    "sent_at": "发送时间"
 }
