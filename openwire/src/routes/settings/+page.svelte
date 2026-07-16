@@ -10,13 +10,8 @@
     initSettingsStore,
     screenshotProtectionStore,
   } from "../../lib/settings";
-  import { open } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { invoke } from "@tauri-apps/api/core";
-  import {
-    downloadDir as getSystemDownloadDir,
-    documentDir as getSystemDocumentDir,
-  } from "@tauri-apps/api/path";
 
   // 语言选项
   const languages = [
@@ -36,12 +31,6 @@
 
   // 加载状态
   let isLoading = $state(true);
-
-  // 下载目录
-  let downloadDir = $state("");
-
-  // 上传文件搜寻目录
-  let uploadDir = $state("");
 
   // 截屏保护
   let screenshotProtection = $state(false);
@@ -99,46 +88,6 @@
       } catch (e) {
         console.error("检查 Keyring 可用性失败:", e);
         keyringCheckDone = true;
-      }
-
-      // 获取下载目录（前端持久化存储，未设置时 fallback 到系统下载文件夹）
-      try {
-        const saved = await getSetting<string>("download_dir");
-        if (saved) {
-          downloadDir = saved;
-        } else {
-          // 未设置时 fallback 到系统下载文件夹
-          downloadDir = await getSystemDownloadDir();
-          // 同步到后端核心，确保首次使用时下载目录正确
-          try {
-            await invoke("set_download_dir", { path: downloadDir });
-          } catch (e) {
-            console.error("同步默认下载目录到后端失败:", e);
-          }
-        }
-      } catch (e) {
-        console.error("获取下载目录失败:", e);
-        // 极端 fallback
-        try {
-          downloadDir = await getSystemDownloadDir();
-        } catch {}
-      }
-
-      // 获取上传文件搜寻目录（前端持久化存储，未设置时 fallback 到系统文档文件夹）
-      try {
-        const saved = await getSetting<string>("upload_dir");
-        if (saved) {
-          uploadDir = saved;
-        } else {
-          // 未设置时 fallback 到系统文档文件夹
-          uploadDir = await getSystemDocumentDir();
-        }
-      } catch (e) {
-        console.error("获取上传目录失败:", e);
-        // 极端 fallback
-        try {
-          uploadDir = await getSystemDocumentDir();
-        } catch {}
       }
 
       // 获取截屏保护设置
@@ -286,47 +235,6 @@
     goto("/");
   }
 
-  // 选择下载目录
-  async function selectDownloadDir() {
-    try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "选择下载目录",
-      });
-      if (selected) {
-        // 持久化到前端设置存储
-        await setSetting("download_dir", selected);
-        downloadDir = selected;
-        // 同步到后端核心，确保文件下载使用正确的目录
-        try {
-          await invoke("set_download_dir", { path: selected });
-        } catch (e) {
-          console.error("同步下载目录到后端失败:", e);
-        }
-      }
-    } catch (e) {
-      console.error("选择下载目录失败:", e);
-    }
-  }
-
-  // 选择上传文件搜寻目录
-  async function selectUploadDir() {
-    try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "选择上传文件搜寻目录",
-      });
-      if (selected) {
-        uploadDir = selected;
-        await setSetting("upload_dir", selected);
-      }
-    } catch (e) {
-      console.error("选择上传目录失败:", e);
-    }
-  }
-
   // 切换截屏保护
   async function toggleScreenshotProtection() {
     screenshotProtection = !screenshotProtection;
@@ -410,39 +318,6 @@
             aria-label={$_("screenshot_protection")}
           >
             <span class="toggle-knob"></span>
-          </button>
-        </div>
-      </section>
-
-      <!-- 文件设置：下载目录 + 上传文件搜寻目录 -->
-      <section class="settings-section">
-        <h2>{$_("file_settings")}</h2>
-
-        <!-- 下载目录 -->
-        <div class="dir-setting">
-          <div class="dir-setting-header">
-            <span class="dir-setting-label">{$_("download_settings")}</span>
-          </div>
-          <div class="dir-path">
-            <span class="dir-path-label">{$_("current_download_dir")}:</span>
-            <span class="dir-path-value">{downloadDir || $_("not_set")}</span>
-          </div>
-          <button class="select-dir-button" onclick={selectDownloadDir}>
-            📁 {$_("select_download_dir")}
-          </button>
-        </div>
-
-        <!-- 上传文件搜寻目录 -->
-        <div class="dir-setting">
-          <div class="dir-setting-header">
-            <span class="dir-setting-label">{$_("upload_settings")}</span>
-          </div>
-          <div class="dir-path">
-            <span class="dir-path-label">{$_("current_upload_dir")}:</span>
-            <span class="dir-path-value">{uploadDir || $_("not_set")}</span>
-          </div>
-          <button class="select-dir-button" onclick={selectUploadDir}>
-            📁 {$_("select_upload_dir")}
           </button>
         </div>
       </section>
