@@ -14,9 +14,9 @@
   "license": "AGPL-3.0",
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-dialog": "^2.7.0",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2",
-    "@tauri-apps/plugin-store": "^2.4.2",
+    "@tauri-apps/plugin-store": "^2.4.4",
     "jsqr": "^1.4.0",
     "qr": "^0.6.0",
     "svelte-i18n": "^4.0.1",
@@ -28,9 +28,9 @@
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tauri-apps/cli": "^2.11.2",
     "@types/node": "^26.0.0",
-    "svelte": "^5.56.3",
-    "svelte-check": "^4.6.0",
+    "svelte": "^5.56.6",
+    "svelte-check": "^4.7.3",
     "typescript": "~7.0.2",
-    "vite": "^8.1.4"
+    "vite": "^8.1.5"
   }
 }
