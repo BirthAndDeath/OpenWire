@@ -8,7 +8,7 @@ default = []
 
 [dependencies]
 libp2p = { version = "0.56.0", features = ["request-response", "tokio", "cbor"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 rand = "0.8"
 lru = "0.18"
 tracing.workspace = true
