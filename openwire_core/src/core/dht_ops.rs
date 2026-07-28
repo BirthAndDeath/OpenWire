@@ -17,13 +17,16 @@ impl ChatCore {
         _peer_id: &str,
         mlkem_pubkey_hex: &str,
     ) {
+        
         // 通过 P2pActor 发布身份到 DHT
-        let _ = self.p2p_handle.tx.try_send(
-            crate::actor::ActorCommand::Custom(P2pCommand::PublishIdentity {
+        if let Err(e) = self.p2p_handle.tx.try_send(
+            P2pCommand::PublishIdentity {
                 mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
                 mlkem_pubkey_hex: mlkem_pubkey_hex.to_string(),
-            }),
-        );
+            },
+        ) {
+            tracing::warn!("Failed to publish identity via P2pActor: {e:?}");
+        }
 
         tracing::info!(
             "Published identity to DHT network: {} (ML-KEM: {})",

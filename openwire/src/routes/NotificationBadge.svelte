@@ -26,7 +26,8 @@
     onNotification((msg) => add(msg));
   });
 
-  function toggle() {
+function toggle(e: MouseEvent) {
+    e.stopPropagation();
     expanded = !expanded;
     if (expanded) {
       unreadCount = 0;

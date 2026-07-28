@@ -68,7 +68,7 @@ impl CoreHandle {
         &self,
         sender_mldsa_pubkey_hex: &str,
         file_hash: [u8; 32],
-        save_path: Option<PathBuf>,
+        save_path: PathBuf,
     ) -> bool {
         self.send_cmd(ChatCommand::RequestFileDownload {
             sender_mldsa_pubkey_hex: sender_mldsa_pubkey_hex.to_string(),
@@ -76,17 +76,6 @@ impl CoreHandle {
             save_path,
         })
         .await
-    }
-
-    /// 设置下载目录
-    pub async fn set_download_dir(&self, path: PathBuf) -> bool {
-        self.send_cmd(ChatCommand::SetDownloadDir { path }).await
-    }
-
-    /// 注册文件供下载
-    pub async fn register_file_for_download(&self, file_id: [u8; 32], file_path: PathBuf) -> bool {
-        self.send_cmd(ChatCommand::RegisterFileForDownload { file_id, file_path })
-            .await
     }
 
     /// 删除联系人
@@ -192,16 +181,19 @@ impl CoreHandle {
             .unwrap_or("unknown")
             .to_string();
 
-        // 记录到已发送文件历史
+        // 记录到已发送文件历史（sent_files 表）
         if let Some(pool) = crate::storage::pool() {
-            let _ = crate::storage::add_sent_file(
+            if let Err(e) = crate::storage::add_sent_file(
                 pool,
                 &file_hash,
                 file_path.to_str().unwrap_or(""),
                 &filename,
                 total_size,
             )
-            .await;
+            .await
+            {
+                tracing::warn!("记录已发送文件失败: {e}");
+            }
         }
 
         let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
@@ -212,13 +204,6 @@ impl CoreHandle {
                 return false;
             }
         };
-
-        if !self
-            .register_file_for_download(file_id, file_path.to_path_buf())
-            .await
-        {
-            return false;
-        }
 
         self.send_cmd(ChatCommand::SendMessage {
             mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),

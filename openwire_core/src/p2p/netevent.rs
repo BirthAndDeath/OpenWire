@@ -31,6 +31,11 @@ pub enum NetEventRequest {
         /// 发送者的当前 ML-KEM 公钥 hex（随通知直接传递，无需 DHT 查询）
         mlkem_pubkey_hex: String,
     },
+    /// 通过中继节点发现对端：向中继查询某公钥对应的 PeerID
+    DiscoverPeer {
+        /// 要查询的 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+    },
 }
 
 /// 网络事件响应
@@ -42,4 +47,13 @@ pub enum NetEventRequest {
 pub enum NetEventResponse {
     /// 确认收到
     Ack,
+    /// 中继查询结果：返回对端的 ML-DSA 公钥、PeerID 和 ML-KEM 公钥
+    PeerInfo {
+        /// 对端的 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 对端的 PeerID（Base58 编码）
+        peer_id: String,
+        /// 对端的 ML-KEM 公钥 hex
+        mlkem_pubkey_hex: String,
+    },
 }

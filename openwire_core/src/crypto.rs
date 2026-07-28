@@ -68,6 +68,7 @@ pub fn encrypt_message(
 
     // 3. 生成随机 nonce
     let nonce_bytes: [u8; 12] = rand::random();
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // 4. 使用 AES-GCM 加密数据
@@ -154,6 +155,7 @@ pub fn decrypt_message(
         return Err(crate::error::CryptoError::EncryptedDataTooShort);
     }
     let (nonce_bytes, ciphertext) = rest.split_at(12);
+    #[allow(deprecated)]
     let nonce = Nonce::from_slice(nonce_bytes);
 
     // 6. 使用 AES-GCM 解密

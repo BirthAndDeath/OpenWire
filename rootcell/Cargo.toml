@@ -1,6 +1,6 @@
 [package]
 name = "rootcell"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [features]
@@ -14,6 +14,8 @@ tracing = "0.1"
 aes-gcm = "0.11.0"
 blake3 = "1.8.5"
 rand = "0.10.2"
+hkdf = "0.12"
+sha2 = "0.10"
 
 keyring = { version = "4.1.4" }
 keyring-core = "1.0.0"

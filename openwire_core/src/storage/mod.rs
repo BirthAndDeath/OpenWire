@@ -28,9 +28,11 @@ pub use message::{
     list_pending_by_peer, mark_failed, mark_pending, mark_sent, mark_sent_batch, mark_sent_by_hash,
     update_message_hash,
 };
-pub use sent_file::{add_sent_file, get_sent_file};
+pub use sent_file::{
+    SentFile, add_sent_file, delete_sent_file, get_sent_file, list_all_sent_files, verify_sent_file,
+};
 use sqlx::{
-    FromRow, Pool, Sqlite,
+    Pool, Sqlite,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{path::Path, time::Duration};
@@ -86,6 +88,9 @@ pub async fn init_path(path: &Path) -> StorageResult<()> {
     if is_new {
         crate::storage::migrations::run(&pool).await?;
         tracing::info!("New database initialized");
+    } else {
+        // 对已有数据库也执行迁移，确保新迁移（如 sent_files 表）被应用
+        crate::storage::migrations::run(&pool).await?;
     }
 
     SQLITE_DB_POOL

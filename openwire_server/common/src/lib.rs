@@ -4,12 +4,20 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use libp2p::futures::StreamExt;
-use libp2p::kad::{self, store::MemoryStore, Config as KadConfig};
+use libp2p::kad::{self, Config as KadConfig, store::MemoryStore};
+use libp2p::request_response::{Config as RrConfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, identity, noise, ping, relay, tcp, yamux, PeerId, StreamProtocol, SwarmBuilder};
+use libp2p::{
+    PeerId, StreamProtocol, SwarmBuilder, connection_limits, identify, identity, memory_connection_limits,
+    noise, ping, relay, tcp, yamux,
+};
+
+use openwire_core::p2p::dht_cache::DhtCache;
+use openwire_core::p2p::netevent::{NetEventRequest, NetEventResponse};
 
 const DHT_RELAY_INDEX_KEY: &str = "relay_nodes_public";
 const PROTOCOL_KAD: StreamProtocol = StreamProtocol::new("/chat/kad/0.0.1");
+const PROTOCOL_NETEVENT: StreamProtocol = StreamProtocol::new("/chat/rr_netevent/0.0.1");
 
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
@@ -17,11 +25,16 @@ struct RelayBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    rr_netevent: cbor::Behaviour<NetEventRequest, NetEventResponse>,
+    limits: connection_limits::Behaviour,
+    memory_limits: memory_connection_limits::Behaviour,
 }
 
 fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
     if path.exists() {
-        return Ok(identity::Keypair::from_protobuf_encoding(&std::fs::read(path)?)?);
+        return Ok(identity::Keypair::from_protobuf_encoding(&std::fs::read(
+            path,
+        )?)?);
     }
     let kp = identity::Keypair::generate_ed25519();
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -49,6 +62,8 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
         .set_provider_record_ttl(Some(Duration::from_secs(3600)))
         .set_publication_interval(Some(Duration::from_secs(3600)));
 
+    let dht_cache = DhtCache::new();
+
     let mut swarm = SwarmBuilder::with_existing_identity(kp)
         .with_tokio()
         .with_tcp(
@@ -60,9 +75,7 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
         .with_quic()
         .with_dns()
         .map_err(|e| anyhow::anyhow!("dns: {e}"))?
-        .with_relay_client(noise::Config::new, yamux::Config::default)
-        .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
-        .with_behaviour(|key, _relay_client| {
+        .with_behaviour(|key| {
             let relay_cfg = relay::Config {
                 max_circuits: 50,
                 max_circuits_per_peer: 5,
@@ -76,7 +89,8 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             let relay = relay::Behaviour::new(key.public().to_peer_id(), relay_cfg);
 
             let pid = key.public().to_peer_id();
-            let mut kademlia = kad::Behaviour::with_config(pid, MemoryStore::new(pid), kad_config.clone());
+            let mut kademlia =
+                kad::Behaviour::with_config(pid, MemoryStore::new(pid), kad_config.clone());
             for node in &bootstrap_nodes {
                 if let (Ok(pid), Ok(addr)) = (PeerId::from_str(&node[0]), node[1].parse()) {
                     kademlia.add_address(&pid, addr);
@@ -90,14 +104,42 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             );
             let ping = ping::Behaviour::new(ping::Config::new());
 
-            Ok(RelayBehaviour { relay, kademlia, identify, ping })
+            let netevent_codec = Codec::<NetEventRequest, NetEventResponse>::default()
+                .set_request_size_maximum(65536)
+                .set_response_size_maximum(1024);
+            let netevent_rr_config = RrConfig::default()
+                .with_request_timeout(Duration::from_secs(15))
+                .with_max_concurrent_streams(10);
+            let rr_netevent = cbor::Behaviour::with_codec(
+                netevent_codec,
+                [(PROTOCOL_NETEVENT, ProtocolSupport::Full)],
+                netevent_rr_config,
+            );
+
+            let limits = connection_limits::Behaviour::new(
+                connection_limits::ConnectionLimits::default()
+                    .with_max_established_incoming(Some(500))
+                    .with_max_established_outgoing(Some(50)),
+            );
+            let memory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.05);
+
+            Ok(RelayBehaviour {
+                relay,
+                kademlia,
+                identify,
+                ping,
+                rr_netevent,
+                limits,
+                memory_limits,
+            })
         })
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .build();
 
     swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;
+    swarm.listen_on(format!("/ip6/::/tcp/{port}").parse()?)?;
     swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
-    swarm.listen_on("/p2p-circuit".parse()?).ok();
+    swarm.listen_on(format!("/ip6/::/udp/{port}/quic-v1").parse()?)?;
 
     let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY.as_bytes().to_vec());
     swarm.behaviour_mut().kademlia.start_providing(relay_key)?;
@@ -112,6 +154,91 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             )) => {
                 tracing::info!("relay reservation from {src_peer_id}");
             }
+            // 处理 FriendOnline 通知：缓存 (pubkey → PeerID) 映射
+            SwarmEvent::Behaviour(RelayBehaviourEvent::RrNetevent(
+                libp2p::request_response::Event::Message {
+                    peer,
+                    message:
+                        libp2p::request_response::Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => {
+                match &request {
+                    NetEventRequest::FriendOnline {
+                        mldsa_pubkey_hex,
+                        peer_id,
+                        ..
+                    } => {
+                        if *peer_id == peer.to_string() {
+                            let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                            tracing::info!(
+                                "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                                peer
+                            );
+                        } else {
+                            tracing::warn!(
+                                "relay FriendOnline PeerID mismatch: claimed={}, actual={}",
+                                peer_id,
+                                peer
+                            );
+                        }
+                        let _ = swarm
+                            .behaviour_mut()
+                            .rr_netevent
+                            .send_response(channel, NetEventResponse::Ack);
+                    }
+                    NetEventRequest::DiscoverPeer { mldsa_pubkey_hex } => {
+                        let peer_id = dht_cache
+                            .get_peerid_by_pubkey(mldsa_pubkey_hex)
+                            .ok()
+                            .flatten();
+                        let mlkem = dht_cache
+                            .get_mlkem_pubkey(mldsa_pubkey_hex)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+match peer_id {
+                        Some(pid) => {
+                            tracing::info!(
+                                "=== RELAY DISCOVER HIT: {}.. -> {} ===",
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                                pid
+                            );
+                                let _ = swarm.behaviour_mut().rr_netevent.send_response(
+                                    channel,
+                                    NetEventResponse::PeerInfo {
+                                        mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
+                                        peer_id: pid.to_string(),
+                                        mlkem_pubkey_hex: mlkem,
+                                    },
+                                );
+                            }
+                            None => {
+                                tracing::info!(
+                                    "=== RELAY DISCOVER MISS: {}.. ===",
+                                    &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
+                                );
+                                let _ = swarm.behaviour_mut().rr_netevent.send_response(
+                                    channel,
+                                    NetEventResponse::PeerInfo {
+                                        mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
+                                        peer_id: String::new(),
+                                        mlkem_pubkey_hex: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // 预留：当 NetEventRequest 新增变体时，直接忽略
+                    _ => {
+                        tracing::trace!("relay ignored NetEventRequest: {:?}", request);
+                    }
+                }
+            }
+            // 忽略其他事件
             _ => {}
         }
     }

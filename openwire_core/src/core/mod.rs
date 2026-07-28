@@ -79,12 +79,8 @@ pub struct ChatCore {
     /// 仅在内存中保留，不持久化
     /// 使用 Zeroizing 包装，确保 drop 时自动清零内存
     pub(crate) mldsa_private_key: Option<Zeroizing<Vec<u8>>>,
-    /// 文件下载目录
-    pub(crate) download_dir: PathBuf,
     /// 活跃的文件传输状态（file_id -> FileTransferState）
     pub(crate) file_transfers: HashMap<String, FileTransferState>,
-    /// 文件路径映射（file_id -> 本地文件路径），用于发送方查找文件
-    pub(crate) file_path_map: HashMap<[u8; 32], PathBuf>,
     /// 上次文件传输超时扫描时间（限制扫描频率，避免每分片触发）
     pub(crate) last_file_timeout_scan: std::time::Instant,
     /// 内存 DHT 缓存
@@ -183,8 +179,7 @@ impl ChatCore {
             }
         }
 
-        // 加载节点配置（relay 和 bootstrap 节点）
-        let relay_nodes: Vec<(String, String)> = cfg.relay_nodes.clone();
+        // 加载节点配置（bootstrap 节点）
         let bootstrap_nodes: Vec<(String, String)> = cfg.bootstrap_nodes.clone();
 
         let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), &bootstrap_nodes)
@@ -200,20 +195,6 @@ impl ChatCore {
         let peer_id_for_dht = peer_id;
         // 保存 ML-KEM pubkey 用于后续 DHT 发布
         let mlkem_pubkey_hex_for_dht = mlkem_pubkey_hex.clone();
-
-        let download_dir = cfg
-            .download_dir
-            .clone()
-            .unwrap_or_else(|| cfg.data_dir.join("downloads"));
-
-        // 确保下载目录存在
-        if let Err(e) = std::fs::create_dir_all(&download_dir) {
-            tracing::warn!(
-                "Failed to create download directory {:?}: {}",
-                download_dir,
-                e
-            );
-        }
 
         let shutdown_token = CancellationToken::new();
 
@@ -248,9 +229,7 @@ impl ChatCore {
             mldsa_identity_id: Some(mldsa_identity_id),
             mlkem_pubkey_hex: Some(mlkem_pubkey_hex_for_dht),
             mldsa_private_key: Some(mldsa_private_key),
-            download_dir,
             file_transfers: HashMap::new(),
-            file_path_map: HashMap::new(),
             last_file_timeout_scan: std::time::Instant::now(),
             dht_cache,
             connected_peers: std::collections::HashMap::new(),
@@ -279,12 +258,12 @@ impl ChatCore {
     pub(crate) async fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
         let _ = self
             .p2p_handle
-            .send(crate::actor::ActorCommand::Custom(
+            .send(
                 P2pCommand::SendMessage {
                     peer_id: peerid,
                     message,
                 },
-            ))
+            )
             .await;
     }
 
@@ -399,12 +378,12 @@ impl Drop for ChatCore {
         let _ = self
             .p2p_handle
             .tx
-            .try_send(crate::actor::ActorCommand::Custom(
+            .try_send(
                 P2pCommand::SaveRoutingTable,
-            ));
+            );
         let _ = self
             .p2p_handle
             .tx
-            .try_send(crate::actor::ActorCommand::Custom(P2pCommand::Shutdown));
+            .try_send(P2pCommand::Shutdown);
     }
 }

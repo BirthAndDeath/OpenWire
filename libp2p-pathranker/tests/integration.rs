@@ -10,7 +10,9 @@ async fn test_two_nodes_connect() {
     let mut node_a = SmartNode::new_test().await;
     let mut node_b = SmartNode::new_test().await;
 
-    let b_addr: Multiaddr = format!("/memory/{}", rand::random::<u64>()).parse().unwrap();
+    let b_addr: Multiaddr = format!("/memory/{}", rand::random::<u64>())
+        .parse()
+        .unwrap();
     let b_id = *node_b.swarm.local_peer_id();
 
     node_b.listen(b_addr.clone()).unwrap();
@@ -36,7 +38,10 @@ async fn test_two_nodes_connect() {
         }
     }
 
-    assert!(node_a.swarm.is_connected(&b_id), "nodes should connect via memory transport");
+    assert!(
+        node_a.swarm.is_connected(&b_id),
+        "nodes should connect via memory transport"
+    );
 }
 
 /// 评分查询：建立连接后发送查询，协议不应 panic。
@@ -45,7 +50,9 @@ async fn test_score_query_sends_safely() {
     let mut node_a = SmartNode::new_test().await;
     let mut node_b = SmartNode::new_test().await;
 
-    let b_addr: Multiaddr = format!("/memory/{}", rand::random::<u64>()).parse().unwrap();
+    let b_addr: Multiaddr = format!("/memory/{}", rand::random::<u64>())
+        .parse()
+        .unwrap();
     let b_id = *node_b.swarm.local_peer_id();
 
     node_b.listen(b_addr.clone()).unwrap();

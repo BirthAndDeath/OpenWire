@@ -1,5 +1,4 @@
-use crate::actor::p2p::P2pCommand;
-use crate::{command::ChatCommand, core::ChatCore, error::CoreError};
+use crate::{actor::p2p::P2pCommand, command::ChatCommand, core::ChatCore, error::CoreError};
 
 impl ChatCore {
     /// 处理单个控制命令
@@ -70,18 +69,6 @@ impl ChatCore {
                 self.handle_file_download_request(&sender_mldsa_pubkey_hex, file_hash, save_path)
                     .await;
             }
-            ChatCommand::SetDownloadDir { path } => {
-                self.handle_set_download_dir(path);
-            }
-            ChatCommand::RegisterFileForDownload { file_id, file_path } => {
-                let file_id_hex = hex::encode(file_id);
-                tracing::info!(
-                    "Registering file for download: file_id={}.., path={:?}",
-                    &file_id_hex[..16],
-                    file_path
-                );
-                self.file_path_map.insert(file_id, file_path);
-            }
             ChatCommand::DhtPublishIdentity {
                 mldsa_pubkey_hex,
                 peer_id,
@@ -105,9 +92,9 @@ impl ChatCore {
                 if let Err(e) = self
                     .p2p_handle
                     .tx
-                    .try_send(crate::actor::ActorCommand::Custom(
+                    .try_send(
                         P2pCommand::RelayServerConfig { allowed },
-                    ))
+                    )
                 {
                     tracing::warn!("Failed to send RelayServerConfig: {e:?}");
                 }
@@ -120,9 +107,9 @@ impl ChatCore {
                 if let Err(e) = self
                     .p2p_handle
                     .tx
-                    .try_send(crate::actor::ActorCommand::Custom(
+                    .try_send(
                         P2pCommand::SaveRoutingTable,
-                    ))
+                    )
                 {
                     tracing::warn!("Failed to send periodic SaveRoutingTable: {e:?}");
                 }
@@ -139,42 +126,5 @@ impl ChatCore {
                 self.publish_current_identity_to_dht();
             }
         }
-    }
-
-    /// 安全设置下载目录：确保路径在 data_dir 内，防止任意路径写入
-    fn handle_set_download_dir(&mut self, path: std::path::PathBuf) {
-        let canonical_data = match self.data_dir.canonicalize() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("无法规范化 data_dir {:?}: {}", self.data_dir, e);
-                return;
-            }
-        };
-        let canonical_path = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => {
-                if let Err(e) = std::fs::create_dir_all(&path) {
-                    tracing::error!("无法创建下载目录 {:?}: {}", path, e);
-                    return;
-                }
-                match path.canonicalize() {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("无法规范化下载路径 {:?}: {}", path, e);
-                        return;
-                    }
-                }
-            }
-        };
-        if !canonical_path.starts_with(&canonical_data) {
-            tracing::error!(
-                "拒绝设置下载目录: {:?} 不在 data_dir {:?} 内",
-                canonical_path,
-                canonical_data
-            );
-            return;
-        }
-        self.download_dir = canonical_path;
-        tracing::info!("Download directory set to {:?}", self.download_dir);
     }
 }

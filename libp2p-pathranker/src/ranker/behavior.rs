@@ -185,17 +185,25 @@ impl PathType {
     pub fn from_multiaddr(addr: &Multiaddr) -> Self {
         let mut has_quic = false;
         let mut has_circuit = false;
+        let mut has_webrtc = false;
+        let mut has_ws = false;
         for p in addr.iter() {
             match p {
                 Protocol::P2pCircuit => has_circuit = true,
                 Protocol::Quic | Protocol::QuicV1 => has_quic = true,
+                Protocol::WebRTC | Protocol::WebRTCDirect => has_webrtc = true,
+                Protocol::Ws(_) | Protocol::Wss(_) => has_ws = true,
                 _ => {}
             }
         }
         if has_circuit {
             PathType::Relay
+        } else if has_webrtc {
+            PathType::Direct
         } else if has_quic {
             PathType::Quic
+        } else if has_ws {
+            PathType::Direct
         } else {
             PathType::Direct
         }
@@ -230,6 +238,8 @@ pub struct BehaviorRanker {
     config: RankerConfig,
     self_score: f64,
     alert_level: AlertLevel,
+    /// 上次 feedback() 是否触发了突变惩罚，由 consume_mutation_flag() 消费
+    mutation_flagged: bool,
 }
 
 impl BehaviorRanker {
@@ -239,6 +249,7 @@ impl BehaviorRanker {
             config,
             self_score: 1.0,
             alert_level: AlertLevel::Normal,
+            mutation_flagged: false,
         }
     }
 
@@ -278,12 +289,30 @@ impl BehaviorRanker {
         self.self_score < threshold
     }
 
+    /// 消费突变标志：如果上次 feedback() 触发了突变惩罚，返回 true 并清除标志。
+    /// 由 SmartNode 在 dial 失败后调用，以通知 AlertEvaluator。
+    pub fn consume_mutation_flag(&mut self) -> bool {
+        let flag = self.mutation_flagged;
+        self.mutation_flagged = false;
+        flag
+    }
+
     /// 获取某 peer 的地址评分表。如果该 peer 不存在则创建空表。
     /// 当全局 peer 数达到 `max_peers` 时，LRU 淘汰最近更新最早的 peer。
     pub fn get_or_insert(&mut self, peer: &PeerId) -> &mut HashMap<Multiaddr, ScoreEntry> {
         if self.scores.len() >= self.config.max_peers && !self.scores.contains_key(peer) {
-            let evict = self.scores.iter()
-                .min_by_key(|(_, map)| map.values().map(|e| e.last_updated).min().unwrap_or(Instant::now()))
+            let evict = self
+                .scores
+                .iter()
+                .min_by(|(_, map_a), (_, map_b)| {
+                    let avg_a = map_a.values().map(|e| e.score).sum::<f64>()
+                        / (map_a.len() as f64).max(1.0);
+                    let avg_b = map_b.values().map(|e| e.score).sum::<f64>()
+                        / (map_b.len() as f64).max(1.0);
+                    avg_a
+                        .partial_cmp(&avg_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|(k, _)| *k);
             if let Some(k) = evict {
                 self.scores.remove(&k);
@@ -357,7 +386,9 @@ impl BehaviorRanker {
             })
             .collect();
 
-        let has_valid = scored.iter().any(|(_, _, credit)| *credit >= credit_threshold);
+        let has_valid = scored
+            .iter()
+            .any(|(_, _, credit)| *credit >= credit_threshold);
         if !has_valid && !scored.is_empty() {
             for (_, _, credit) in scored.iter_mut() {
                 *credit = self.config.initial_credit;
@@ -373,8 +404,16 @@ impl BehaviorRanker {
         if result.len() > 1 {
             let exploration_budget = self.config.exploration_budget_at(self.alert_level);
             let diversity_k = self.config.diversity_top_k_at(self.alert_level);
-            let effective_exploration = if self.is_overloaded() { 0.0 } else { exploration_budget };
-            let effective_k = if self.is_overloaded() { 1.min(result.len()) } else { diversity_k.min(result.len()) };
+            let effective_exploration = if self.is_overloaded() {
+                0.0
+            } else {
+                exploration_budget
+            };
+            let effective_k = if self.is_overloaded() {
+                1.min(result.len())
+            } else {
+                diversity_k.min(result.len())
+            };
 
             let k = effective_k;
             let top: Vec<_> = result[..k].to_vec();
@@ -383,11 +422,17 @@ impl BehaviorRanker {
                 .iter()
                 .enumerate()
                 .map(|(i, _)| {
-                    if k == 1 { 1.0 }
-                    else if self.alert_level >= AlertLevel::Defensive { 1.0 / k as f64 }
-                    else if i == 0 { 0.7 }
-                    else if i == 1 { 0.2 }
-                    else { 0.1 / (k - 2) as f64 }
+                    if k == 1 {
+                        1.0
+                    } else if self.alert_level >= AlertLevel::Defensive {
+                        1.0 / k as f64
+                    } else if i == 0 {
+                        0.7
+                    } else if i == 1 {
+                        0.2
+                    } else {
+                        0.1 / (k - 2) as f64
+                    }
                 })
                 .collect();
 
@@ -435,13 +480,7 @@ impl BehaviorRanker {
     ///
     /// 延迟趋势检测：如果最近 2 次延迟 EWMA 上升超过 20%，信用 -0.5。
     /// 这个机制约束了"慢变量"信用分，防止延迟恶化后信用仍高。
-    pub fn feedback(
-        &mut self,
-        peer: &PeerId,
-        addr: &Multiaddr,
-        latency: Duration,
-        success: bool,
-    ) {
+    pub fn feedback(&mut self, peer: &PeerId, addr: &Multiaddr, latency: Duration, success: bool) {
         let alpha = self.config.alpha;
         let decay_timeout = self.config.decay_timeout;
         let recent_window = self.config.recent_window;
@@ -456,7 +495,10 @@ impl BehaviorRanker {
             Some(latency.as_secs_f64() * 1000.0)
         };
 
-        let entry = self.get_or_insert_entry(peer, addr, latency_ms.unwrap_or(500.0), max_addrs_per_peer);
+        let entry =
+            self.get_or_insert_entry(peer, addr, latency_ms.unwrap_or(500.0), max_addrs_per_peer);
+
+        let mut triggered_mutation = false;
 
         if let Some(l_ms) = latency_ms {
             entry.latency_ewma = alpha * l_ms + (1.0 - alpha) * entry.latency_ewma;
@@ -506,11 +548,16 @@ impl BehaviorRanker {
                 }
             }
 
-            // 突变观察期内快速恢复
+            // 突变观察期内快速恢复：需连续 3 次成功
             if let Some(until) = entry.mutation_penalty_until {
                 if now < until {
-                    let success_count = entry.recent_success.iter().filter(|&&s| s).count();
-                    if success_count >= 3 {
+                    let consecutive = entry
+                        .recent_success
+                        .iter()
+                        .rev()
+                        .take_while(|&&s| s)
+                        .count();
+                    if consecutive >= 3 {
                         entry.success_rate = 0.5;
                         entry.credit = 50.0;
                         entry.score = 0.5;
@@ -532,6 +579,7 @@ impl BehaviorRanker {
                     entry.score = (entry.score * 0.3).max(0.0);
                     entry.recovery_needed = recovery_success_threshold;
                     entry.mutation_penalty_until = Some(now + mutation_observation);
+                    triggered_mutation = true;
                 } else {
                     entry.credit = (entry.credit - 0.5).max(0.0);
                 }
@@ -540,6 +588,7 @@ impl BehaviorRanker {
 
         entry.last_updated = now;
         entry.last_used = now;
+        self.mutation_flagged = triggered_mutation;
     }
 
     /// 注入邻居评分（通过协作协议获取的远程评分）。
@@ -563,12 +612,7 @@ impl BehaviorRanker {
 
     /// 更新某 peer 某地址的远程自评分数。
     /// 在收到该 peer 的直接评分响应时调用，存储其声明的负载等级。
-    pub fn set_peer_self_score(
-        &mut self,
-        peer: &PeerId,
-        addr: &Multiaddr,
-        peer_self_score: f64,
-    ) {
+    pub fn set_peer_self_score(&mut self, peer: &PeerId, addr: &Multiaddr, peer_self_score: f64) {
         let entry = self.get_or_insert_entry(peer, addr, 500.0, self.config.max_addrs_per_peer);
         entry.peer_self_score = peer_self_score.clamp(0.0, 1.0);
     }
@@ -578,8 +622,11 @@ impl BehaviorRanker {
         self.scores
             .get(peer)
             .and_then(|map| {
-                map.iter()
-                    .max_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap_or(std::cmp::Ordering::Equal))
+                map.iter().max_by(|a, b| {
+                    a.1.score
+                        .partial_cmp(&b.1.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
             })
             .map(|(addr, _)| addr.clone())
     }
@@ -597,7 +644,11 @@ impl BehaviorRanker {
         if map.len() >= max_addrs
             && let Some(lowest) = map
                 .iter()
-                .min_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by(|a, b| {
+                    a.1.score
+                        .partial_cmp(&b.1.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|(k, _)| k.clone())
         {
             map.remove(&lowest);
@@ -649,7 +700,10 @@ mod tests {
 
     #[test]
     fn test_rank_orders_by_score() {
-        let mut ranker = BehaviorRanker::new(RankerConfig { diversity_top_k: 1, ..Default::default() });
+        let mut ranker = BehaviorRanker::new(RankerConfig {
+            diversity_top_k: 1,
+            ..Default::default()
+        });
         let peer = PeerId::random();
         let a: Multiaddr = "/ip4/10.0.0.1/tcp/8080".parse().unwrap();
         let b: Multiaddr = "/ip4/10.0.0.2/tcp/8080".parse().unwrap();
@@ -672,7 +726,10 @@ mod tests {
 
     #[test]
     fn test_credit_threshold_filter() {
-        let config = RankerConfig { credit_threshold: 60.0, ..Default::default() };
+        let config = RankerConfig {
+            credit_threshold: 60.0,
+            ..Default::default()
+        };
         let mut ranker = BehaviorRanker::new(config);
         let peer = PeerId::random();
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/8080".parse().unwrap();
@@ -686,6 +743,9 @@ mod tests {
         let config = RankerConfig::default();
         assert_eq!(config.credit_threshold_at(AlertLevel::Shelter), 75.0);
         assert_eq!(config.credit_threshold_at(AlertLevel::Normal), 30.0);
-        assert!(config.exploration_budget_at(AlertLevel::Defensive) < config.exploration_budget_at(AlertLevel::Normal));
+        assert!(
+            config.exploration_budget_at(AlertLevel::Defensive)
+                < config.exploration_budget_at(AlertLevel::Normal)
+        );
     }
 }

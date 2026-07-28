@@ -43,7 +43,21 @@ pub const TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// 用于验证文件完整性（下载完成后比对哈希）。
 /// 使用 8KB 缓冲区流式读取，避免大文件占用过多内存。
 pub async fn compute_file_hash(file_path: &Path) -> FileTransferResult<[u8; 32]> {
-    let mut file = tokio::fs::File::open(file_path).await?;
+    let mut file = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let mut std_opts = std::fs::OpenOptions::new();
+            std_opts.read(true);
+            std_opts.share_mode(0x00000001 | 0x00000002 | 0x00000004);
+            let std_file = std_opts.open(file_path)?;
+            tokio::fs::File::from_std(std_file)
+        }
+        #[cfg(not(windows))]
+        {
+            tokio::fs::File::open(file_path).await?
+        }
+    };
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
     loop {
@@ -98,4 +112,40 @@ pub struct FileTransferState {
     pub status: TransferStatus,
     /// 开始时间
     pub started_at: std::time::Instant,
+}
+
+impl FileTransferState {
+    /// 计算已接收字节数（最后一个分片可能小于 chunk_size）
+    pub fn received_bytes(&self) -> u64 {
+        if self.total_chunks == 0 {
+            return 0;
+        }
+        let last_chunk_size = if self.total_size % self.chunk_size as u64 == 0 {
+            self.chunk_size as u64
+        } else {
+            self.total_size % self.chunk_size as u64
+        };
+        let last_idx = self.total_chunks - 1;
+        self.received_chunks
+            .iter()
+            .map(|&idx| {
+                if idx == last_idx {
+                    last_chunk_size
+                } else {
+                    self.chunk_size as u64
+                }
+            })
+            .sum()
+    }
+
+    /// 持久化已接收分片列表到状态文件（断点续传）
+    pub fn persist_state(&self, state_path: &Path) {
+        let csv: String = self
+            .received_chunks
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = std::fs::write(state_path, &csv);
+    }
 }

@@ -28,11 +28,13 @@ pub fn spawn_all(
         shutdown_token.clone(),
     );
 
-    // 在线消息重试（1秒）
+    // 在线消息重试（10秒间隔，降低 CPU 开销和日志噪声；
+    // 对于大多数场景，10s 延迟对用户体验影响可忽略，
+    // 且减少重试频率有助于降低 P2pActor 的通道压力）
     spawn_interval_task(
         &rt_handle,
         "online_retry",
-        Duration::from_secs(1),
+        Duration::from_secs(10),
         || ChatCommand::TimerRetryPendingOnline,
         cmd_tx.clone(),
         shutdown_token.clone(),
@@ -48,25 +50,17 @@ pub fn spawn_all(
         shutdown_token.clone(),
     );
 
-    // 联系人 DHT 发现维护（5分钟）
-    spawn_interval_task(
-        &rt_handle,
-        "connection_maintenance",
-        Duration::from_secs(300),
-        || ChatCommand::TimerDiscoverAllContacts,
-        cmd_tx.clone(),
-        shutdown_token.clone(),
-    );
-
     // DHT 记录清理（1小时）
     spawn_interval_task(
         &rt_handle,
         "dht_cleanup",
         Duration::from_secs(3600),
         || ChatCommand::TimerCleanupDht,
-        cmd_tx,
-        shutdown_token,
+        cmd_tx.clone(),
+        shutdown_token.clone(),
     );
+
+    // 已发送文件有效性验证由 handle_file_download_request 按需触发
 }
 
 /// 启动一个简单的间隔定时器任务。

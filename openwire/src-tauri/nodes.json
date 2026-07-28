@@ -1,5 +1,7 @@
 {
   "relay_nodes": [
+    ["12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P", "/ip4/206.237.12.198/tcp/44909"],
+    ["12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P", "/ip4/206.237.12.198/udp/44909/quic-v1"]
   ],
   "bootstrap_nodes": [
     ["QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN", "/dnsaddr/sv15.bootstrap.libp2p.io"],

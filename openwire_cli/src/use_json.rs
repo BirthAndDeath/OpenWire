@@ -1,5 +1,6 @@
 use crate::App;
 use crate::error::CliError;
+use hex;
 use openwire_core::storage;
 use openwire_core::{IncomingMessage, MessageEvent, validate_mldsa_pubkey_hex};
 use serde_json::json;
@@ -274,6 +275,152 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             let error_output = json!({
                                 "type": "error",
                                 "data": "缺少 mldsa_pubkey_hex 或 message 字段",
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let err_str =
+                                serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                    r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                });
+                            eprintln!("{}", err_str);
+                        }
+                    }
+                    "send_file" => {
+                        if let (Some(mldsa_pubkey_hex), Some(file_path)) = (
+                            parsed.get("mldsa_pubkey_hex").and_then(|v| v.as_str()),
+                            parsed.get("file_path").and_then(|v| v.as_str()),
+                        ) {
+                            if !validate_mldsa_pubkey_hex(mldsa_pubkey_hex) {
+                                let error_output = json!({
+                                    "type": "error",
+                                    "data": "ML-DSA 公钥格式不正确（应为3904字符的hex编码）",
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                let err_str =
+                                    serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                        r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                    });
+                                eprintln!("{}", err_str);
+                                continue;
+                            }
+                            if !handle
+                                .send_file(mldsa_pubkey_hex, std::path::Path::new(file_path))
+                                .await
+                            {
+                                let error_output = json!({
+                                    "type": "error",
+                                    "data": "发送文件失败",
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                let err_str =
+                                    serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                        r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                    });
+                                eprintln!("{}", err_str);
+                                continue;
+                            }
+                            let success_output = json!({
+                                "type": "sent",
+                                "data": {
+                                    "mldsa_pubkey_hex": mldsa_pubkey_hex,
+                                    "file_path": file_path
+                                },
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            println!("{}", serde_json::to_string(&success_output)?);
+                            tokio::io::stdout().flush().await.ok();
+                        } else {
+                            let error_output = json!({
+                                "type": "error",
+                                "data": "缺少 mldsa_pubkey_hex 或 file_path 字段",
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let err_str =
+                                serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                    r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                });
+                            eprintln!("{}", err_str);
+                        }
+                    }
+                    "request_file_download" => {
+                        if let (
+                            Some(sender_mldsa_pubkey_hex),
+                            Some(file_hash_hex),
+                            Some(save_path),
+                        ) = (
+                            parsed
+                                .get("sender_mldsa_pubkey_hex")
+                                .and_then(|v| v.as_str()),
+                            parsed.get("file_hash_hex").and_then(|v| v.as_str()),
+                            parsed.get("save_path").and_then(|v| v.as_str()),
+                        ) {
+                            if !validate_mldsa_pubkey_hex(sender_mldsa_pubkey_hex) {
+                                let error_output = json!({
+                                    "type": "error",
+                                    "data": "发送方 ML-DSA 公钥格式不正确（应为3904字符的hex编码）",
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                let err_str =
+                                    serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                        r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                    });
+                                eprintln!("{}", err_str);
+                                continue;
+                            }
+                            let file_hash_bytes = match hex::decode(file_hash_hex) {
+                                Ok(b) if b.len() == 32 => b,
+                                _ => {
+                                    let error_output = json!({
+                                        "type": "error",
+                                        "data": "file_hash_hex 无效，应为64字符的hex编码",
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    let err_str = serde_json::to_string(&error_output)
+                                        .unwrap_or_else(|_| {
+                                            r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                        });
+                                    eprintln!("{}", err_str);
+                                    continue;
+                                }
+                            };
+                            let mut file_hash = [0u8; 32];
+                            file_hash_bytes
+                                .iter()
+                                .enumerate()
+                                .for_each(|(i, &b)| file_hash[i] = b);
+                            if !handle
+                                .request_file_download(
+                                    sender_mldsa_pubkey_hex,
+                                    file_hash,
+                                    std::path::PathBuf::from(save_path),
+                                )
+                                .await
+                            {
+                                let error_output = json!({
+                                    "type": "error",
+                                    "data": "请求文件下载失败",
+                                    "timestamp": chrono::Utc::now().to_rfc3339()
+                                });
+                                let err_str =
+                                    serde_json::to_string(&error_output).unwrap_or_else(|_| {
+                                        r#"{"type":"error","data":"序列化失败"}"#.to_string()
+                                    });
+                                eprintln!("{}", err_str);
+                                continue;
+                            }
+                            let success_output = json!({
+                                "type": "download_requested",
+                                "data": {
+                                    "sender_mldsa_pubkey_hex": sender_mldsa_pubkey_hex,
+                                    "save_path": save_path
+                                },
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            println!("{}", serde_json::to_string(&success_output)?);
+                            tokio::io::stdout().flush().await.ok();
+                        } else {
+                            let error_output = json!({
+                                "type": "error",
+                                "data": "缺少 sender_mldsa_pubkey_hex、file_hash_hex 或 save_path 字段",
                                 "timestamp": chrono::Utc::now().to_rfc3339()
                             });
                             let err_str =

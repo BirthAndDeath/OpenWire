@@ -155,9 +155,10 @@ const VALIDATORS = {
         let err = requiredString(p.senderMldsaPubkeyHex, 'senderMldsaPubkeyHex');
         if (err) return err;
         if (!isHex(p.senderMldsaPubkeyHex)) return 'senderMldsaPubkeyHex must be hex';
-        err = requiredString(p.fileIdHex, 'fileIdHex');
+        err = requiredString(p.fileHashHex, 'fileHashHex');
         if (err) return err;
-        if (!isHex(p.fileIdHex)) return 'fileIdHex must be hex';
+        if (!isHex(p.fileHashHex)) return 'fileHashHex must be hex';
+        if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
         return null;
     },
     set_download_dir: (p) => requiredString(p.path, 'path', 4096),

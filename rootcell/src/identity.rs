@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 use anyhow;
 use tracing;
 use zeroize::Zeroizing;
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 #[cfg(unix)]
 use libc;
@@ -98,13 +100,13 @@ impl PrivateKeyHandle {
         }
     }
 
-    pub fn load_master_key() -> anyhow::Result<Option<[u8; 32]>> {
+    pub fn load_master_key() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
         match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
             Ok(entry) => match entry.get_password() {
                 Ok(pwd) if !pwd.trim().is_empty() => {
-                    let decoded = hex::decode(pwd.trim())?;
+                    let decoded = Zeroizing::new(hex::decode(pwd.trim())?);
                     if decoded.len() == 32 {
-                        let mut key = [0u8; 32];
+                        let mut key = Zeroizing::new([0u8; 32]);
                         key.copy_from_slice(&decoded);
                         Ok(Some(key))
                     } else {
@@ -135,6 +137,15 @@ impl PrivateKeyHandle {
         Self::load_master_key().ok().flatten().is_some()
     }
 
+    /// 使用 HKDF 从 master key 派生出每个身份专用的 AES 密钥
+    fn derive_aes_key(master_key: &[u8; 32], identifier: &str) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(Some(b"openwire-key-derivation"), master_key);
+        let mut aes_key = [0u8; 32];
+        hk.expand(identifier.as_bytes(), &mut aes_key)
+            .expect("HKDF expand should not fail with valid output length");
+        aes_key
+    }
+
     pub fn check_keyring_available() -> bool {
         ensure_keyring_init();
         keyring::Entry::new(KEYRING_SERVICE, "test_availability").is_ok()
@@ -153,9 +164,8 @@ impl PrivateKeyHandle {
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("Failed to check master key in Keyring: {e:?}");
-                entry.delete_credential()?;
-                Ok(())
+                tracing::error!("Failed to check master key in Keyring: {e:?}");
+                Err(anyhow::anyhow!("Keyring 不可用，无法删除 master key: {e}"))
             }
         }
     }
@@ -167,9 +177,7 @@ impl PrivateKeyHandle {
 
     fn encrypted_file_path(data_dir: &str, identifier: &str) -> std::path::PathBuf {
         let short_name = Self::hash_identifier(identifier);
-        Path::new(data_dir)
-            .join("keys")
-            .join(format!("{}.enc", short_name))
+        Path::new(data_dir).join("keys").join(format!("{}.enc", short_name))
     }
 
     pub fn save_encrypted_private_key(
@@ -181,10 +189,16 @@ impl PrivateKeyHandle {
         use aes_gcm::aead::{Aead, KeyInit};
         use aes_gcm::{Aes256Gcm, Key, Nonce};
 
-        let keys_dir = Path::new(data_dir).join("keys");
+        // 安全校验：规范化路径防止 ../ 遍历，但不改变写入路径
+        let data_path = Path::new(data_dir);
+        let _ = data_path.canonicalize()
+            .map_err(|e| anyhow::anyhow!("无效的 data_dir '{}': {}", data_path.display(), e))?;
+        let keys_dir = data_path.join("keys");
         std::fs::create_dir_all(&keys_dir)?;
 
-        let key = Key::<Aes256Gcm>::from(*master_key);
+        // 使用 HKDF 派生出每个身份专用的 AES 密钥
+        let derived = Self::derive_aes_key(master_key, identifier);
+        let key = Key::<Aes256Gcm>::from(derived);
         let cipher = Aes256Gcm::new(&key);
 
         let nonce = Nonce::from(rand::random::<[u8; 12]>());
@@ -219,11 +233,11 @@ impl PrivateKeyHandle {
         use aes_gcm::{Aes256Gcm, Key, Nonce};
 
         let path = Self::encrypted_file_path(data_dir, identifier);
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let file_content = std::fs::read(&path)?;
+        let file_content = match std::fs::read(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         if file_content.len() < 12 {
             tracing::warn!(
                 "Encrypted key file for {} is too short ({} bytes), ignoring",
@@ -238,17 +252,33 @@ impl PrivateKeyHandle {
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid nonce length"))?;
         let nonce = Nonce::from(nonce_array);
-        let key = Key::<Aes256Gcm>::from(*master_key);
+        // 使用 HKDF 派生出每个身份专用的 AES 密钥
+        let derived = Self::derive_aes_key(master_key, identifier);
+        let key = Key::<Aes256Gcm>::from(derived);
         let cipher = Aes256Gcm::new(&key);
 
         match cipher.decrypt(&nonce, ciphertext) {
-            Ok(plaintext) => Ok(Some(plaintext)),
+            Ok(plaintext) => return Ok(Some(plaintext)),
             Err(_) => {
-                tracing::warn!(
-                    "Failed to decrypt private key for {} (wrong key or corrupted file)",
-                    identifier
-                );
-                Ok(None)
+                // 回退到旧格式（无 HKDF）：直接用 master_key 作为 AES 密钥
+                let old_key = Key::<Aes256Gcm>::from(*master_key);
+                let old_cipher = Aes256Gcm::new(&old_key);
+                match old_cipher.decrypt(&nonce, ciphertext) {
+                    Ok(plaintext) => {
+                        tracing::info!("以旧格式解密身份 {} 成功，自动迁移到 HKDF 格式", identifier);
+                        if let Err(e) = Self::save_encrypted_private_key(data_dir, identifier, &plaintext, master_key) {
+                            tracing::warn!("迁移身份 {} 到 HKDF 格式失败: {e}", identifier);
+                        }
+                        Ok(Some(plaintext))
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Failed to decrypt private key for {} (wrong key or corrupted file)",
+                            identifier
+                        );
+                        Ok(None)
+                    }
+                }
             }
         }
     }
@@ -282,7 +312,8 @@ impl PrivateKeyHandle {
             Some(key) => key,
             None => {
                 tracing::info!("No master key found in Keyring, generating new one");
-                Self::generate_and_save_master_key()?
+                let raw_key = Self::generate_and_save_master_key()?;
+                Zeroizing::new(raw_key)
             }
         };
 

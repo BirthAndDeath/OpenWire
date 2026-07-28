@@ -1,15 +1,23 @@
 use crate::{App, Focus};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
+use hex;
 
 /// 分发事件到对应的焦点处理器
 pub async fn handle_event(app: &mut App, event: Event) -> std::io::Result<()> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match app.current_focus {
-            Focus::Messages => handle_messages_focus(app, key.code).await,
-            Focus::Input => handle_input_focus(app, key).await,
-            Focus::SidebarArea => handle_sidebar_area_focus(app, key.code).await,
-            Focus::IdentityArea => handle_identity_area_focus(app, key.code).await,
-        },
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // 下载对话框捕获所有键盘事件
+            if app.download_dialog.is_some() {
+                handle_download_dialog(app, key).await;
+            } else {
+                match app.current_focus {
+                    Focus::Messages => handle_messages_focus(app, key.code).await,
+                    Focus::Input => handle_input_focus(app, key).await,
+                    Focus::SidebarArea => handle_sidebar_area_focus(app, key.code).await,
+                    Focus::IdentityArea => handle_identity_area_focus(app, key.code).await,
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -56,15 +64,22 @@ async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
                                 .messages_by_contact
                                 .entry(contact.mldsa_pubkey_hex.clone())
                                 .or_default();
+                            let shares = app
+                                .file_shares_by_contact
+                                .entry(contact.mldsa_pubkey_hex.clone())
+                                .or_default();
                             let name = contact.name.as_deref().unwrap_or("(未命名)");
                             entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                            shares.push(None);
                             for msg in msgs.iter().rev() {
                                 let prefix = if msg.is_outgoing == 1 {
                                     "[我]"
                                 } else {
                                     "[对方]"
                                 };
-                                entry.push(format!("{} {}", prefix, msg.content));
+                                let text = format!("{} {}", prefix, msg.content);
+                                entry.push(text);
+                                shares.push(crate::detect_file_share(&msg));
                             }
                         }
                     }
@@ -147,6 +162,89 @@ async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
                 app.input = format!("回复「{}」: ", msg);
                 app.current_focus = Focus::Input;
             }
+        }
+        KeyCode::Right => {
+            if let Some(i) = app.message_list_state.selected()
+                && let Some(_msg) = msgs.get(i)
+            {
+                let contact_pk = app
+                    .contact_list_state
+                    .selected()
+                    .and_then(|ci| app.contacts.get(ci))
+                    .map(|c| c.mldsa_pubkey_hex.clone());
+                if let Some(pk) = contact_pk {
+                    if let Some(shares) = app.file_shares_by_contact.get(&pk) {
+                        if let Some(Some(info)) = shares.get(i) {
+                            app.download_dialog = Some(info.clone());
+                            // 预填默认下载路径，用户可编辑修改
+                            let default_dir = app.data_dir.join("downloads");
+                            app.input = default_dir
+                                .join(&info.filename)
+                                .to_string_lossy()
+                                .to_string();
+                            app.push_message(format!(
+                                "按 Enter 下载到默认目录，或编辑路径后按 Enter"
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 处理下载对话框的键盘事件
+async fn handle_download_dialog(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter if !app.input.trim().is_empty() => {
+            let info = app.download_dialog.take().unwrap();
+            let save_path = app.input.trim().to_string();
+            app.input.clear();
+            let file_hash_bytes = match hex::decode(&info.file_hash) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    app.push_message("错误：文件哈希无效".to_string());
+                    return;
+                }
+            };
+            let mut file_hash = [0u8; 32];
+            file_hash_bytes
+                .iter()
+                .enumerate()
+                .for_each(|(i, &b)| file_hash[i] = b);
+            app.push_message(format!("正在下载到: {}", save_path));
+            let ok = app
+                .core_handle
+                .request_file_download(
+                    &info.sender,
+                    file_hash,
+                    std::path::PathBuf::from(&save_path),
+                )
+                .await;
+            if ok {
+                app.push_message(format!("✅ 下载请求已发送: {}", save_path));
+            } else {
+                app.push_message("❌ 下载请求失败".to_string());
+            }
+            let msg_count = app.current_messages().len();
+            if msg_count > 0 {
+                app.message_list_state.select(Some(msg_count - 1));
+            }
+        }
+        // Esc 取消下载（主循环已确保 Esc 不会误退出程序）
+        KeyCode::Esc => {
+            app.download_dialog = None;
+            app.input.clear();
+        }
+        // 'c' 键在输入为空时也可取消（首次打开对话框时方便操作）
+        KeyCode::Char('c') if app.input.is_empty() => {
+            app.download_dialog = None;
+        }
+        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Backspace => {
+            app.input.pop();
         }
         _ => {}
     }
@@ -278,7 +376,10 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
         }
         // Esc: 取消添加联系人/文件发送模式，或退出输入框
         KeyCode::Esc => {
-            if app.add_contact_mode {
+            if app.download_dialog.is_some() {
+                app.download_dialog = None;
+                app.input.clear();
+            } else if app.add_contact_mode {
                 app.add_contact_mode = false;
                 app.status_message = "已取消添加联系人".to_string();
             } else if app.file_send_mode {
@@ -331,6 +432,7 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
                         app.refresh_contacts().await;
                         app.refresh_identities().await;
                         app.messages_by_contact.clear();
+                        app.file_shares_by_contact.clear();
                         // 重新加载历史消息
                         if let Some(pool) = openwire_core::storage::pool() {
                             let owner = openwire_core::storage::get_current_identity(pool)
@@ -352,15 +454,22 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
                                         .messages_by_contact
                                         .entry(contact.mldsa_pubkey_hex.clone())
                                         .or_default();
+                                    let shares = app
+                                        .file_shares_by_contact
+                                        .entry(contact.mldsa_pubkey_hex.clone())
+                                        .or_default();
                                     let name = contact.name.as_deref().unwrap_or("(未命名)");
                                     entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                                    shares.push(None);
                                     for msg in msgs.iter().rev() {
                                         let prefix = if msg.is_outgoing == 1 {
                                             "[我]"
                                         } else {
                                             "[对方]"
                                         };
-                                        entry.push(format!("{} {}", prefix, msg.content));
+                                        let text = format!("{} {}", prefix, msg.content);
+                                        entry.push(text);
+                                        shares.push(crate::detect_file_share(&msg));
                                     }
                                 }
                             }

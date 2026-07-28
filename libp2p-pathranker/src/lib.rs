@@ -1,38 +1,30 @@
-use async_trait::async_trait;
-use futures::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+
 use libp2p::{
-    StreamProtocol,
-    request_response::{self, Codec, ProtocolSupport},
-    swarm::NetworkBehaviour,
+    Multiaddr, PeerId, StreamProtocol,
+    request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel, cbor},
+    swarm::{FromSwarm, NetworkBehaviour},
 };
 use serde::{Deserialize, Serialize};
-use std::io;
 use tracing;
 
-pub const PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/pathranker/0.1.0");
-
-// ---------- 子模块 ----------
-pub mod node;
 pub mod ranker;
 
-// ---------- 消息定义 ----------
-/// 查询某个目标节点的评分。
-/// `nonce` 用于防重放攻击，每次请求随机生成。
+use ranker::behavior::{AlertLevel, BehaviorRanker, RankerConfig};
+
+pub const PROTOCOL_NAME: StreamProtocol = StreamProtocol::new("/openwire/pathranker/1.0");
+
+const REQUEST_SIZE_MAX: u64 = 256 * 1024;
+const RESPONSE_SIZE_MAX: u64 = 256 * 1024;
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+const MAX_CONCURRENT_STREAMS: usize = 10;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreRequest {
     pub target: String,
     pub nonce: u64,
 }
 
-/// 返回的评分信息（双维评分模型：他评 + 自评）。
-///
-/// 字段说明：
-/// - `score`：对目标节点的历史表现评分（EWMA 延迟 + 成功率），范围 [0,1]
-/// - `self_score`：发起响应节点自身的负载评分，范围 [0,1]，1 = 完全空闲
-/// - `overloaded`：简化的过载标记，当 `self_score < 0.3` 时为 true
-/// - `nonce`：回显请求中的 nonce，用于防重放
-/// - `signature`：Ed25519 签名，覆盖 `(responder || score || updated_at || target || nonce || self_score)`
-/// - `responder_key`：protobuf 编码的公钥，接收方用于验签
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreResponse {
     pub score: f64,
@@ -45,127 +37,152 @@ pub struct ScoreResponse {
     pub self_score: f64,
 }
 
-// ---------- 编解码器 ----------
-/// 自定义的请求/响应编解码器。
-#[derive(Debug, Clone, Default)]
-pub struct PathRankerCodec;
+pub type PathRankerEvent = request_response::Event<ScoreRequest, ScoreResponse>;
 
-#[async_trait]
-impl Codec for PathRankerCodec {
-    type Protocol = StreamProtocol;
-    type Request = ScoreRequest;
-    type Response = ScoreResponse;
+/// 警戒态势评估器：监控连接速率、突变率、失败率，输出警戒等级
+struct AlertEvaluator {
+    conn_rate_ewma: f64,
+    baseline_conn_rate: f64,
+    mutation_count: usize,
+    recent_failures: usize,
+    baseline_samples: usize,
+    current_level_since: std::time::Instant,
+    current_level: AlertLevel,
+    last_event_time: std::time::Instant,
+}
 
-    async fn read_request<T>(
-        &mut self,
-        protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> io::Result<Self::Request>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        let _ = protocol;
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf);
-        let mut buf = vec![0u8; len as usize];
-        io.read_exact(&mut buf).await?;
-        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+impl AlertEvaluator {
+    fn new() -> Self {
+        Self {
+            conn_rate_ewma: 0.0,
+            baseline_conn_rate: 0.0,
+            mutation_count: 0,
+            recent_failures: 0,
+            baseline_samples: 0,
+            current_level_since: std::time::Instant::now(),
+            current_level: AlertLevel::Normal,
+            last_event_time: std::time::Instant::now(),
+        }
     }
 
-    async fn read_response<T>(
-        &mut self,
-        protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> io::Result<Self::Response>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        let _ = protocol;
-        let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf);
-        let mut buf = vec![0u8; len as usize];
-        io.read_exact(&mut buf).await?;
-        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    fn record_connection_event(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now
+            .duration_since(self.last_event_time)
+            .as_secs_f64()
+            .max(0.001);
+        let instant_rate = 1.0 / elapsed;
+        self.conn_rate_ewma = 0.3 * instant_rate + 0.7 * self.conn_rate_ewma;
+        self.last_event_time = now;
     }
 
-    async fn write_request<T>(
-        &mut self,
-        protocol: &Self::Protocol,
-        io: &mut T,
-        req: Self::Request,
-    ) -> io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        let _ = protocol;
-        let data =
-            serde_json::to_vec(&req).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        io.write_all(&data).await?;
-        Ok(())
+    fn record_mutation(&mut self) {
+        self.mutation_count += 1;
     }
 
-    async fn write_response<T>(
-        &mut self,
-        protocol: &Self::Protocol,
-        io: &mut T,
-        resp: Self::Response,
-    ) -> io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        let _ = protocol;
-        let data =
-            serde_json::to_vec(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        io.write_all(&data).await?;
-        Ok(())
+    fn record_failure(&mut self) {
+        self.recent_failures += 1;
+    }
+
+    fn evaluate(&mut self) -> AlertLevel {
+        if self.baseline_samples < 100 {
+            self.baseline_conn_rate = (self.baseline_conn_rate * self.baseline_samples as f64
+                + self.conn_rate_ewma)
+                / (self.baseline_samples as f64 + 1.0);
+            self.baseline_samples += 1;
+        }
+        let conn_ratio = if self.baseline_conn_rate > 0.01 {
+            self.conn_rate_ewma / self.baseline_conn_rate
+        } else {
+            1.0
+        };
+        let alert_score = (conn_ratio - 1.0).max(0.0) * 3.0
+            + (self.mutation_count as f64).min(5.0) * 0.5
+            + self.recent_failures as f64 * 0.2;
+        let new_level = AlertLevel::from_score(alert_score);
+        let now = std::time::Instant::now();
+        if new_level > self.current_level {
+            self.current_level = new_level;
+            self.current_level_since = now;
+        } else if new_level < self.current_level {
+            if now.duration_since(self.current_level_since) > Duration::from_secs(30) {
+                self.current_level = new_level;
+                self.current_level_since = now;
+            }
+        } else {
+            self.current_level_since = now;
+        }
+        self.mutation_count = (self.mutation_count as f64 * 0.9) as usize;
+        self.recent_failures = (self.recent_failures as f64 * 0.9) as usize;
+        self.current_level
     }
 }
 
-// ---------- 行为定义 ----------
-/// 封装 `request_response::Behaviour`，提供基于 `/pathranker/0.1.0` 协议的评分查询能力。
+/// `/openwire/pathranker/1.0` 协议的网络行为实现 + 行为感知评分引擎。
 ///
-/// 集成 Ed25519 签名，确保响应不可伪造、不可篡改。
-/// 签名覆盖 `(responder || score || updated_at || target || nonce || self_score)`。
-///
-/// 手写 `impl NetworkBehaviour`（libp2p 0.56 的 derive 宏不支持非 Behaviour 字段）。
+/// 协议事件（收到评分查询/响应）由 `P2pActor` 通过 `PathRankerEvent` 处理，
+/// 连接生命周期反馈由 `on_swarm_event` 自动采集更新评分。
 pub struct PathRankerBehaviour {
-    inner: request_response::Behaviour<PathRankerCodec>,
+    inner: cbor::Behaviour<ScoreRequest, ScoreResponse>,
     local_key: libp2p::identity::Keypair,
+    pub ranker: BehaviorRanker,
+    alert_evaluator: AlertEvaluator,
+    last_alert_tick: std::time::Instant,
 }
 
 impl PathRankerBehaviour {
     pub fn new(local_key: libp2p::identity::Keypair) -> Self {
-        let rr = request_response::Behaviour::new(
+        let codec = cbor::codec::Codec::<ScoreRequest, ScoreResponse>::default()
+            .set_request_size_maximum(REQUEST_SIZE_MAX)
+            .set_response_size_maximum(RESPONSE_SIZE_MAX);
+        let rr = cbor::Behaviour::with_codec(
+            codec,
             [(PROTOCOL_NAME, ProtocolSupport::Full)],
-            request_response::Config::default(),
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .with_max_concurrent_streams(MAX_CONCURRENT_STREAMS),
         );
-        Self { inner: rr, local_key }
+        Self {
+            inner: rr,
+            local_key,
+            ranker: BehaviorRanker::new(RankerConfig::default()),
+            alert_evaluator: AlertEvaluator::new(),
+            last_alert_tick: std::time::Instant::now(),
+        }
     }
 
-    pub fn local_peer_id(&self) -> libp2p::PeerId {
+    pub fn local_peer_id(&self) -> PeerId {
         self.local_key.public().to_peer_id()
     }
 
-    /// 向指定节点发送评分查询。自动生成随机 nonce 防重放。
-    pub fn send_query(&mut self, peer: &libp2p::PeerId, target: String) -> libp2p::request_response::OutboundRequestId {
-        self.inner.send_request(peer, ScoreRequest { target, nonce: rand::random() })
+    // ====== 协议方法 ======
+
+    pub fn send_query(&mut self, peer: &PeerId, target: String) -> OutboundRequestId {
+        self.inner.send_request(
+            peer,
+            ScoreRequest {
+                target,
+                nonce: rand::random(),
+            },
+        )
     }
 
-    /// 回复评分查询。自动填充 `responder_key` 和 `signature`。
-    /// 签名失败时返回 `Err(resp)`，调用方可选择如何处理。
     pub fn send_response(
         &mut self,
-        channel: request_response::ResponseChannel<ScoreResponse>,
+        channel: ResponseChannel<ScoreResponse>,
         mut resp: ScoreResponse,
     ) -> Result<(), ScoreResponse> {
         let public_key = self.local_key.public();
         resp.responder_key = public_key.encode_protobuf();
         let responder_id = public_key.to_peer_id();
-        let payload = Self::build_signing_payload(&responder_id, resp.score, resp.updated_at, &resp.target, resp.nonce, resp.self_score);
+        let payload = Self::build_signing_payload(
+            &responder_id,
+            resp.score,
+            resp.updated_at,
+            &resp.target,
+            resp.nonce,
+            resp.self_score,
+        );
         match self.local_key.sign(&payload) {
             Ok(sig) => {
                 resp.signature = sig;
@@ -178,20 +195,31 @@ impl PathRankerBehaviour {
         }
     }
 
-    /// 验签：从 `responder_key` 解码公钥，重构签名载荷并验证。
-    /// 返回 `false` 表示签名无效或公钥解码失败。
     pub fn verify_response(resp: &ScoreResponse) -> bool {
         let pk = match libp2p::identity::PublicKey::try_decode_protobuf(&resp.responder_key) {
             Ok(pk) => pk,
             Err(_) => return false,
         };
         let responder_id = pk.to_peer_id();
-        let payload = Self::build_signing_payload(&responder_id, resp.score, resp.updated_at, &resp.target, resp.nonce, resp.self_score);
+        let payload = Self::build_signing_payload(
+            &responder_id,
+            resp.score,
+            resp.updated_at,
+            &resp.target,
+            resp.nonce,
+            resp.self_score,
+        );
         pk.verify(&payload, &resp.signature)
     }
 
-    /// 构建签名载荷，所有变长字段前加 4 字节大端长度前缀，防止域碰撞。
-    fn build_signing_payload(responder: &libp2p::PeerId, score: f64, updated_at: u64, target: &str, nonce: u64, self_score: f64) -> Vec<u8> {
+    fn build_signing_payload(
+        responder: &PeerId,
+        score: f64,
+        updated_at: u64,
+        target: &str,
+        nonce: u64,
+        self_score: f64,
+    ) -> Vec<u8> {
         let mut data = Vec::new();
         let responder_bytes = responder.to_bytes();
         data.extend_from_slice(&(responder_bytes.len() as u32).to_be_bytes());
@@ -204,109 +232,159 @@ impl PathRankerBehaviour {
         data.extend_from_slice(&self_score.to_be_bytes());
         data
     }
-}
 
-/// 方便外部匹配的事件类型
-pub type PathRankerEvent = request_response::Event<ScoreRequest, ScoreResponse>;
+    // ====== 评分引擎代理方法 ======
+
+    pub fn rank(&self, peer: &PeerId, addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+        self.ranker.rank(peer, addrs)
+    }
+
+    pub fn feedback(&mut self, peer: &PeerId, addr: &Multiaddr, latency: Duration, success: bool) {
+        self.ranker.feedback(peer, addr, latency, success);
+    }
+
+    pub fn best_addr(&self, peer: &PeerId) -> Option<Multiaddr> {
+        self.ranker.best_addr(peer)
+    }
+
+    pub fn set_alert_level(&mut self, level: AlertLevel) {
+        self.ranker.set_alert_level(level);
+    }
+
+    pub fn alert_level(&self) -> AlertLevel {
+        self.ranker.alert_level()
+    }
+
+    pub fn consume_mutation_flag(&mut self) -> bool {
+        self.ranker.consume_mutation_flag()
+    }
+
+    pub fn inject_neighbor_score(
+        &mut self,
+        peer: &PeerId,
+        addr: &Multiaddr,
+        score: f64,
+        path_type: ranker::behavior::PathType,
+    ) {
+        self.ranker
+            .inject_neighbor_score(peer, addr, score, path_type);
+    }
+
+    pub fn set_peer_self_score(&mut self, peer: &PeerId, addr: &Multiaddr, score: f64) {
+        self.ranker.set_peer_self_score(peer, addr, score);
+    }
+
+    pub fn is_overloaded(&self) -> bool {
+        self.ranker.is_overloaded()
+    }
+
+    /// 限频警戒评估：每秒最多一次
+    fn maybe_tick_alert(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_alert_tick) < Duration::from_secs(1) {
+            return;
+        }
+        self.last_alert_tick = now;
+        let new_level = self.alert_evaluator.evaluate();
+        if new_level != self.ranker.alert_level() {
+            tracing::info!(
+                "alert level changed: {:?} → {:?}",
+                self.ranker.alert_level(),
+                new_level
+            );
+            self.ranker.set_alert_level(new_level);
+        }
+    }
+}
 
 impl NetworkBehaviour for PathRankerBehaviour {
     type ConnectionHandler =
-        <request_response::Behaviour<PathRankerCodec> as NetworkBehaviour>::ConnectionHandler;
+        <cbor::Behaviour<ScoreRequest, ScoreResponse> as NetworkBehaviour>::ConnectionHandler;
     type ToSwarm = request_response::Event<ScoreRequest, ScoreResponse>;
 
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: libp2p::swarm::ConnectionId,
-        peer: libp2p::PeerId,
-        local_addr: &libp2p::Multiaddr,
-        remote_addr: &libp2p::Multiaddr,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
     ) -> Result<Self::ConnectionHandler, libp2p::swarm::ConnectionDenied> {
-        self.inner.handle_established_inbound_connection(connection_id, peer, local_addr, remote_addr)
+        self.inner.handle_established_inbound_connection(
+            connection_id,
+            peer,
+            local_addr,
+            remote_addr,
+        )
     }
 
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: libp2p::swarm::ConnectionId,
-        peer: libp2p::PeerId,
-        addr: &libp2p::Multiaddr,
+        peer: PeerId,
+        addr: &Multiaddr,
         role_override: libp2p::core::Endpoint,
         port_use: libp2p::core::transport::PortUse,
     ) -> Result<Self::ConnectionHandler, libp2p::swarm::ConnectionDenied> {
-        self.inner.handle_established_outbound_connection(connection_id, peer, addr, role_override, port_use)
+        self.inner.handle_established_outbound_connection(
+            connection_id,
+            peer,
+            addr,
+            role_override,
+            port_use,
+        )
     }
 
-    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        match &event {
+            FromSwarm::ConnectionEstablished(e) => {
+                self.ranker.feedback(
+                    &e.peer_id,
+                    e.endpoint.get_remote_address(),
+                    Duration::from_secs(0),
+                    true,
+                );
+                self.alert_evaluator.record_connection_event();
+                self.maybe_tick_alert();
+            }
+            FromSwarm::ConnectionClosed(_) => {
+                self.alert_evaluator.record_connection_event();
+                self.maybe_tick_alert();
+            }
+            FromSwarm::DialFailure(e) => {
+                if let Some(peer_id) = e.peer_id {
+                    self.ranker.feedback(
+                        &peer_id,
+                        &Multiaddr::empty(),
+                        Duration::from_secs(2),
+                        false,
+                    );
+                    self.alert_evaluator.record_failure();
+                    if self.ranker.consume_mutation_flag() {
+                        self.alert_evaluator.record_mutation();
+                    }
+                    self.maybe_tick_alert();
+                }
+            }
+            _ => {}
+        }
         self.inner.on_swarm_event(event);
     }
 
     fn on_connection_handler_event(
         &mut self,
-        peer_id: libp2p::PeerId,
+        peer_id: PeerId,
         connection_id: libp2p::swarm::ConnectionId,
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
-        self.inner.on_connection_handler_event(peer_id, connection_id, event);
+        self.inner
+            .on_connection_handler_event(peer_id, connection_id, event);
     }
 
     fn poll(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>> {
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
         self.inner.poll(cx)
-    }
-}
-
-// ---------- 核心评分器接口 ----------
-/// 行为感知路由的核心 trait，定义了路径排序和反馈接口。
-///
-/// 当前由 `BehaviorRanker` 实现，直接调用其固有方法即可。
-/// 此 trait 保留用于泛型编程场景——若不需要，可安全删除。
-pub trait PathRanker {
-    /// 对候选地址列表排序，返回按评分降序的地址序列
-    fn rank(&self, peer: &libp2p::PeerId, addrs: Vec<libp2p::Multiaddr>) -> Vec<libp2p::Multiaddr>;
-
-    /// 通信结束后反馈实际表现，更新内部评分
-    fn feedback(
-        &mut self,
-        peer: &libp2p::PeerId,
-        addr: &libp2p::Multiaddr,
-        latency: std::time::Duration,
-        success: bool,
-    );
-}
-
-#[cfg(test)]
-mod codec_tests {
-    use super::*;
-
-    #[test]
-    fn test_score_request_roundtrip() {
-        let req = ScoreRequest { target: "12D3KooWAbcd".into(), nonce: 42 };
-        let json = serde_json::to_vec(&req).unwrap();
-        let decoded: ScoreRequest = serde_json::from_slice(&json).unwrap();
-        assert_eq!(req.target, decoded.target);
-        assert_eq!(req.nonce, decoded.nonce);
-    }
-
-    #[test]
-    fn test_score_response_roundtrip() {
-        let resp = ScoreResponse {
-            score: 0.85,
-            updated_at: 1000,
-            nonce: 42,
-            target: "12D3KooWAbcd".into(),
-            signature: vec![1, 2, 3],
-            responder_key: vec![4, 5, 6],
-            overloaded: false,
-            self_score: 0.9,
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: ScoreResponse = serde_json::from_slice(&json).unwrap();
-        assert!((decoded.score - 0.85).abs() < 1e-10);
-        assert_eq!(decoded.nonce, 42);
-        assert_eq!(decoded.target, "12D3KooWAbcd");
-        assert_eq!(decoded.signature, vec![1, 2, 3]);
-        assert!(!decoded.overloaded);
-        assert!((decoded.self_score - 0.9).abs() < 1e-10);
     }
 }

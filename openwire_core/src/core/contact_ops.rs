@@ -25,29 +25,35 @@ impl ChatCore {
                     let msg = format!("好友 {} 添加成功", &mldsa_pubkey_hex[..16]);
                     self.send_log_mpsc(msg).await;
                     // 添加联系人后，发起 DHT 查询以获取对方的最新信息（使用 try_send 避免阻塞）
-                    let _ = self.p2p_handle.tx.try_send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
-                            key: mldsa_pubkey_hex.clone(),
-                        }),
-                    );
+                    if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::GetProviders {
+                        key: mldsa_pubkey_hex.clone(),
+                    }) {
+                        tracing::warn!("Failed to send GetProviders after adding contact: {e:?}");
+                    }
                     // Fix 4: 重新发布自身身份到 DHT，确保对方能通过 DHT 反向发现我方
                     // 直接写入本地 DHT 存储 + 发起网络发布（使用 try_send 避免阻塞）
                     let store = self.get_dht_store();
-                    if let (Some(pubkey), Some(pid)) = (&self.mldsa_pubkey_hex, &self.current_peer_id) {
+                    if let (Some(pubkey), Some(pid)) =
+                        (&self.mldsa_pubkey_hex, &self.current_peer_id)
+                    {
                         let _ = store.set_pubkey_peerid(pubkey, pid);
                     }
-                    let _ = self.p2p_handle.tx.try_send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::PublishIdentity {
-                            mldsa_pubkey_hex: self.mldsa_pubkey_hex.clone().unwrap_or_default(),
-                            mlkem_pubkey_hex: self.mlkem_pubkey_hex.clone().unwrap_or_default(),
-                        }),
-                    );
+                    if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::PublishIdentity {
+                        mldsa_pubkey_hex: self.mldsa_pubkey_hex.clone().unwrap_or_default(),
+                        mlkem_pubkey_hex: self.mlkem_pubkey_hex.clone().unwrap_or_default(),
+                    }) {
+                        tracing::warn!(
+                            "Failed to send PublishIdentity after adding contact: {e:?}"
+                        );
+                    }
                     let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-                    let _ = self.p2p_handle.tx.try_send(
-                        crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
-                            key: mlkem_key,
-                        }),
-                    );
+                    if let Err(e) = self
+                        .p2p_handle
+                        .tx
+                        .try_send(P2pCommand::GetRecord { key: mlkem_key })
+                    {
+                        tracing::warn!("Failed to send GetRecord after adding contact: {e:?}");
+                    }
                     true
                 }
                 Err(e) => {
@@ -111,6 +117,24 @@ impl ChatCore {
 
         // 如果本地已有完整信息
         if has_local_peerid && has_local_mlkem {
+            // 从本地缓存获取 PeerID 并直接拨号，无需等待 DHT 响应
+            let peer_id = store
+                .get_peerid_by_pubkey(mldsa_pubkey_hex)
+                .ok()
+                .flatten();
+            if let Some(pid) = peer_id {
+                if !self.connected_peers.contains_key(&pid) {
+                    tracing::info!(
+                        "DHT discovery: 本地已有 {} 的 PeerID={}，直接拨号",
+                        pubkey_short,
+                        pid
+                    );
+                    if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::Dial { peer_id: pid }) {
+                        tracing::warn!("Failed to send Dial for cached contact: {e:?}");
+                    }
+                }
+            }
+
             if is_existing_contact {
                 // 已存在的联系人：只刷新 DHT 查询，不重复添加
                 tracing::debug!(
@@ -118,11 +142,11 @@ impl ChatCore {
                     pubkey_short
                 );
                 // 通过 P2pActor 发起 GetProviders 以刷新在线状态（使用 try_send 避免阻塞）
-                let _ = self.p2p_handle.tx.try_send(
-                    crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
-                        key: mldsa_pubkey_hex.to_string(),
-                    }),
-                );
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::GetProviders {
+                    key: mldsa_pubkey_hex.to_string(),
+                }) {
+                    tracing::warn!("Failed to send GetProviders for DHT discovery: {e:?}");
+                }
             } else {
                 // 新联系人：直接添加
                 tracing::info!(
@@ -140,24 +164,32 @@ impl ChatCore {
 
         // 本地没有缓存，发起网络 DHT 查询但不阻塞等待
         if !has_local_peerid {
-            let _ = self.p2p_handle.tx.try_send(
-                crate::actor::ActorCommand::Custom(P2pCommand::GetProviders {
-                    key: mldsa_pubkey_hex.to_string(),
-                }),
-            );
+            if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::GetProviders {
+                key: mldsa_pubkey_hex.to_string(),
+            }) {
+                tracing::warn!("Failed to send GetProviders for new contact: {e:?}");
+            }
+            // 同时通过中继查询，作为 DHT 的回退方案
+            if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::DiscoverPeer {
+                mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+            }) {
+                tracing::warn!("Failed to send DiscoverPeer for new contact: {e:?}");
+            }
             tracing::debug!(
-                "DHT discovery: initiated GetProviders for {} (non-blocking)",
+                "DHT discovery: initiated GetProviders + DiscoverPeer for {} (non-blocking)",
                 pubkey_short
             );
         }
 
         if !has_local_mlkem {
             let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-            let _ = self.p2p_handle.tx.try_send(
-                crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
-                    key: mlkem_key,
-                }),
-            );
+            if let Err(e) = self
+                .p2p_handle
+                .tx
+                .try_send(P2pCommand::GetRecord { key: mlkem_key })
+            {
+                tracing::warn!("Failed to send GetRecord for new contact: {e:?}");
+            }
             tracing::debug!(
                 "DHT discovery: initiated ML-KEM query for {} (non-blocking)",
                 pubkey_short

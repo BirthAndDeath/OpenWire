@@ -85,7 +85,8 @@ fn build_filter(level: Option<&str>) -> crate::error::LogResult<EnvFilter> {
 /// * `Ok(WorkerGuard)` - 工作线程守卫，确保日志写入完成
 /// * `Err(anyhow::Error)` - 初始化失败
 fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<WorkerGuard> {
-    std::fs::create_dir_all(path).expect("Failed to create log directory");
+    std::fs::create_dir_all(path)
+        .map_err(|e| crate::error::LogError::CreateRollingFileAppenderFailed(e.into()))?;
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
 
     let file_appender = RollingFileAppender::builder()
@@ -100,7 +101,7 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<
         .with_writer(non_blocking)
         .with_env_filter(filter.clone())
         .try_init()
-        .expect("Failed to init File logger");
+        .map_err(|e| crate::error::LogError::LoggerInitFailed(e.into()))?;
 
     tracing::info!(
         filter = %filter,

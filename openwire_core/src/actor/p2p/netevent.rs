@@ -8,6 +8,7 @@
 //! FriendOnline 的实际处理在 event_loop.rs 中直接操作 swarm。
 
 use libp2p::PeerId;
+#[cfg(feature = "redb_dht")]
 use std::sync::Arc;
 
 use crate::p2p::netevent::NetEventRequest;
@@ -15,6 +16,7 @@ use crate::p2p::netevent::NetEventRequest;
 /// 处理收到的 FriendOnline 通知
 ///
 /// 已停用：RedbRecordStore 不再作为 Kademlia 储存使用。
+#[cfg(feature = "redb_dht")]
 #[allow(dead_code)]
 pub fn handle_friend_online(
     request: &NetEventRequest,

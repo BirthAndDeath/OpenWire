@@ -3,7 +3,7 @@ use libp2p::kad::{self, Config as KadConfig, Mode};
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{
     PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
-    memory_connection_limits, noise, ping, relay, tcp, yamux,
+    memory_connection_limits, noise, ping, tcp, yamux,
 };
 use std::time::Duration;
 
@@ -41,8 +41,8 @@ const RESPONSE_SIZE_MAX: usize = 256 * 1024;
 /// Identify 协议缓存大小
 const IDENTIFY_CACHE_SIZE: usize = 100;
 
-/// 空闲连接超时（秒）
-const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 30;
+/// 空闲连接超时（秒）—— relay 连接需要更宽容的超时
+const IDLE_CONNECTION_TIMEOUT_SECS: u64 = 90;
 
 /// 每个连接最大并发协商入站流数
 const MAX_NEGOTIATING_INBOUND_STREAMS: usize = 5;
@@ -50,8 +50,8 @@ const MAX_NEGOTIATING_INBOUND_STREAMS: usize = 5;
 /// request-response 协议最大并发流数
 const RR_MAX_CONCURRENT_STREAMS: usize = 10;
 
-/// 并发拨号因子
-const DIAL_CONCURRENCY_FACTOR: u8 = 3;
+/// 并发拨号因子 —— 加速批量 relay 建立
+const DIAL_CONCURRENCY_FACTOR: u8 = 5;
 
 // ============================================================================
 // Kademlia 配置
@@ -70,9 +70,6 @@ const KAD_PROVIDER_TTL_SECS: u64 = 60 * 60;
 /// Kademlia 发布间隔（秒）- 1小时
 const KAD_PUBLICATION_INTERVAL_SECS: u64 = 60 * 60;
 
-/// 路由表缓存文件名
-const ROUTING_TABLE_CACHE_FILE: &str = "routing_table.cache";
-
 /// 初始化 libp2p Swarm
 ///
 /// # 参数
@@ -85,7 +82,7 @@ pub fn swarm_init(
     keypair: libp2p::identity::Keypair,
     bootstrap_nodes: &[(String, String)],
 ) -> P2pResult<Swarm<MyBehaviour>> {
-let mut swarm = {
+    let mut swarm = {
         let builder = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -100,7 +97,7 @@ let mut swarm = {
         let builder = builder
             .with_dns()
             .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
-
+        #[cfg(not(target_os = "android"))] //似乎会在安卓端出bug
         let builder = futures::executor::block_on(
             builder.with_websocket(noise::Config::new, yamux::Config::default),
         )
@@ -109,89 +106,86 @@ let mut swarm = {
         builder
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
-        .with_behaviour(|key, relay_behaviour| {
-            let peer_id = key.public().to_peer_id();
+            .with_behaviour(|key, relay_behaviour| {
+                let peer_id = key.public().to_peer_id();
 
-            // --- rr_msg: 消息传输 ---
-            let msg_codec = Codec::<ChatMessage, ChatResponse>::default()
-                .set_request_size_maximum(REQUEST_SIZE_MAX as u64)
-                .set_response_size_maximum(RESPONSE_SIZE_MAX as u64);
-            let rr_config = rrconfig::default()
-                .with_request_timeout(Duration::from_secs(30))
-                .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
-            let rr_msg = cbor::Behaviour::with_codec(
-                msg_codec,
-                [(PROTOCOL_MSGRR.deref().to_owned(), ProtocolSupport::Full)],
-                rr_config,
-            );
+                // --- rr_msg: 消息传输 ---
+                let msg_codec = Codec::<ChatMessage, ChatResponse>::default()
+                    .set_request_size_maximum(REQUEST_SIZE_MAX as u64)
+                    .set_response_size_maximum(RESPONSE_SIZE_MAX as u64);
+                let rr_config = rrconfig::default()
+                    .with_request_timeout(Duration::from_secs(30))
+                    .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
+                let rr_msg = cbor::Behaviour::with_codec(
+                    msg_codec,
+                    [(PROTOCOL_MSGRR.deref().to_owned(), ProtocolSupport::Full)],
+                    rr_config,
+                );
 
-            // --- rr_netevent: 网络事件通知 ---
-            let netevent_codec = Codec::<NetEventRequest, NetEventResponse>::default()
-                .set_request_size_maximum(64 * 1024) // 64KB 足够
-                .set_response_size_maximum(1024); // 响应很小
-            let netevent_rr_config = rrconfig::default()
-                .with_request_timeout(Duration::from_secs(15))
-                .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
-            let rr_netevent = cbor::Behaviour::with_codec(
-                netevent_codec,
-                [(PROTOCOL_NETEVENT.deref().to_owned(), ProtocolSupport::Full)],
-                netevent_rr_config,
-            );
+                // --- rr_netevent: 网络事件通知 ---
+                let netevent_codec = Codec::<NetEventRequest, NetEventResponse>::default()
+                    .set_request_size_maximum(64 * 1024) // 64KB 足够
+                    .set_response_size_maximum(1024); // 响应很小
+                let netevent_rr_config = rrconfig::default()
+                    .with_request_timeout(Duration::from_secs(15))
+                    .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
+                let rr_netevent = cbor::Behaviour::with_codec(
+                    netevent_codec,
+                    [(PROTOCOL_NETEVENT.deref().to_owned(), ProtocolSupport::Full)],
+                    netevent_rr_config,
+                );
 
-            // --- mDNS 配置 ---
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
-                    .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
+                // --- mDNS 配置 ---
+                let mdns =
+                    mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
+                        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
-            // 创建 Kademlia 行为实例
-            let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes)?;
-            let identify_config =
-                identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
-                    .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
-                    .with_cache_size(IDENTIFY_CACHE_SIZE);
-            let identify = identify::Behaviour::new(identify_config);
-            let ping = ping::Behaviour::new(ping::Config::new());
-            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-            let relay_config = relay::Config {
-                max_reservations: 50,
-                max_reservations_per_peer: 5,
-                reservation_duration: Duration::from_secs(7200),
-                reservation_rate_limiters: vec![],
-                max_circuits: 50,
-                max_circuits_per_peer: 5,
-                max_circuit_duration: Duration::from_secs(3600),
-                max_circuit_bytes: 100 * 1024 * 1024,
-                circuit_src_rate_limiters: vec![],
-            };
-            let relay_server = relay::Behaviour::new(key.public().to_peer_id(), relay_config);
-            let limits =
-                connection_limits::Behaviour::new(connection_limits::ConnectionLimits::default());
-            let memmory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.01);
-            let autonat = autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
-            Ok(MyBehaviour {
-                autonat,
-                rr_msg,
-                rr_netevent,
-                mdns,
-                kademlia,
-                ping,
-                identify,
-                relay_client: relay_behaviour,
-                relay_server,
-                dcutr,
-                limits,
-                memmory_limits,
+                // 创建 Kademlia 行为实例
+                let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes)?;
+                let identify_config =
+                    identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
+                        .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
+                        .with_cache_size(IDENTIFY_CACHE_SIZE);
+                let identify = identify::Behaviour::new(identify_config);
+                let ping = ping::Behaviour::new(ping::Config::new());
+                let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+                let limits = connection_limits::Behaviour::new(
+                    connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(50))
+                        .with_max_pending_outgoing(Some(50))
+                        .with_max_established_incoming(Some(200))
+                        .with_max_established_outgoing(Some(50)),
+                );
+                let memory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.05);
+                let autonat =
+                    autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
+                #[cfg(feature = "pathranker")]
+                let pathranker = libp2p_pathranker::PathRankerBehaviour::new(key.clone());
+                Ok(MyBehaviour {
+                    autonat,
+                    rr_msg,
+                    rr_netevent,
+                    mdns,
+                    kademlia,
+                    ping,
+                    identify,
+                    relay_client: relay_behaviour,
+                    dcutr,
+                    limits,
+                    memory_limits,
+                    #[cfg(feature = "pathranker")]
+                    pathranker,
+                })
             })
-        })
-        .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
-        .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(Duration::from_secs(IDLE_CONNECTION_TIMEOUT_SECS))
-                .with_max_negotiating_inbound_streams(MAX_NEGOTIATING_INBOUND_STREAMS)
-                .with_dial_concurrency_factor(
-                    NonZero::new(DIAL_CONCURRENCY_FACTOR).expect("DIAL_CONCURRENCY_FACTOR > 0"),
-                )
-        })
-        .build()
+            .map_err(|e| P2pError::SwarmInitFailed(e.into()))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(IDLE_CONNECTION_TIMEOUT_SECS))
+                    .with_max_negotiating_inbound_streams(MAX_NEGOTIATING_INBOUND_STREAMS)
+                    .with_dial_concurrency_factor(
+                        NonZero::new(DIAL_CONCURRENCY_FACTOR).expect("DIAL_CONCURRENCY_FACTOR > 0"),
+                    )
+            })
+            .build()
     };
 
     // 端口 0 表示系统自动分配
@@ -215,17 +209,19 @@ let mut swarm = {
             P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
         })?)
         .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0/ws".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    swarm
-        .listen_on("/ip6/::/tcp/0/ws".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
+    #[cfg(not(target_os = "android"))]
+    {
+        swarm
+            .listen_on("/ip4/0.0.0.0/tcp/0/ws".parse().map_err(|e| {
+                P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+            })?)
+            .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+        swarm
+            .listen_on("/ip6/::/tcp/0/ws".parse().map_err(|e| {
+                P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
+            })?)
+            .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    } // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
 
     Ok(swarm)
 }
@@ -233,7 +229,7 @@ let mut swarm = {
 /// 创建 Kademlia 行为
 fn create_kademlia(
     peer_id: PeerId,
-    data_dir: &Path,
+    _data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
 ) -> P2pResult<kad::Behaviour<MemoryStore>> {
     //let store = crate::server_redb_store::RedbRecordStore::new(db);
@@ -254,15 +250,9 @@ fn create_kademlia(
     let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
     kademlia.set_mode(Some(Mode::Client));
 
-    // 先加载缓存的路由表
-    let cache_path = data_dir.join(ROUTING_TABLE_CACHE_FILE);
-    let cached_count = load_routing_table(&mut kademlia, &cache_path);
-    if cached_count > 0 {
-        tracing::info!(
-            "Loaded {} cached peers from routing table cache, skipping bootstrap",
-            cached_count
-        );
-    } else if !bootstrap_nodes.is_empty() {
+    // 不加载路由表缓存——PeerID 临时，缓存不可跨 session 复用
+    // 直接使用 nodes.json bootstrap 节点（需 RSA 支持）
+    if !bootstrap_nodes.is_empty() {
         for (peerid, addr) in bootstrap_nodes {
             let peer_id = PeerId::from_str(peerid).map_err(|e| {
                 P2pError::SwarmInitFailed(
@@ -341,7 +331,8 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
     }
 }
 
-/// 从缓存文件加载路由表
+/// 从缓存文件加载路由表 (PeerID 临时，不再调用)
+#[allow(dead_code)]
 fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &Path) -> usize {
     if !cache_path.exists() {
         return 0;

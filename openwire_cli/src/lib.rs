@@ -13,6 +13,15 @@ pub mod error;
 pub mod notui;
 pub mod tui;
 pub mod use_json;
+
+/// 文件分享信息，用于 TUI 渲染下载按钮
+#[derive(Debug, Clone)]
+pub struct FileShareInfo {
+    pub file_hash: String,
+    pub sender: String,
+    pub filename: String,
+}
+
 pub struct App {
     // --- 焦点系统 ---
     current_focus: Focus,
@@ -46,6 +55,12 @@ pub struct App {
     add_contact_mode: bool,
     /// 剪贴板实例（复用避免每次创建）
     clipboard: Option<arboard::Clipboard>,
+    /// 文件分享信息映射（与 messages_by_contact 同步），用于 TUI 渲染下载按钮
+    pub file_shares_by_contact: HashMap<String, Vec<Option<FileShareInfo>>>,
+    /// 下载对话框状态：为 Some 时显示覆盖层让用户输入保存路径
+    pub download_dialog: Option<FileShareInfo>,
+    /// 数据目录，用于提供默认下载路径
+    pub data_dir: std::path::PathBuf,
 }
 
 impl App {
@@ -77,11 +92,13 @@ impl App {
             .and_then(|i| self.contacts.get(i))
             .map(|c| c.mldsa_pubkey_hex.clone());
         if let Some(key) = contact_key {
-            let msgs = self.messages_by_contact.entry(key).or_default();
+            let msgs = self.messages_by_contact.entry(key.clone()).or_default();
+            let shares = self.file_shares_by_contact.entry(key).or_default();
             msgs.push(text);
-            // 限制消息列表大小，防止内存无限增长
+            shares.push(None);
             if msgs.len() > Self::MAX_MESSAGES_PER_CONTACT {
                 msgs.remove(0);
+                shares.remove(0);
             }
         }
     }
@@ -92,13 +109,47 @@ impl App {
             .messages_by_contact
             .entry(contact_pubkey.to_string())
             .or_default();
+        let shares = self
+            .file_shares_by_contact
+            .entry(contact_pubkey.to_string())
+            .or_default();
         msgs.push(text);
+        shares.push(None);
         // 限制消息列表大小，防止内存无限增长
         if msgs.len() > Self::MAX_MESSAGES_PER_CONTACT {
             msgs.remove(0);
+            shares.remove(0);
         }
     }
 }
+
+/// 从数据库消息中检测文件分享并返回 FileShareInfo
+/// 内容格式通过 openwire_core::command::FILE_SHARE_CONTENT_PREFIX / FILE_SHARE_HASH_PREFIX 定义
+pub fn detect_file_share(msg: &openwire_core::storage::Message) -> Option<FileShareInfo> {
+    if let Some(rest) = msg
+        .content
+        .strip_prefix(openwire_core::command::FILE_SHARE_CONTENT_PREFIX)
+    {
+        if let Some(hash_start) = rest.rfind(openwire_core::command::FILE_SHARE_HASH_PREFIX) {
+            let filename = rest[..hash_start].to_string();
+            let hash_start_actual =
+                hash_start + openwire_core::command::FILE_SHARE_HASH_PREFIX.len();
+            if !rest.ends_with(']') {
+                return None;
+            }
+            let hash_hex = &rest[hash_start_actual..rest.len() - 1];
+            if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
+                return Some(FileShareInfo {
+                    file_hash: hash_hex.to_string(),
+                    sender: msg.peer_pubkey_hex.clone(),
+                    filename,
+                });
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 // 定义焦点枚举
 enum Focus {
@@ -135,7 +186,7 @@ impl App {
     }
 
     /// 在初始化 ChatCore 后构建 App 实例
-    async fn build_app(core: ChatCore, _data_dir: std::path::PathBuf) -> Result<App, CliError> {
+    async fn build_app(core: ChatCore, data_dir: std::path::PathBuf) -> Result<App, CliError> {
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // 默认选中第一条消息
         let core_handle = core.core_handle.clone();
@@ -150,6 +201,8 @@ impl App {
 
         // 加载历史消息（按联系人分组）
         let mut messages_by_contact: HashMap<String, Vec<String>> = HashMap::new();
+        let mut file_shares_by_contact: HashMap<String, Vec<Option<FileShareInfo>>> =
+            HashMap::new();
         for contact in &contacts {
             if let Ok(msgs) = openwire_core::storage::get_messages(
                 pool,
@@ -163,15 +216,21 @@ impl App {
                 let entry = messages_by_contact
                     .entry(contact.mldsa_pubkey_hex.clone())
                     .or_default();
+                let shares = file_shares_by_contact
+                    .entry(contact.mldsa_pubkey_hex.clone())
+                    .or_default();
                 let name = contact.name.as_deref().unwrap_or("(未命名)");
                 entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+                shares.push(None);
                 for msg in msgs.iter().rev() {
                     let prefix = if msg.is_outgoing == 1 {
                         "[我]"
                     } else {
                         "[对方]"
                     };
-                    entry.push(format!("{} {}", prefix, msg.content));
+                    let text = format!("{} {}", prefix, msg.content);
+                    entry.push(text);
+                    shares.push(detect_file_share(msg));
                 }
             }
         }
@@ -194,6 +253,9 @@ impl App {
             file_send_mode: false,
             add_contact_mode: false,
             clipboard: None,
+            file_shares_by_contact,
+            download_dialog: None,
+            data_dir,
         })
     }
 
@@ -238,20 +300,32 @@ impl App {
                     }
                     IncomingMessage::FileShare {
                         filename,
-                        file_id,
-                        total_size,
+                        file_id: _,
+                        file_hash,
+                        total_size: _,
                         sender,
                         ..
                     } => {
                         self.push_message_to(
                             &sender,
                             format!(
-                                "[文件] {} ({} bytes, id={})",
+                                "{}{} {}{}",
+                                openwire_core::command::FILE_SHARE_CONTENT_PREFIX,
                                 filename,
-                                total_size,
-                                &file_id[..16]
+                                openwire_core::command::FILE_SHARE_HASH_PREFIX,
+                                &file_hash,
                             ),
                         );
+                        // 更新最后一条消息的 file_shares 条目（由 push_message_to 推入的 None）
+                        if let Some(shares) = self.file_shares_by_contact.get_mut(&sender) {
+                            if let Some(last) = shares.last_mut() {
+                                *last = Some(FileShareInfo {
+                                    file_hash,
+                                    sender: sender.clone(),
+                                    filename: filename.clone(),
+                                });
+                            }
+                        }
                     }
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
                         self.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
@@ -278,6 +352,10 @@ impl App {
                     progress.total_size,
                     progress.status,
                 ));
+                let msg_count = self.current_messages().len();
+                if msg_count > 0 {
+                    self.message_list_state.select(Some(msg_count - 1));
+                }
             }
             MessageEvent::Warning(data) => {
                 self.push_message(format!("[警告] {}", data));
@@ -300,6 +378,30 @@ impl App {
                 let status = if online { "在线" } else { "离线" };
                 self.push_message(format!("[在线状态] {} {}", short, status));
             }
+        }
+    }
+
+    /// 向指定联系人的消息列表添加一条数据库历史消息，自动检测文件分享
+    pub fn push_history_message(
+        &mut self,
+        contact_pubkey: &str,
+        prefix: &str,
+        msg: &openwire_core::storage::Message,
+    ) {
+        let text = format!("{} {}", prefix, msg.content);
+        let msgs = self
+            .messages_by_contact
+            .entry(contact_pubkey.to_string())
+            .or_default();
+        let shares = self
+            .file_shares_by_contact
+            .entry(contact_pubkey.to_string())
+            .or_default();
+        msgs.push(text);
+        shares.push(crate::detect_file_share(msg));
+        if msgs.len() > Self::MAX_MESSAGES_PER_CONTACT {
+            msgs.remove(0);
+            shares.remove(0);
         }
     }
 }

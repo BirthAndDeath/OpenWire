@@ -1,6 +1,17 @@
 //! OpenWire 核心库，处理后端可复用代码工作
 //! ✅
 #![warn(missing_docs)]
+
+// ============================================================
+// DHT 存储特性互斥检查：mem_dht 和 redb_dht 必须且只能选一个
+// ============================================================
+#[cfg(all(feature = "mem_dht", feature = "redb_dht"))]
+compile_error!("特性 mem_dht 和 redb_dht 是互斥的，不能同时启用（请在 Cargo.toml 的 features 中选择其中一个）");
+
+#[cfg(not(any(feature = "mem_dht", feature = "redb_dht")))]
+compile_error!("必须启用 mem_dht 或 redb_dht 特性之一（请在 Cargo.toml 的 features 中添加 mem_dht 或 redb_dht）");
+// ============================================================
+
 /// Actor 模块（P2P 事件循环 Actor 模式）
 pub mod actor;
 /// 命令与事件类型定义
@@ -20,7 +31,7 @@ pub mod diagnostics;
 pub mod error;
 /// 身份管理（ML-DSA + ML-KEM）
 pub mod identity;
-/// 日志模块 ✅稳定
+/// 日志模块
 mod log;
 
 pub use vstd::prelude::*;
@@ -29,6 +40,7 @@ pub mod message;
 /// P2P 网络模块
 pub mod p2p;
 /// 基于 Redb 的持久化 DHT 记录存储（供服务器节点使用）
+#[cfg(feature = "redb_dht")]
 pub mod server_redb_store;
 /// 签名模块（ML-DSA）
 pub mod signature;
@@ -37,8 +49,8 @@ pub mod storage;
 /// 文件传输模块
 pub mod transfer;
 pub use actor::p2p::{P2pActor, P2pActorHandle, P2pCommand, P2pEvent, start_p2p_actor};
-pub use actor::{Actor, ActorHandle, RUNTIME};
-pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent};
+pub use actor::RUNTIME;
+pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, TransferProgressStatus};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{

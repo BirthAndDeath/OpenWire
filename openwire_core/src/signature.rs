@@ -29,7 +29,10 @@ pub fn validate_mldsa_pubkey_hex(hex: &str) -> bool {
     // 尝试解码 hex 并验证长度
     match hex::decode(hex) {
         Ok(bytes) => {
-            // 验证解码后的字节
+            // 验证长度必须匹配 ML-DSA 65 公钥长度（1952 字节）
+            if bytes.len() != ML_DSA_65_PUBLIC_KEY_LEN {
+                return false;
+            }
 
             // 创建 UnparsedPublicKey 对象来触发 aws-lc-rs 的基本验证
             // 虽然 new() 不会立即验证，但它会存储算法和公钥的引用

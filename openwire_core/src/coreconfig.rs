@@ -13,8 +13,6 @@ pub struct CoreConfig {
     pub path_to_log: Option<PathBuf>,
     /// 日志级别（可选）
     pub log_level: Option<String>,
-    /// 下载目录（可选）
-    pub download_dir: Option<PathBuf>,
     /// 中继节点列表 [(PeerId, Multiaddr)]
     pub relay_nodes: Vec<(String, String)>,
     /// 引导节点列表 [(PeerId, Multiaddr)]
@@ -47,7 +45,6 @@ impl CoreConfig {
                 data_dir: data_dir.into(),
                 path_to_log: None,
                 log_level: None,
-                download_dir: None,
                 relay_nodes: Vec::new(),
                 bootstrap_nodes: Vec::new(),
                 signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),
@@ -55,11 +52,11 @@ impl CoreConfig {
             };
         }
 
+        let safe_path_to_log = path_to_log.map(Into::into);
         Self {
             data_dir: data_dir.into(),
-            path_to_log: Some(path_to_log.unwrap().into()),
+            path_to_log: safe_path_to_log,
             log_level: log_level.map(|s| s.into()),
-            download_dir: None,
             relay_nodes: Vec::new(),
             bootstrap_nodes: Vec::new(),
             signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),

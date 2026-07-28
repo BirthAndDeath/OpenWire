@@ -19,19 +19,11 @@ pub async fn handle_incoming_request(
     channel: libp2p::request_response::ResponseChannel<ChatResponse>,
     request: ChatMessage,
 ) {
-    let data_preview = if !request.data.is_empty() {
-        let preview_len = std::cmp::min(16, request.data.len());
-        hex::encode(&request.data[..preview_len])
-    } else {
-        "empty".to_string()
-    };
-    tracing::info!(
-        "收到: {:?} from {}, data_len={}, data_preview={}, hash_preview={}",
+    tracing::debug!(
+        "收到: {:?} from {}, data_len={}",
         request.msgtype,
         peer,
         request.data.len(),
-        data_preview,
-        hex::encode(&request.hash[..std::cmp::min(8, request.hash.len())]),
     );
 
     let pool = match storage::pool() {
@@ -260,7 +252,7 @@ async fn handle_decrypted_message(
             handle_text_message(core, pool, sender_mldsa_pubkey_hex, decrypted_data).await;
         }
         ChatMessageType::FileHash => {
-            handle_file_hash_message(core, sender_mldsa_pubkey_hex, decrypted_data).await;
+            handle_file_hash_message(core, pool, sender_mldsa_pubkey_hex, decrypted_data).await;
         }
         ChatMessageType::FileStream => {
             handle_file_stream_message(core, decrypted_data).await;
@@ -347,9 +339,10 @@ async fn handle_text_message(
     }
 }
 
-/// 处理文件哈希消息：解析 FileHashInfo → 通知 UI（包含结构化数据供前端渲染可点击下载）
+/// 处理文件哈希消息：解析 FileHashInfo → 存储到数据库 + 通知 UI
 async fn handle_file_hash_message(
     core: &mut ChatCore,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
     sender_mldsa_pubkey_hex: &str,
     data: Vec<u8>,
 ) {
@@ -363,9 +356,35 @@ async fn handle_file_hash_message(
                 file_info.file_hash,
             );
 
-            // 发送结构化消息（枚举），上层负责序列化为 JSON
-            let file_id_hex = hex::encode(file_info.file_id);
             let file_hash_hex = hex::encode(file_info.file_hash);
+
+            // 存入数据库，使重启后仍在历史中可见
+            let owner_identity_id =
+                match storage::get_current_identity(pool).await.ok().flatten() {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!("未找到当前身份，无法保存收到的文件消息");
+                        return;
+                    }
+                };
+            let display_content = format!("{}{} {}{}",
+                crate::command::FILE_SHARE_CONTENT_PREFIX,
+                file_info.filename,
+                crate::command::FILE_SHARE_HASH_PREFIX,
+                file_hash_hex,
+            );
+            let _ = storage::add_message_with_hash(
+                pool,
+                &owner_identity_id,
+                sender_mldsa_pubkey_hex,
+                &display_content,
+                false,
+                false,
+                "", // 文件消息不需要去重哈希
+            )
+            .await;
+
+            let file_id_hex = hex::encode(file_info.file_id);
             core.send_message_mpsc(crate::command::IncomingMessage::FileShare {
                 filename: file_info.filename,
                 file_id: file_id_hex,
@@ -408,7 +427,7 @@ async fn handle_file_stream_message(core: &mut ChatCore, data: Vec<u8>) {
 }
 
 /// 处理文件下载请求（发送方收到接收方的下载请求）
-/// 解析 DownloadRequest → 查 sent_files 历史 → 拒绝/接受并发送分片
+/// 解析 DownloadRequest → 查 sent_files 历史 → 验证文件有效性 → 拒绝/接受并发送分片
 async fn handle_file_download_request(
     core: &mut ChatCore,
     sender_mldsa_pubkey_hex: &str,
@@ -425,7 +444,7 @@ async fn handle_file_download_request(
     let file_hash_hex = hex::encode(request.file_hash);
     tracing::info!("收到文件下载请求: file_hash={}..", &file_hash_hex[..16]);
 
-    // 查 sent_files 历史验证合法性，数据库不可用时降级到 file_path_map
+    // 查 sent_files 历史验证合法性
     let sent_file = match storage::pool() {
         Some(pool) => match storage::get_sent_file(pool, &request.file_hash).await {
             Ok(Some(sent)) => Some(sent),
@@ -434,48 +453,37 @@ async fn handle_file_download_request(
         None => None,
     };
 
-    // 优先使用 sent_files 记录的文件路径，否则回退到 file_path_map
-    let file_path = sent_file
-        .as_ref()
-        .map(|s| std::path::PathBuf::from(&s.file_path))
-        .or_else(|| core.file_path_map.get(&request.file_hash).cloned());
-
-    let Some(file_path) = file_path else {
+    let Some(sent_file) = sent_file else {
         tracing::warn!(
             "拒绝下载请求: file_hash={}.. 不在发送历史中",
             &file_hash_hex[..16]
         );
-        let response = crate::message::DownloadResponse {
-            file_hash: request.file_hash,
-            accepted: false,
-            filename: None,
-            total_size: None,
-            total_chunks: None,
-            chunk_size: None,
-        };
-        if let Ok(data) = postcard::to_allocvec(&response) {
-            let _ = core
-                .send_text(
-                    sender_mldsa_pubkey_hex,
-                    ChatMessageType::FileDownloadResponse,
-                    data,
-                )
-                .await;
-        }
+        send_reject_response(core, sender_mldsa_pubkey_hex, request.file_hash, "文件未授权：该文件不在发送历史中").await;
         return;
     };
 
-    let filename = sent_file.map(|s| s.filename).unwrap_or_else(|| {
-        file_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
+    // 验证文件是否仍有效（路径存在且哈希匹配）
+    let file_path = std::path::PathBuf::from(&sent_file.file_path);
+    match storage::verify_sent_file(&sent_file).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let reason = "下载被拒绝：文件可能已被移动、删除或内容已更改";
+            tracing::warn!(
+                "拒绝下载请求: file={:?}, reason={reason}",
+                sent_file.file_path
+            );
+            send_reject_response(core, sender_mldsa_pubkey_hex, request.file_hash, reason).await;
+            // 由定时器 handle_sent_file_scan 负责清理无效记录，避免并发竞态
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("验证文件有效性失败: {e}，拒绝请求但保留记录供下次重试");
+            send_reject_response(core, sender_mldsa_pubkey_hex, request.file_hash, "下载被拒绝：暂时无法验证文件有效性，请稍后重试").await;
+            return;
+        }
+    }
 
-    // 接受请求：注册到 file_path_map 供分片发送使用
-    core.file_path_map
-        .insert(request.file_hash, file_path.clone());
+    let filename = sent_file.filename.clone();
 
     // 获取文件信息
     let metadata = match tokio::fs::metadata(&file_path).await {
@@ -499,6 +507,7 @@ async fn handle_file_download_request(
         total_size: Some(file_size),
         total_chunks: Some(total_chunks),
         chunk_size: Some(chunk_size),
+        error_reason: None,
     };
     let response_data = match postcard::to_allocvec(&response) {
         Ok(d) => d,
@@ -538,9 +547,9 @@ async fn handle_file_download_request(
             if let Err(e) = core
                 .p2p_handle
                 .tx
-                .try_send(crate::actor::ActorCommand::Custom(P2pCommand::DialAddr {
+                .try_send(P2pCommand::DialAddr {
                     addr: dial_addr,
-                }))
+                })
             {
                 tracing::warn!("Failed to send DialAddr during file transfer: {e:?}");
             }
@@ -571,7 +580,7 @@ async fn handle_file_download_request(
             file_hash,
         };
 
-        let (chunk, bytes_read) =
+        let (chunk, _bytes_read) =
             match crate::message::FileStreamChunk::from_file(&mut file, &config, compression_level)
                 .await
             {
@@ -608,7 +617,7 @@ async fn handle_file_download_request(
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "发送文件分片 {} 失败 (尝试 {}/3): {}",
                         chunk_index,
                         attempt + 1,
@@ -639,7 +648,33 @@ async fn handle_file_download_request(
         total_chunks,
         sent_count,
     );
-    core.file_path_map.remove(&file_hash);
+}
+
+/// 发送拒绝下载的响应
+async fn send_reject_response(
+    core: &mut ChatCore,
+    sender_mldsa_pubkey_hex: &str,
+    file_hash: [u8; 32],
+    reason: &str,
+) {
+    let response = crate::message::DownloadResponse {
+        file_hash,
+        accepted: false,
+        filename: None,
+        total_size: None,
+        total_chunks: None,
+        chunk_size: None,
+        error_reason: Some(reason.to_string()),
+    };
+    if let Ok(data) = postcard::to_allocvec(&response) {
+        let _ = core
+            .send_text(
+                sender_mldsa_pubkey_hex,
+                ChatMessageType::FileDownloadResponse,
+                data,
+            )
+            .await;
+    }
 }
 
 /// 处理文件下载响应（接收方收到发送方的同意/拒绝）
@@ -652,11 +687,19 @@ async fn handle_file_download_response(core: &mut ChatCore, data: Vec<u8>) {
         }
     };
 
+    fallback_handle_download_response(core, response).await;
+}
+
+/// 直接处理下载响应（无 actor 时的回退路径）
+async fn fallback_handle_download_response(core: &mut ChatCore, response: crate::message::DownloadResponse) {
     if !response.accepted {
         let file_hash_hex = hex::encode(response.file_hash);
-        tracing::warn!("发送方拒绝了下载请求: file_hash={}..", &file_hash_hex[..16]);
-        core.send_warning_mpsc(format!("发送方拒绝了下载请求"))
-            .await;
+        let reason = response.error_reason.unwrap_or_else(|| "未知原因".to_string());
+        tracing::warn!(
+            "发送方拒绝了下载请求: file_hash={}.., reason={reason}",
+            &file_hash_hex[..16]
+        );
+        core.send_warning_mpsc(format!("下载被拒绝: {reason}")).await;
         return;
     }
 
@@ -668,7 +711,6 @@ async fn handle_file_download_response(core: &mut ChatCore, data: Vec<u8>) {
         response.total_chunks.unwrap_or(0),
     );
 
-    // 创建传输状态，等待 FileStream 分片到达
     let _ = core.handle_file_download_response(response).await;
 }
 
@@ -690,9 +732,9 @@ async fn send_response(
     // 我们需要通过 P2pActor 来发送响应
     let _ = core
         .p2p_handle
-        .send(crate::actor::ActorCommand::Custom(
+        .send(
             P2pCommand::SendResponse { channel, response },
-        ))
+        )
         .await;
 }
 

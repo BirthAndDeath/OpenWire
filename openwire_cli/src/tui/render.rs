@@ -1,10 +1,22 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::{App, Focus};
+
+/// 截断字符串到指定显示宽度（近似字符数），为尾部标记预留空间
+fn truncate_for_download(msg: &str, available_width: usize) -> String {
+    let marker = " [下载]";
+    let max_msg_len = available_width.saturating_sub(marker.len());
+    if msg.chars().count() > max_msg_len {
+        let truncated: String = msg.chars().take(max_msg_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    } else {
+        msg.to_string()
+    }
+}
 
 fn getcontacts(app: &App, contacts_list: &mut Vec<ListItem>) {
     *contacts_list = app
@@ -119,10 +131,37 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
     let input_area = right_vertical[1];
 
     // 渲染消息列表（仅显示当前选中联系人的消息）
+    let selected_contact = app
+        .contact_list_state
+        .selected()
+        .and_then(|i| app.contacts.get(i))
+        .map(|c| &c.mldsa_pubkey_hex);
+    // 可用宽度 = 消息区域宽度 - 边框(2) - 高亮符号(3) - 内边距(3)
+    let available_width = messages_area.width.saturating_sub(8) as usize;
     let messages: Vec<ListItem> = app
         .current_messages()
         .iter()
-        .map(|m| ListItem::new(Text::from(m.clone())))
+        .enumerate()
+        .map(|(idx, m)| {
+            let is_file_share = selected_contact
+                .and_then(|pk| app.file_shares_by_contact.get(pk))
+                .and_then(|shares| shares.get(idx))
+                .is_some_and(|s| s.is_some());
+            if is_file_share {
+                let truncated = truncate_for_download(m, available_width);
+                ListItem::new(Line::from(vec![
+                    Span::raw(truncated),
+                    Span::styled(
+                        " [下载]",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            } else {
+                ListItem::new(Text::from(m.clone()))
+            }
+        })
         .collect();
 
     let message_list = List::new(messages)
@@ -238,7 +277,7 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
 
     let status = match app.current_focus {
         Focus::Messages => format!(
-            " 模式: 浏览消息 (↑/↓选择, Enter回复){}{}",
+            " 模式: 浏览消息 (↑/↓选择, Enter回复, →下载文件){}{}",
             identity_prefix, online_indicator
         ),
         Focus::Input => {
@@ -276,4 +315,40 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
     };
     let status_bar = Paragraph::new(status).block(Block::default().borders(Borders::TOP));
     frame.render_widget(status_bar, messages_area);
+
+    // 下载对话框覆盖层
+    if let Some(info) = &app.download_dialog {
+        let area = frame.area();
+        let dialog_width = area.width.min(60);
+        let dialog_height = 8;
+        let dialog_x = area.x + (area.width - dialog_width) / 2;
+        let dialog_y = area.y + (area.height - dialog_height) / 2;
+        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+
+        frame.render_widget(Clear, dialog_area);
+        let dialog = Paragraph::new(vec![
+            Line::from(Span::styled(
+                " 下载文件 ",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(format!(" 文件: {}", info.filename))),
+            Line::from(Span::raw(format!(" 保存路径: {}", app.input))),
+            Line::from(Span::raw(format!(
+                " 默认: {}/downloads/{} (留空按 Enter)",
+                app.data_dir.display(),
+                info.filename
+            ))),
+            Line::from(Span::raw("")),
+            Line::from(Span::styled(
+                " Enter 确认下载 | C 取消 ",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(dialog, dialog_area);
+    }
 }

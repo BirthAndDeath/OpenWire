@@ -1,12 +1,8 @@
-use crate::CoreConfig;
-use sqlx::{
-    FromRow, Pool, Sqlite,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::{path::Path, time::Duration};
+use sqlx::{FromRow, Pool, Sqlite};
+use std::path::Path;
 use tracing;
 
-use crate::error::{StorageError, StorageResult};
+use crate::error::StorageResult;
 
 //此文件提供对身份进行操作的函数
 //通过初步审查✅

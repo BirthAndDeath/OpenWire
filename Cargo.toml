@@ -1,5 +1,13 @@
 [workspace]
-members = ["openwire_core", "rootcell", "openwire_cli", "openwire/src-tauri", "libp2p-pathranker", "openwire_server/common", "openwire_server/server_cli"]
+members = [
+    "openwire_core",
+    "rootcell",
+    "openwire_cli",
+    "openwire/src-tauri",
+    "libp2p-pathranker",
+    "openwire_server/common",
+    "openwire_server/server_cli",
+]
 resolver = "3"
 
 [workspace.dependencies]
@@ -27,12 +35,14 @@ libp2p = { version = "0.56.0", features = [
     "yamux",
     "memory-connection-limits",
     "websocket",
+    "rsa",
 ] }
 tracing = "0.1.44"
 [profile.dev]
 incremental = true
 lto = false
-
+#opt-level = 0
+#codegen-units = 256
 [profile.release]
 codegen-units = 1
 lto = "thin"

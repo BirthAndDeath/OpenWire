@@ -437,7 +437,9 @@ impl RecordStore for RedbRecordStore {
                         }));
 
                         if records.len() >= 10_000 {
-                            tracing::warn!("DHT records() returned more than 10,000 records, may affect performance");
+                            tracing::warn!(
+                                "DHT records() returned more than 10,000 records, may affect performance"
+                            );
                             break;
                         }
                     }
@@ -576,7 +578,9 @@ impl RecordStore for RedbRecordStore {
                                 }));
 
                                 if provided_records.len() >= 5_000 {
-                                    tracing::warn!("DHT provided() returned more than 5,000 records, may affect performance");
+                                    tracing::warn!(
+                                        "DHT provided() returned more than 5,000 records, may affect performance"
+                                    );
                                     break;
                                 }
                             }

@@ -2,6 +2,37 @@ use crate::message::ChatMessageType;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
+/// 文件分享消息在数据库 content 字段中的存储格式前缀
+/// 格式: "[文件] {filename} [hash:{64-hex-chars}]"
+/// 解析方通过此格式反序列化出文件元信息。
+pub const FILE_SHARE_CONTENT_PREFIX: &str = "[文件] ";
+/// 文件分享消息在数据库 content 字段中 hash 部分的前缀标记
+pub const FILE_SHARE_HASH_PREFIX: &str = " [hash:";
+
+/// 文件传输进度状态
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum TransferProgressStatus {
+    /// 下载中
+    #[serde(rename = "downloading")]
+    Downloading,
+    /// 已完成
+    #[serde(rename = "completed")]
+    Completed,
+    /// 失败
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::fmt::Display for TransferProgressStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferProgressStatus::Downloading => write!(f, "downloading"),
+            TransferProgressStatus::Completed => write!(f, "completed"),
+            TransferProgressStatus::Error => write!(f, "error"),
+        }
+    }
+}
+
 /// 文件传输进度事件（结构化数据）
 ///
 /// chat_core 通过此结构体向上层传递进度信息，
@@ -22,8 +53,8 @@ pub struct FileTransferProgress {
     pub received_bytes: u64,
     /// 文件总大小（字节）
     pub total_size: u64,
-    /// 状态："downloading" | "completed" | "error"
-    pub status: String, // "downloading" | "completed" | "error"
+    /// 传输状态
+    pub status: TransferProgressStatus,
 }
 
 /// 控制命令：外部向核心发送的指令
@@ -64,28 +95,14 @@ pub enum ChatCommand {
         identity_id: String,
     },
 
-/// 请求文件下载（接收方发起）
+    /// 请求文件下载（接收方发起）
     RequestFileDownload {
         /// 发送方的 ML-DSA 公钥 hex（谁分享的文件）
         sender_mldsa_pubkey_hex: String,
         /// 文件的 SHA256 哈希
         file_hash: [u8; 32],
-        /// 保存路径（含文件名），None 时用默认下载目录
-        save_path: Option<PathBuf>,
-    },
-
-    /// 设置下载目录
-    SetDownloadDir {
-        /// 下载目录路径
-        path: PathBuf,
-    },
-
-    /// 注册文件供下载（发送方在发送 FileHash 后调用，记录文件路径）
-    RegisterFileForDownload {
-        /// 文件唯一标识
-        file_id: [u8; 32],
-        /// 本地文件路径
-        file_path: PathBuf,
+        /// 保存路径（含文件名）
+        save_path: PathBuf,
     },
 
     /// 通过 DHT 发布身份记录到 Kademlia 网络

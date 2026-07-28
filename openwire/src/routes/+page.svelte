@@ -11,6 +11,7 @@
   import Toast from "./Toast.svelte";
   import NotificationBadge from "./NotificationBadge.svelte";
   import AddFriendModal from "./AddFriendModal.svelte";
+  import SentFileManager from "./SentFileManager.svelte";
   interface IdentityDto {
     id: number;
     identity_id: string;
@@ -113,6 +114,9 @@
   // 添加好友相关状态
   let showAddFriendModal = $state(false);
 
+  // 已发送文件管理
+  let showSentFiles = $state(false);
+
   let contacts = $state<
     {
       order: number;
@@ -127,10 +131,12 @@
 
   // === 核心是否已就绪（后端核心初始化完成） ===
   let coreReady = $state(false);
+  let coreInitError = $state<string | null>(null);
 
   // === 监听消息和事件 ===
   onMount(() => {
     let unlistenWarning: (() => void) | undefined;
+  let unlistenCoreInitFailed: (() => void) | undefined;
     let unlistenMessage: (() => void) | undefined;
     let unlistenFileProgress: (() => void) | undefined;
     let unlistenCoreReady: (() => void) | undefined;
@@ -147,6 +153,10 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
         coreReady = true;
         loadContacts();
         loadCurrentIdentity();
+      });
+
+      unlistenCoreInitFailed = await listen<string>("core-init-failed", (e) => {
+        coreInitError = e.payload;
       });
 
       unlistenWarning = await listen<string>("warning", (e) => {
@@ -267,6 +277,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     return () => {
       if (pollingTimer) clearInterval(pollingTimer);
       unlistenWarning?.();
+      unlistenCoreInitFailed?.();
       unlistenMessage?.();
       unlistenFileProgress?.();
       unlistenCoreReady?.();
@@ -341,6 +352,10 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   function goToIdentity() {
     goto("/identity");
   }
+
+  function openSentFiles() {
+    showSentFiles = true;
+  }
 </script>
 
 <main class="container">
@@ -380,6 +395,24 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             fill="currentColor"
             d="M10.95 19.55q.5.3 1.05.288t1.05-.313l4.55-2.775q-1.25-.875-2.675-1.312T12 15t-2.937.438t-2.713 1.287zm3.525-7.575Q15.5 10.95 15.5 9.5t-1.025-2.475T12 6T9.525 7.025T8.5 9.5t1.025 2.475T12 13t2.475-1.025m-3.525 9.9l-7-4.3q-.45-.275-.7-.725T3 15.875v-7.75q0-.525.25-.975t.7-.725l7-4.3q.5-.3 1.05-.3t1.05.3l7 4.3q.45.275.7.725t.25.975v7.75q0 .525-.25.975t-.7.725l-7 4.3q-.5.3-1.05.3t-1.05-.3"
           /></svg
+        >
+      </button>
+
+      <button
+        class="icon-btn"
+        onclick={openSentFiles}
+        title={$_("sent_files")}
+        aria-label="已发送文件"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          ><path
+            fill="currentColor"
+            d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM6 20V4h7v5h5v11z"
+          /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
         >
       </button>
     </div>
@@ -428,6 +461,9 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     {currentIdentityId}
     onFriendAdded={loadContacts}
   />
+
+  <!-- 已发送文件管理 -->
+  <SentFileManager bind:show={showSentFiles} />
 
   <div
     class="resizer-v"

@@ -94,6 +94,8 @@ pub struct DownloadResponse {
     pub total_chunks: Option<u32>,
     /// 分片大小（接受时返回）
     pub chunk_size: Option<u32>,
+    /// 拒绝原因（accepted=false 时返回）
+    pub error_reason: Option<String>,
 }
 
 // ========== 文件哈希信息方法 ==========

@@ -190,9 +190,9 @@ impl ChatCore {
                 let _ = self
                     .p2p_handle
                     .tx
-                    .try_send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+                    .try_send(P2pCommand::GetRecord {
                         key: mlkem_key,
-                    }));
+                    });
                 return hex::decode(&mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
             }
             _ => {
@@ -249,9 +249,9 @@ impl ChatCore {
         let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
         let _ = self
             .p2p_handle
-            .send(crate::actor::ActorCommand::Custom(P2pCommand::GetRecord {
+            .send(P2pCommand::GetRecord {
                 key: mlkem_key,
-            }))
+            })
             .await;
         Err(CoreError::MlKemKeyNotCached(format!(
             "联系人 {} 的 ML-KEM 公钥未缓存，消息已保存到离线队列，后台正在通过 DHT 网络查询",
@@ -531,7 +531,7 @@ impl ChatCore {
                     Ok(Some(peer_id)) => {
                         let online = self.connected_peers.contains_key(&peer_id);
                         if !online {
-                            tracing::debug!(
+                            tracing::trace!(
                                 "待发消息 {} 的接收方 {}.. 不在线，跳过",
                                 msg.id,
                                 &msg.peer_pubkey_hex[..16]
@@ -540,7 +540,7 @@ impl ChatCore {
                         online
                     }
                     _ => {
-                        tracing::debug!(
+                        tracing::trace!(
                             "待发消息 {} 的接收方 {}.. PeerID 未缓存，跳过",
                             msg.id,
                             &msg.peer_pubkey_hex[..16]
@@ -643,11 +643,11 @@ impl ChatCore {
         // 自动缓存到本地数据库，并触发 retry_pending_messages 重试待发送消息
         let _ = self
             .p2p_handle
-            .send(crate::actor::ActorCommand::Custom(
+            .send(
                 P2pCommand::GetProviders {
                     key: mldsa_pubkey_hex.to_string(),
                 },
-            ))
+            )
             .await;
 
         tracing::debug!(

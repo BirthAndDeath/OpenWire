@@ -245,6 +245,10 @@ pub enum StorageError {
     #[error("批量大小过大")]
     BatchSizeTooLarge,
 
+    /// 特性未启用
+    #[error("存储特性未启用: {0}（需要在 Cargo.toml 中启用该 feature）")]
+    FeatureNotEnabled(&'static str),
+
     /// I/O 错误
     #[error("I/O 错误: {0}")]
     IoError(#[from] std::io::Error),
@@ -265,26 +269,32 @@ pub enum StorageError {
 /// DHT 存储错误
 #[derive(Error, Debug)]
 pub enum DhtError {
+    #[cfg(feature = "redb_dht")]
     /// 创建 DHT 数据库失败
     #[error("创建 DHT 数据库失败: {0}")]
     CreateDatabaseFailed(#[source] redb::DatabaseError),
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库连接未初始化
     #[error("DHT 数据库连接未初始化")]
     DatabaseNotInitialized,
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库写入事务失败
     #[error("DHT 数据库写入事务失败: {0}")]
     WriteTransactionFailed(#[from] redb::TransactionError),
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库读取事务失败
     #[error("DHT 数据库读取事务失败: {0}")]
     ReadTransactionFailed(#[source] redb::TransactionError),
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库表错误
     #[error("DHT 数据库表错误: {0}")]
     TableError(#[from] redb::TableError),
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 提交事务失败
     #[error("DHT 提交事务失败: {0}")]
     CommitError(#[from] redb::CommitError),
@@ -293,6 +303,7 @@ pub enum DhtError {
     #[error("DHT 存储错误: {0}")]
     StoreError(#[from] libp2p::kad::store::Error),
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库存储操作失败
     #[error("DHT 数据库存储操作失败: {0}")]
     StorageError(#[from] redb::StorageError),
@@ -583,16 +594,18 @@ pub enum CoreError {
     #[error("日志初始化失败: {0}")]
     LogInitFailed(#[source] LogError),
 
+    #[cfg(feature = "redb_dht")]
     /// 创建 DHT 数据库失败
     #[error("创建 DHT 数据库失败 {path:?}: {source}")]
     DhtDatabaseCreateFailed {
-        /// 数据库路径
+        /// 数据库文件路径
         path: std::path::PathBuf,
-        /// 底层错误
+        /// 底层 redb 错误
         #[source]
         source: redb::Error,
     },
 
+    #[cfg(feature = "redb_dht")]
     /// DHT 数据库连接未初始化
     #[error("DHT 数据库连接未初始化")]
     DhtDatabaseNotInitialized,

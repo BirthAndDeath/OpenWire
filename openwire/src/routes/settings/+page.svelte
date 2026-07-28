@@ -600,67 +600,6 @@
     padding: 8px;
   }
 
-  /* 目录设置样式 */
-  .dir-setting {
-    margin-bottom: 20px;
-    padding: 12px;
-    background: var(--bg-secondary, #0a0a0a);
-    border: 1px solid var(--border-color, #2a2a2a);
-    border-radius: 6px;
-  }
-
-  .dir-setting:last-child {
-    margin-bottom: 0;
-  }
-
-  .dir-setting-header {
-    margin-bottom: 8px;
-  }
-
-  .dir-path {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    margin-bottom: 12px;
-    font-size: 13px;
-    word-break: break-all;
-  }
-
-  .dir-path-label {
-    color: var(--text-secondary, #737373);
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  .dir-path-value {
-    color: var(--text-primary, #fafafa);
-    font-family: monospace;
-    background: var(--bg-tertiary, #1a1a1a);
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 12px;
-  }
-
-  .select-dir-button {
-    background: transparent;
-    border: 1px solid var(--border-color, #2a2a2a);
-    border-radius: 6px;
-    padding: 8px 16px;
-    color: var(--text-primary, #fafafa);
-    cursor: pointer;
-    font-size: 13px;
-    transition: all 0.2s;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .select-dir-button:hover {
-    background: var(--bg-tertiary, #1a1a1a);
-    border-color: #3b82f6;
-    color: #3b82f6;
-  }
-
   /* 开关样式 */
   .toggle-setting {
     display: flex;

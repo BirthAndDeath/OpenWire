@@ -47,8 +47,12 @@ pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
                 if let Event::Key(key) = event
                     && key.kind == KeyEventKind::Press
                 {
+                    let is_ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
                     match key.code {
-                        KeyCode::Esc => break,
+                        // Ctrl+C 退出
+                        KeyCode::Char('c') if is_ctrl => break,
+                        // Esc 退出（下载对话框打开时不触发，由对话框内部处理）
+                        KeyCode::Esc if app.download_dialog.is_none() => break,
                         KeyCode::Tab => app.current_focus = app.current_focus.next_focus(),
                         KeyCode::F(2) => {
                             app.current_focus = Focus::IdentityArea;
@@ -96,8 +100,9 @@ pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
     // 使用 spawn_blocking 等待后台线程结束，添加超时防止永久阻塞
     let result_thread = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || core_joinhandle.join())
-    ).await;
+        tokio::task::spawn_blocking(move || core_joinhandle.join()),
+    )
+    .await;
     match result_thread {
         Ok(Ok(join_result)) => eprintln!("结束后台线程 结果{:?}", join_result),
         Ok(Err(e)) => eprintln!("等待后台线程失败: {:?}", e),

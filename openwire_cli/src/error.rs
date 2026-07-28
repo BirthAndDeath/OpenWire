@@ -12,7 +12,9 @@ pub enum CliError {
     #[error("基础路径获取失败")]
     BaseStrategyFailed,
 
-    #[error("系统密钥环（Keyring）不可用。OpenWire 需要系统密钥环来安全存储加密密钥。\n请确保已安装并配置密钥环服务：\n  - Windows: Credential Manager（默认可用）\n  - macOS: Keychain（默认可用）\n  - Linux: 安装 gnome-keyring 或 kwallet\n  - Android/iOS: 平台内置密钥环")]
+    #[error(
+        "系统密钥环（Keyring）不可用。OpenWire 需要系统密钥环来安全存储加密密钥。\n请确保已安装并配置密钥环服务：\n  - Windows: Credential Manager（默认可用）\n  - macOS: Keychain（默认可用）\n  - Linux: 安装 gnome-keyring 或 kwallet\n  - Android/iOS: 平台内置密钥环"
+    )]
     KeyringNotAvailable,
 
     #[error("I/O 错误: {0}")]

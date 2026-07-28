@@ -17,6 +17,7 @@ ratatui = "0.30.2"
 arboard = "3.6"
 etcetera = "0.11.0"
 rootcell = { workspace = true }
+hex = "0.4.3"
 [package.metadata.docs.rs]
 # docs.rs 构建时使用
 no-deps = true

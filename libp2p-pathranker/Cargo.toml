@@ -7,15 +7,8 @@ edition = "2024"
 default = []
 
 [dependencies]
-async-trait = "0.1.89"
-futures = "0.3.32"
-libp2p = { version = "0.56.0", features = ["request-response", "tokio", "tcp", "dns", "noise", "yamux", "macros"] }
+libp2p = { version = "0.56.0", features = ["request-response", "tokio", "cbor"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
 rand = "0.8"
 lru = "0.18"
-tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }

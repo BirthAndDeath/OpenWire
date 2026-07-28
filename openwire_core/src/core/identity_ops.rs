@@ -145,7 +145,6 @@ impl ChatCore {
         };
         let peer_id = keypair.public().to_peer_id();
 
-        let dht_cache = self.dht_cache.clone();
         let bootstrap_nodes: Vec<(String, String)> = Vec::new();
         let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), &bootstrap_nodes) {
             Ok(s) => s,
@@ -250,7 +249,6 @@ impl ChatCore {
 
     /// 重新初始化 swarm（生成新 PeerID）
     fn reinitialize_swarm(&mut self) {
-        let dht_cache = self.dht_cache.clone();
         let bootstrap_nodes: Vec<(String, String)> = Vec::new();
         match identity::generate_temporary_peerid() {
             Ok(keypair) => {
@@ -295,12 +293,10 @@ impl ChatCore {
     async fn publish_tombstone_records(&mut self, identity_id: &str) {
         // 通过 P2pActor 发布墓碑记录（空 ML-KEM 公钥表示删除）
         let _ = self.p2p_handle.tx.try_send(
-            crate::actor::ActorCommand::Custom(
-                crate::actor::p2p::P2pCommand::PublishIdentity {
-                    mldsa_pubkey_hex: identity_id.to_string(),
-                    mlkem_pubkey_hex: String::new(),
-                },
-            ),
+            crate::actor::p2p::P2pCommand::PublishIdentity {
+                mldsa_pubkey_hex: identity_id.to_string(),
+                mlkem_pubkey_hex: String::new(),
+            },
         );
         tracing::info!(
             "Published tombstone records to DHT network for deleted identity: {}",

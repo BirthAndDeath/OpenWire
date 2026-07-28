@@ -1,2 +1,2 @@
 pub mod behavior;
-pub use behavior::AlertLevel;
+pub use behavior::{AlertLevel, PathType, RankerConfig};
