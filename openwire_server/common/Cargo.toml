@@ -7,4 +7,4 @@ edition = "2024"
 openwire_core = { workspace = true }
 libp2p = { workspace = true }
 tracing = { workspace = true }
-anyhow = "1.0.103"
+anyhow = "1.0.104"
