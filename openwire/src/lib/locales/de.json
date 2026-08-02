@@ -101,5 +101,8 @@
     "loading_nodes": "Lade Knotenkonfiguration...",
     "sent_files": "Gesendete Dateien",
     "no_sent_files": "Keine gesendeten Dateien",
-    "revoke": "Widerrufen"
+    "revoke": "Widerrufen",
+    "filename": "Dateiname",
+    "size": "Größe",
+    "sent_at": "Gesendet am"
 }

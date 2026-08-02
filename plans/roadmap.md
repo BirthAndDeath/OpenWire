@@ -34,18 +34,18 @@
 - [x] Simplify P2pActorHandle (direct P2pCommand channel)
 - [x] Split P2pActor: relay_handler.rs extracted
 
-## Phase 3: Bug Fixes (Next)
+## Phase 3: Bug Fixes
 
-- [ ] F1: send_response channel drop → send error response
-- [ ] F2: Frontend file share format mismatch → detect FILE_SHARE prefix
-- [ ] F3: bootstrap_nodes empty → load from config
-- [ ] F4: delete_contact dialog timeout → 30s timeout
-- [ ] F5: delete_contact error propagation → use ?
-- [ ] F6: Identity deletion cleanup → clear peerid_to_pubkey
+- [x] F1: send_response channel drop → send error response
+- [ ] F2: Frontend file share format mismatch → detect FILE_SHARE prefix (legacy messages)
+- [x] F3: bootstrap_nodes empty → load from config (P2pActorBuilder + graceful shutdown)
+- [x] F4: delete_contact dialog timeout → 30s timeout
+- [x] F5: delete_contact error propagation → use ?
+- [x] F6: Identity deletion cleanup → clear peerid_to_pubkey
 - [ ] F7: mark_sent_by_hash error → handle gracefully
 - [ ] F8: DHT publish failure → send Warning event to UI
-- [ ] F9: Contact lastMsg wrong key → remove selectedId
-- [ ] F10: handleScroll parameter type → fix VList callback
+- [x] F9: Contact lastMsg wrong key → remove selectedId
+- [x] F10: handleScroll parameter type → fix VList callback
 - [ ] F11: CLI status bar overlap → use bottom area
 - [ ] F12: CLI detect_file_share rfind → find
 

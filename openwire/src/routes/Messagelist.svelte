@@ -84,23 +84,51 @@
         ts: number;
         pending: number;
     }): Msg {
-        // 尝试解析 file_hash 消息
         let type: Msg["type"] = "text";
         let file_hash_info: Msg["file_hash_info"] = undefined;
-        try {
-            const parsed = JSON.parse(m.content);
-            if (parsed.file_hash && parsed.filename !== undefined) {
-                type = "file_hash";
-                file_hash_info = {
-                    filename: parsed.filename,
-                    total_size: parsed.total_size || 0,
-                    file_hash: parsed.file_hash,
-                    file_id: parsed.file_id || parsed.file_hash,
-                };
+
+        // 尝试解析新版 file_hash 格式: "[文件] filename [hash:hex64]"
+        const FILE_SHARE_PREFIX = "[文件] ";
+        const FILE_SHARE_HASH_PREFIX = " [hash:";
+        if (m.content.startsWith(FILE_SHARE_PREFIX)) {
+            const hashStart = m.content.indexOf(FILE_SHARE_HASH_PREFIX);
+            if (hashStart !== -1) {
+                const filename = m.content.substring(FILE_SHARE_PREFIX.length, hashStart);
+                const hashEnd = m.content.indexOf("]", hashStart + FILE_SHARE_HASH_PREFIX.length);
+                if (hashEnd !== -1) {
+                    const fileHash = m.content.substring(
+                        hashStart + FILE_SHARE_HASH_PREFIX.length,
+                        hashEnd,
+                    );
+                    type = "file_hash";
+                    file_hash_info = {
+                        filename,
+                        total_size: 0,
+                        file_hash: fileHash,
+                        file_id: fileHash,
+                    };
+                }
             }
-        } catch {
-            // 不是 JSON，保持 text 类型
         }
+
+        // 尝试解析旧版 JSON 格式（兼容历史消息）
+        if (type === "text") {
+            try {
+                const parsed = JSON.parse(m.content);
+                if (parsed.file_hash && parsed.filename !== undefined) {
+                    type = "file_hash";
+                    file_hash_info = {
+                        filename: parsed.filename,
+                        total_size: parsed.total_size || 0,
+                        file_hash: parsed.file_hash,
+                        file_id: parsed.file_id || parsed.file_hash,
+                    };
+                }
+            } catch {
+                // 不是 JSON，保持 text 类型
+            }
+        }
+
         return {
             id: `hist-${m.id}`,
             content:

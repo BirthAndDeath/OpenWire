@@ -74,7 +74,7 @@ pub fn encrypt_message(
     // 4. 使用 AES-GCM 加密数据
     let cipher = Aes256Gcm::new(&aes_key.into());
     let ciphertext = cipher
-        .encrypt(&nonce, data)
+        .encrypt(nonce, data)
         .map_err(|e| crate::error::CryptoError::AesGcmEncryptionFailed(e.to_string()))?;
 
     // 5. 组合: version + ciphertext_kem + nonce + ciphertext
@@ -89,7 +89,7 @@ pub fn encrypt_message(
     // 添加版本标识
     result.push(CURRENT_ENCRYPTION_VERSION);
     result.extend_from_slice(kem_ciphertext_bytes);
-    result.extend_from_slice(&nonce);
+    result.extend_from_slice(nonce);
     result.extend_from_slice(&ciphertext);
 
     Ok(result)
@@ -188,18 +188,11 @@ fn derive_aes_key_from_mlkem(shared_secret: &[u8]) -> [u8; 32] {
 
 /// 恒定时间比较两个字节数组
 ///
-/// 防止时序攻击，无论比较结果如何，都执行相同数量的操作
+/// 防止时序攻击，无论比较结果如何，都执行相同数量的操作。
+/// 使用 `subtle` crate 确保编译器不会优化掉恒定时间特性。
 pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-
-    result == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]

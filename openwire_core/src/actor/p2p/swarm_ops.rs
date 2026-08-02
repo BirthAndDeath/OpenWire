@@ -65,14 +65,17 @@ pub fn send_response(
 // DHT 操作
 // ============================================================================
 
-/// 发布身份到 DHT（start_providing + put_record）
-pub fn publish_identity_to_dht(
-    swarm: &mut Swarm<MyBehaviour>,
-    mldsa_pubkey_hex: &str,
-    mlkem_pubkey_hex: &str,
-) {
-    // 1. 使用 Kademlia 原生 provider 机制发布 PeerID
-    let key = libp2p::kad::RecordKey::new(&mldsa_pubkey_hex.to_string());
+/// 将 ML-DSA 公钥 hex 哈希为 DHT 查询键，隐藏原始公钥
+pub fn dht_key(mldsa_pubkey_hex: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(mldsa_pubkey_hex.as_bytes()))
+}
+
+/// 发布身份到 DHT（ML-KEM 不再存入 DHT）
+///
+/// 使用 SHA256(ML-DSA 公钥) 作为 provider key，隐藏原始公钥。
+pub fn publish_identity_to_dht(swarm: &mut Swarm<MyBehaviour>, mldsa_pubkey_hex: &str) {
+    let key = libp2p::kad::RecordKey::new(&dht_key(mldsa_pubkey_hex));
     match swarm.behaviour_mut().kademlia.start_providing(key) {
         Ok(query_id) => {
             tracing::debug!(
@@ -89,49 +92,12 @@ pub fn publish_identity_to_dht(
             );
         }
     }
-
-    // 2. 发布 ML-KEM 公钥记录
-    if !mlkem_pubkey_hex.is_empty() {
-        let record_key = format!("mlkem:{}", mldsa_pubkey_hex);
-        let record = libp2p::kad::Record {
-            key: libp2p::kad::RecordKey::new(&record_key),
-            value: mlkem_pubkey_hex.as_bytes().to_vec(),
-            publisher: None,
-            expires: None,
-        };
-        match swarm
-            .behaviour_mut()
-            .kademlia
-            .put_record(record, libp2p::kad::Quorum::One)
-        {
-            Ok(query_id) => {
-                tracing::debug!(
-                    "Published ML-KEM pubkey for ML-DSA {} (query_id: {:?})",
-                    truncate_str(mldsa_pubkey_hex, 16),
-                    query_id,
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to publish ML-KEM pubkey for ML-DSA {}: {:?}",
-                    truncate_str(mldsa_pubkey_hex, 16),
-                    e
-                );
-            }
-        }
-    }
 }
 
-/// 发起 GetProviders 查询
+/// 发起 GetProviders 查询（key 由调用方用 dht_key 哈希）
 pub fn get_providers(swarm: &mut Swarm<MyBehaviour>, key: &str) {
     let record_key = libp2p::kad::RecordKey::new(&key);
     let _query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
-}
-
-/// 发起 GetRecord 查询
-pub fn get_record(swarm: &mut Swarm<MyBehaviour>, key: &str) {
-    let record_key = libp2p::kad::RecordKey::new(&key);
-    let _query_id = swarm.behaviour_mut().kademlia.get_record(record_key);
 }
 
 /// 添加地址到 Kademlia 路由表

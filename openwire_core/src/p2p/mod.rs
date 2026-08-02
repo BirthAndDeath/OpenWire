@@ -2,8 +2,8 @@
 pub mod behaviour;
 /// DHT 内存缓存（替代旧的 redb 持久化存储）
 pub mod dht_cache;
-/// DHT 本地缓存查询
-pub mod dht;
+/// Kademlia DHT 事件处理
+pub mod kademlia;
 mod events;
 pub mod netevent;
 pub mod nodes;

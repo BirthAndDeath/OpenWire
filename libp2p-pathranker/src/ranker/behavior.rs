@@ -182,6 +182,7 @@ pub enum PathType {
 }
 
 impl PathType {
+    /// 根据 multiaddr 推断路径类型，优先级：Relay > Quic > WebRTC > WebSocket > TCP
     pub fn from_multiaddr(addr: &Multiaddr) -> Self {
         let mut has_quic = false;
         let mut has_circuit = false;
@@ -209,11 +210,13 @@ impl PathType {
         }
     }
 
+    /// 协议偏好加成，控制台输出顺序：QUIC > Direct > HolePunch > WebSocket > Relay
+    /// 加成值会叠加到 rank() 的综合评分中，影响地址排序优先级。
     pub fn bonus(&self) -> f64 {
         match self {
-            PathType::Direct => 0.1,
-            PathType::HolePunch => 0.05,
-            PathType::Quic => 0.08,
+            PathType::Quic => 0.15,
+            PathType::Direct => 0.10,
+            PathType::HolePunch => 0.08,
             PathType::Relay => 0.0,
             PathType::Unknown => 0.0,
         }
@@ -339,12 +342,13 @@ impl BehaviorRanker {
     /// 对候选地址排序，返回按有效评分降序的地址序列。
     ///
     /// 评分计算步骤：
-    /// 1. 基础评分 = `entry.score`
-    /// 2. 延迟趋势衰减：最近 3 次持续上升 → ×0.9
-    /// 3. 融合远程自评：`effective_score = score * peer_self_score`
+    /// 1. 基础评分 = `entry.score`（无历史时使用 PathType 初始分）
+    /// 2. 协议偏好加成：`PathType::bonus()` 叠加（QUIC > Direct > HolePunch > Relay）
+    /// 3. 延迟趋势衰减：最近 3 次持续上升 → ×0.9
+    /// 4. 融合远程自评：`effective_score = score * peer_self_score`
     ///    警戒等级越高自评权重越大（`self_score_multiplier` 放大）
-    /// 4. 信用过滤：使用 `credit_threshold_at(alert_level)` 动态阈值
-    /// 5. 未使用地址临时信用 ×0.9
+    /// 5. 信用过滤：使用 `credit_threshold_at(alert_level)` 动态阈值
+    /// 6. 未使用地址临时信用 ×0.9
     ///
     /// 探索预算和多样性也由 `alert_level` 动态调节。
     pub fn rank(&self, peer: &PeerId, addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
@@ -357,32 +361,49 @@ impl BehaviorRanker {
         let credit_threshold = self.config.credit_threshold_at(self.alert_level);
         let self_score_mult = self.config.self_score_multiplier_at(self.alert_level);
 
+        // 默认初始分：无历史记录的地址使用此值，确保新地址也有机会被尝试。
+        // 加上 protocol_bonus 后（QUIC=0.15 → 0.45，Direct=0.10 → 0.40），
+        // 低于 ScoreEntry 的默认 score（0.5），所以有历史记录的地址始终优先于新地址。
+        // 各协议新地址的初始排序：QUIC(0.45) > Direct(0.40) > HolePunch(0.38) > Relay(0.30)
+        const DEFAULT_SCORE: f64 = 0.3;
+        const DEFAULT_CREDIT: f64 = 50.0;
+
         let mut scored: Vec<_> = addrs
             .iter()
             .cloned()
-            .filter_map(|addr| {
+            .map(|addr| {
+                let path_type = PathType::from_multiaddr(&addr);
+                let protocol_bonus = path_type.bonus();
+
                 let entry = self.scores.get(peer).and_then(|m| m.get(&addr));
-                entry.map(|e| {
-                    let mut adjusted_score = e.score;
+                match entry {
+                    Some(e) => {
+                        // feedback() 已包含 PathType::bonus()，此处不再重复叠加
+                        let mut adjusted_score = e.score;
 
-                    if e.latency_history.len() >= 3 {
-                        let recent: Vec<_> = e.latency_history.iter().copied().collect();
-                        if recent[0] <= recent[1] && recent[1] <= recent[2] {
-                            adjusted_score *= 0.9;
+                        if e.latency_history.len() >= 3 {
+                            let recent: Vec<_> = e.latency_history.iter().copied().collect();
+                            if recent[0] <= recent[1] && recent[1] <= recent[2] {
+                                adjusted_score *= 0.9;
+                            }
                         }
+
+                        let effective_self_score =
+                            1.0 - (1.0 - e.peer_self_score) * self_score_mult;
+                        adjusted_score *= effective_self_score;
+
+                        let mut effective_credit = e.credit;
+                        if now.duration_since(e.last_used) > unused_cutoff {
+                            effective_credit *= 0.9;
+                        }
+
+                        (addr, adjusted_score, effective_credit)
                     }
-
-                    // 融合远程自评，警戒等级越高放大倍数越大
-                    let effective_self_score = 1.0 - (1.0 - e.peer_self_score) * self_score_mult;
-                    adjusted_score *= effective_self_score;
-
-                    let mut effective_credit = e.credit;
-                    if now.duration_since(e.last_used) > unused_cutoff {
-                        effective_credit *= 0.9;
+                    None => {
+                        // 无历史记录的地址：使用协议初始分 + 默认信用
+                        (addr, DEFAULT_SCORE + protocol_bonus, DEFAULT_CREDIT)
                     }
-
-                    (addr, adjusted_score, effective_credit)
-                })
+                }
             })
             .collect();
 

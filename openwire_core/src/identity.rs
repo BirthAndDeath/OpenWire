@@ -3,12 +3,41 @@ use aws_lc_rs::signature::KeyPair;
 use libp2p::identity;
 use zeroize::Zeroizing;
 
-use crate::{coreconfig::CoreConfig, storage};
+use crate::{coreconfig::CoreConfig, peerid_store::PeerIdConfig, storage};
 
 /// 生成临时 PeerId（ed25519 密钥对）
+///
+/// 如果提供了 `PeerIdConfig`（持久化），则恢复存储的密钥对实现 PeerID 稳定；
+/// 否则每次生成全新的密钥对（向后兼容，用于测试等场景）。
 pub fn generate_temporary_peerid() -> crate::error::IdentityResult<identity::Keypair> {
     let keypair = identity::Keypair::generate_ed25519();
     Ok(keypair)
+}
+
+/// 从持久化配置恢复 PeerID，或生成新的
+pub fn load_or_create_peerid(
+    data_dir: &std::path::Path,
+) -> (identity::Keypair, PeerIdConfig) {
+    let config = PeerIdConfig::load_or_create(data_dir);
+    match config.to_keypair() {
+        Ok(kp) => {
+            tracing::info!("Restored PeerID from persistent storage: {}", kp.public().to_peer_id());
+            (kp, config)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to restore PeerID from config, generating new: {e}");
+            // 删除损坏的文件，避免 load_or_create 再次读取相同损坏数据
+            let config_path = PeerIdConfig::path(data_dir);
+            if let Err(e) = std::fs::remove_file(&config_path) {
+                tracing::warn!("Failed to remove corrupt PeerIdConfig file: {e}");
+            }
+            let config = PeerIdConfig::load_or_create(data_dir);
+            let kp = config
+                .to_keypair()
+                .expect("Freshly created PeerIdConfig should always yield a valid keypair");
+            (kp, config)
+        }
+    }
 }
 
 /// 完整身份信息（ML-DSA 签名 + ML-KEM 封装密钥）

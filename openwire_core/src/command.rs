@@ -105,17 +105,13 @@ pub enum ChatCommand {
         save_path: PathBuf,
     },
 
-    /// 通过 DHT 发布身份记录到 Kademlia 网络
+    /// 通过 DHT 发布身份到 Kademlia 网络
     ///
-    /// 将当前身份的 ML-DSA 公钥 -> PeerID 映射发布到 DHT 网络，
-    /// 使其他节点可以通过公钥查询到当前节点的 PeerID。
+    /// 使用 SHA256(ML-DSA 公钥) 作为 provider key，隐藏原始公钥。
+    /// ML-KEM 公钥不再存入 DHT，改为通过 FriendOnline 直接传递。
     DhtPublishIdentity {
-        /// ML-DSA 公钥 hex（记录键）
+        /// ML-DSA 公钥 hex
         mldsa_pubkey_hex: String,
-        /// 当前 PeerID（记录值，序列化为字符串）
-        peer_id: String,
-        /// ML-KEM 公钥 hex（记录值，序列化为字符串）
-        mlkem_pubkey_hex: String,
     },
 
     /// 通过 DHT 发现联系人

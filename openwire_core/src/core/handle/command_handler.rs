@@ -69,13 +69,8 @@ impl ChatCore {
                 self.handle_file_download_request(&sender_mldsa_pubkey_hex, file_hash, save_path)
                     .await;
             }
-            ChatCommand::DhtPublishIdentity {
-                mldsa_pubkey_hex,
-                peer_id,
-                mlkem_pubkey_hex,
-            } => {
-                self.publish_identity_to_dht(&mldsa_pubkey_hex, &peer_id, &mlkem_pubkey_hex)
-                    .await;
+            ChatCommand::DhtPublishIdentity { mldsa_pubkey_hex } => {
+                self.publish_identity_to_dht(&mldsa_pubkey_hex).await;
             }
             ChatCommand::DiscoverContact {
                 mldsa_pubkey_hex,

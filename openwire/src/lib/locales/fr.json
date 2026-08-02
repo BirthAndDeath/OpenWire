@@ -101,5 +101,8 @@
     "loading_nodes": "Chargement de la configuration...",
     "sent_files": "Fichiers envoyés",
     "no_sent_files": "Aucun fichier envoyé",
-    "revoke": "Révoquer"
+    "revoke": "Révoquer",
+    "filename": "Nom du fichier",
+    "size": "Taille",
+    "sent_at": "Envoyé le"
 }

@@ -8,6 +8,7 @@ default = ["mem_dht", "sqlite_history_storage", "pathranker"]
 sqlite_history_storage = []
 mem_dht = ["dashmap"]
 redb_dht = ["redb"]
+persist_routing = []
 pathranker = ["libp2p-pathranker"]
 [dependencies]
 thiserror = "2"
@@ -30,6 +31,7 @@ aws-lc-rs = { version = "1.17", features = ["unstable", "prebuilt-nasm"] }
 
 hex = "0.4.3"
 blake3 = "1.8.5"
+subtle = "2"
 rand = "0.10.2"
 lru = "0.18.1"
 
@@ -40,10 +42,11 @@ async-compression = { version = "0.4.43", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 async-trait = "0.1.91"
 vstd = "0.0.0-2026-07-27-0206"
-tokio-tungstenite = "0.24"
 libp2p-pathranker = { path = "../libp2p-pathranker", optional = true }
-[dev-dependencies]
 serde_json = "1"
 
+
+[dev-dependencies]
+did-key = "0.2.1"
 [package.metadata.docs.rs]
 #no-deps = true

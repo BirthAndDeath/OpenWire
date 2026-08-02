@@ -123,12 +123,14 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),    // 右上：消息列表
-            Constraint::Length(3), // 右下：输入框
+            Constraint::Length(3), // 中间：输入框
+            Constraint::Length(1), // 右下：状态栏
         ])
         .split(horizontal_chunks[1]);
 
     let messages_area = right_vertical[0];
     let input_area = right_vertical[1];
+    let status_area = right_vertical[2];
 
     // 渲染消息列表（仅显示当前选中联系人的消息）
     let selected_contact = app
@@ -314,7 +316,7 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
         }
     };
     let status_bar = Paragraph::new(status).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(status_bar, messages_area);
+    frame.render_widget(status_bar, status_area);
 
     // 下载对话框覆盖层
     if let Some(info) = &app.download_dialog {

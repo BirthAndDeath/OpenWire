@@ -1,4 +1,4 @@
-use crate::actor::p2p::P2pCommand;
+use crate::actor::p2p::{swarm_ops as p2p_swarm_ops, P2pCommand};
 use sha2::{Digest, Sha256};
 
 use crate::{core::ChatCore, crypto, error::CoreError, message::ChatMessageType, storage};
@@ -139,11 +139,15 @@ impl ChatCore {
 
         // 首次发送成功后立即标记为已发送，防止重制定时器重复发送消息
         // 重试路径由 retry_single_pending_message 中的 mark_sent 按 ID 标记
-        if !is_retry {
-            if let Some(pool) = storage::pool() {
-                let _ = storage::mark_sent_by_hash(pool, &message_hash).await;
-            }
-        }
+        if !is_retry
+            && let Some(pool) = storage::pool()
+                && let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await {
+                    tracing::warn!(
+                        "标记消息 {}.. 为已发送失败: {}（消息已发送，但 pending 状态未更新，可能触发重试）",
+                        &message_hash[..16],
+                        e,
+                    );
+                }
 
         Ok(message_hash)
     }
@@ -178,38 +182,24 @@ impl ChatCore {
             data.len()
         );
 
-        // 步骤 1：从 DHT 本地数据库查询（优先级最高）
-        // DHT 本地数据库中的 ML-KEM 公钥在 select_identity 时实时更新，
-        // 而 contacts 表中的公钥仅在添加联系人时写入一次，不会自动更新。
+        // 步骤 1：从 peerid_to_mlkem 缓存查询（FriendOnline 直接传递，无需 DHT）
+        // 通过 DHT 缓存找到目标公钥对应的 PeerID，再查 ML-KEM 公钥
         let store = self.get_dht_store();
-        match store.get_mlkem_pubkey(mldsa_pubkey_hex) {
-            Ok(Some(mlkem_hex)) if !mlkem_hex.is_empty() => {
-                tracing::info!("Found ML-KEM pubkey for {} via DHT local DB", pubkey_short);
-                // 后台异步发起 DHT 网络查询以验证公钥是否最新
-                let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-                let _ = self
-                    .p2p_handle
-                    .tx
-                    .try_send(P2pCommand::GetRecord {
-                        key: mlkem_key,
-                    });
-                return hex::decode(&mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
-            }
-            _ => {
-                tracing::debug!(
-                    "ML-KEM pubkey not found in DHT local DB for {}, trying contacts DB",
-                    pubkey_short
-                );
-            }
-        }
+        let peer_id = store.get_peerid_by_pubkey(mldsa_pubkey_hex).ok().flatten();
+        if let Some(pid) = peer_id
+            && let Some(mlkem_hex) = self.peerid_to_mlkem.get(&pid)
+                && !mlkem_hex.is_empty() {
+                    tracing::info!("Found ML-KEM pubkey for {} via peerid_to_mlkem", pubkey_short);
+                    return hex::decode(mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
+                }
 
-        // 步骤 2：从 contacts 表查询（兜底）
+        // 步骤 2：从 contacts 表查询（兜底，可能是旧数据）
         if let Some(pool) = storage::pool() {
             match storage::get_contact_mlkem_pubkey(pool, owner_identity_id, mldsa_pubkey_hex).await
             {
                 Ok(Some(pubkey)) if !pubkey.is_empty() => {
                     tracing::debug!(
-                        "Found ML-KEM pubkey for {} in contacts DB ({} bytes)",
+                        "Found ML-KEM pubkey for {} in contacts DB ({} bytes, may be stale)",
                         pubkey_short,
                         pubkey.len()
                     );
@@ -235,9 +225,10 @@ impl ChatCore {
             return Err(CoreError::DatabaseNotAvailable);
         }
 
-        // 步骤 3：本地没有，保存到离线队列并发起 DHT 网络查询（非阻塞）
+        // 步骤 3：本地没有，保存到离线队列等待重试
+        // 对方不在线时 FriendOnline 未送达，无 ML-KEM 缓存，待重试
         tracing::debug!(
-            "lookup_mlkem_pubkey: 步骤3 - 本地无 ML-KEM 公钥, is_retry={}, 将调用 save_pending_message",
+            "lookup_mlkem_pubkey: ML-KEM 公钥未缓存, is_retry={}, 将保存到离线队列",
             is_retry
         );
         if !is_retry {
@@ -246,15 +237,8 @@ impl ChatCore {
         } else {
             tracing::debug!("lookup_mlkem_pubkey: is_retry=true, 跳过 save_pending_message");
         }
-        let mlkem_key = format!("mlkem:{}", mldsa_pubkey_hex);
-        let _ = self
-            .p2p_handle
-            .send(P2pCommand::GetRecord {
-                key: mlkem_key,
-            })
-            .await;
         Err(CoreError::MlKemKeyNotCached(format!(
-            "联系人 {} 的 ML-KEM 公钥未缓存，消息已保存到离线队列，后台正在通过 DHT 网络查询",
+            "联系人 {} 的 ML-KEM 公钥未缓存（对方离线），消息已保存到离线队列",
             pubkey_short
         )))
     }
@@ -511,58 +495,39 @@ impl ChatCore {
             }
         };
 
-        let pending_msgs = match storage::list_pending(pool).await {
+        // Collect the pubkeys of currently connected peers for targeted query
+        let online_pubkeys: Vec<String> = {
+            let store = self.get_dht_store();
+            self.connected_peers.keys().filter_map(|peer_id| {
+                store.get_pubkey_by_peerid(peer_id).ok().flatten()
+            }).collect()
+        };
+
+        if online_pubkeys.is_empty() {
+            tracing::debug!("没有在线好友的待发送消息（无在线好友）");
+            return;
+        }
+
+        let pending_msgs = match storage::list_pending_by_peers(pool, &online_pubkeys).await {
             Ok(msgs) => msgs,
             Err(e) => {
-                tracing::warn!("查询待发送消息列表失败: {}", e);
+                tracing::warn!("查询在线好友待发送消息失败: {}", e);
                 return;
             }
         };
 
         if pending_msgs.is_empty() {
-            return;
-        }
-
-        let online_pending: Vec<_> = pending_msgs
-            .into_iter()
-            .filter(|msg| {
-                let store = self.get_dht_store();
-                match store.get_peerid_by_pubkey(&msg.peer_pubkey_hex) {
-                    Ok(Some(peer_id)) => {
-                        let online = self.connected_peers.contains_key(&peer_id);
-                        if !online {
-                            tracing::trace!(
-                                "待发消息 {} 的接收方 {}.. 不在线，跳过",
-                                msg.id,
-                                &msg.peer_pubkey_hex[..16]
-                            );
-                        }
-                        online
-                    }
-                    _ => {
-                        tracing::trace!(
-                            "待发消息 {} 的接收方 {}.. PeerID 未缓存，跳过",
-                            msg.id,
-                            &msg.peer_pubkey_hex[..16]
-                        );
-                        false
-                    }
-                }
-            })
-            .collect();
-
-        if online_pending.is_empty() {
             tracing::debug!("没有面向在线好友的待发送消息");
             return;
         }
 
         tracing::info!(
             "定时重试: 向 {} 位在线好友重试 {} 条待发送消息",
-            online_pending.len(),
-            online_pending.len()
+            online_pubkeys.len(),
+            pending_msgs.len()
         );
 
-        for msg in &online_pending {
+        for msg in &pending_msgs {
             if let Err(e) = self.retry_single_pending_message(pool, msg).await {
                 tracing::warn!("定时重试: 消息 {} 失败: {}", msg.id, e);
             }
@@ -626,26 +591,23 @@ impl ChatCore {
         }
 
         // === 步骤 3：查询本地 DHT 数据库 ===
-        match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
-            Ok(Some(peer_id)) => {
-                tracing::info!(
-                    "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
-                    &mldsa_pubkey_hex[..16],
-                    peer_id
-                );
-                return Some(peer_id);
-            }
-            _ => {}
+        if let Ok(Some(peer_id)) = store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
+            tracing::info!(
+                "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
+                &mldsa_pubkey_hex[..16],
+                peer_id
+            );
+            return Some(peer_id);
         }
 
         // === 步骤 4：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
-        // 查询结果会通过 P2pEvent::GetProvidersResult 事件处理
-        // 自动缓存到本地数据库，并触发 retry_pending_messages 重试待发送消息
+        // 使用 SHA256(ML-DSA 公钥) 作为查询 key，隐藏原始公钥
+        let query_key = p2p_swarm_ops::dht_key(mldsa_pubkey_hex);
         let _ = self
             .p2p_handle
             .send(
                 P2pCommand::GetProviders {
-                    key: mldsa_pubkey_hex.to_string(),
+                    key: query_key,
                 },
             )
             .await;

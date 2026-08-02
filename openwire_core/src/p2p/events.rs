@@ -93,12 +93,12 @@ pub async fn handle_incoming_request(
         // 与发送方 save_pending_message_with_hash 中使用的哈希一致。
         let receipt_data = hex::encode(&request.hash);
 
-        // 通过 DHT 查找发送方的 PeerID 和 ML-KEM 公钥，并发回加密的回执
+        // 通过 peerid_to_mlkem 查找发送方的 ML-KEM 公钥，并发回加密的回执
         let store = core.get_dht_store();
         if let Ok(Some(sender_peer_id)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
-            // 获取发送方的 ML-KEM 公钥，用于加密回执数据
-            let sender_mlkem_pubkey = match store.get_mlkem_pubkey(&sender_mldsa_pubkey_hex) {
-                Ok(Some(hex_str)) if !hex_str.is_empty() => match hex::decode(&hex_str) {
+            // 获取发送方的 ML-KEM 公钥（从 FriendOnline 缓存获取，无需 DHT）
+            let sender_mlkem_pubkey = match core.peerid_to_mlkem.get(&sender_peer_id) {
+                Some(hex_str) if !hex_str.is_empty() => match hex::decode(hex_str) {
                     Ok(key) => key,
                     Err(e) => {
                         tracing::warn!("发送方 ML-KEM 公钥 hex 解码失败: {}", e);

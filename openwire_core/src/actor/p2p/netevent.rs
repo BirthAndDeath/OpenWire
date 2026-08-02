@@ -29,6 +29,7 @@ pub fn handle_friend_online(
             listen_addrs,
             mlkem_pubkey_hex: _,
         } => (mldsa_pubkey_hex, peer_id, listen_addrs),
+        _ => return,
     };
 
     let pubkey_short = if mldsa_pubkey_hex.len() >= 16 {
@@ -49,20 +50,7 @@ pub fn handle_friend_online(
         if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
             let _ = record_store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
         }
-
-        let has_mlkem = record_store
-            .get_mlkem_pubkey(mldsa_pubkey_hex)
-            .ok()
-            .flatten()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-
-        if !has_mlkem {
-            tracing::debug!(
-                "ML-KEM 公钥未缓存，需要网络查询: {}..",
-                pubkey_short
-            );
-        }
+        // ML-KEM 公钥不再通过 DHT 缓存，改为 FriendOnline 直接携带
     }
 }
 

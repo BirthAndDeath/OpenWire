@@ -33,6 +33,8 @@ pub mod error;
 pub mod identity;
 /// 日志模块
 mod log;
+/// PeerID 持久化存储
+pub mod peerid_store;
 
 pub use vstd::prelude::*;
 /// 消息结构定义
@@ -48,14 +50,14 @@ pub mod signature;
 pub mod storage;
 /// 文件传输模块
 pub mod transfer;
-pub use actor::p2p::{P2pActor, P2pActorHandle, P2pCommand, P2pEvent, start_p2p_actor};
+pub use actor::p2p::{P2pActor, P2pActorBuilder, P2pActorHandle, P2pCommand, P2pEvent};
 pub use actor::RUNTIME;
 pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, TransferProgressStatus};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{
     extract_public_key_from_private, generate_complete_identity, generate_temporary_peerid,
-    load_or_generate_complete_identity,
+    load_or_create_peerid, load_or_generate_complete_identity,
 };
 pub use message::{ChatMessage, ChatMessageType, ChatResponse, OnlineStatusPayload};
 pub use signature::{

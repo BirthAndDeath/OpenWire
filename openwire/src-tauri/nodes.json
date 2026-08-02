@@ -4,6 +4,7 @@
     ["12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P", "/ip4/206.237.12.198/udp/44909/quic-v1"]
   ],
   "bootstrap_nodes": [
+    ["12D3KooWNHL5yLssLwToZG4iuuMkviVdQ1JCnxXnxgDvbk86Jk6P", "/ip4/206.237.12.198/tcp/44909"],
     ["QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN", "/dnsaddr/sv15.bootstrap.libp2p.io"],
     ["QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa", "/dnsaddr/ny5.bootstrap.libp2p.io"],
     ["QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb", "/dnsaddr/am6.bootstrap.libp2p.io"],

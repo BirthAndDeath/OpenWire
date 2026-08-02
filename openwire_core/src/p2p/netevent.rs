@@ -56,4 +56,9 @@ pub enum NetEventResponse {
         /// 对端的 ML-KEM 公钥 hex
         mlkem_pubkey_hex: String,
     },
+    /// 中继查询结果：对方未将此公钥注册到中继（对方尚未添加本节点为联系人）
+    PeerNotFound {
+        /// 查询的 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+    },
 }

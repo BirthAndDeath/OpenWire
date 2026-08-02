@@ -1,9 +1,5 @@
 use std::path::PathBuf;
 
-/// 默认 WebSocket 信令服务器（Cloudflare Workers）
-/// 海外用户可直接使用，国内用户请设 `signaling_server = None`
-pub const DEFAULT_SIGNALING_SERVER: &str = "openwire-server.3589206993.workers.dev";
-
 /// 核心配置：初始化参数集合
 #[derive(Default, Clone)]
 pub struct CoreConfig {
@@ -17,11 +13,6 @@ pub struct CoreConfig {
     pub relay_nodes: Vec<(String, String)>,
     /// 引导节点列表 [(PeerId, Multiaddr)]
     pub bootstrap_nodes: Vec<(String, String)>,
-    /// WebSocket 信令服务器主机，如 "openwire-server.3589206993.workers.dev"
-    /// 设为 `None` 可禁用信令功能（国内用户建议禁用）
-    pub signaling_server: Option<String>,
-    /// 信令房间名（可选），不设置则用 ML-DSA 公钥前 16 字符
-    pub signaling_room: Option<String>,
 }
 
 impl CoreConfig {
@@ -47,8 +38,6 @@ impl CoreConfig {
                 log_level: None,
                 relay_nodes: Vec::new(),
                 bootstrap_nodes: Vec::new(),
-                signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),
-                signaling_room: None,
             };
         }
 
@@ -59,8 +48,6 @@ impl CoreConfig {
             log_level: log_level.map(|s| s.into()),
             relay_nodes: Vec::new(),
             bootstrap_nodes: Vec::new(),
-            signaling_server: Some(DEFAULT_SIGNALING_SERVER.to_string()),
-            signaling_room: None,
         }
     }
 

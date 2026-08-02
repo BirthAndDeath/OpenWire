@@ -101,7 +101,7 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<
         .with_writer(non_blocking)
         .with_env_filter(filter.clone())
         .try_init()
-        .map_err(|e| crate::error::LogError::LoggerInitFailed(e.into()))?;
+        .map_err(crate::error::LogError::LoggerInitFailed)?;
 
     tracing::info!(
         filter = %filter,
@@ -126,7 +126,7 @@ fn init_console_logger(filter: &EnvFilter) -> crate::error::LogResult<()> {
     fmt()
         .with_env_filter(filter.clone())
         .try_init()
-        .map_err(|e| crate::error::LogError::LoggerInitFailed(e.into()))?;
+        .map_err(crate::error::LogError::LoggerInitFailed)?;
 
     tracing::info!("Console logger initialized");
     Ok(())

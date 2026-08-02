@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use aws_lc_rs::kem::DecapsulationKey;
 use libp2p::PeerId;
@@ -8,12 +8,12 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 /// 消息通道容量（背压控制，防止内存溢出）
-const CHANNEL_CAPACITY: usize = 64;
+pub(crate) const CHANNEL_CAPACITY: usize = 64;
 /// DHT 定期注册间隔（秒）- 5分钟
 pub(crate) const DHT_REGISTRATION_INTERVAL_SECS: u64 = 300;
 
 use crate::{
-    actor::p2p::{P2pActor, P2pActorHandle, P2pCommand, P2pEvent},
+    actor::p2p::{P2pActorHandle, P2pCommand, P2pEvent},
     command::{ChatCommand, ChatcoreEvent, MessageEvent},
     coreconfig::CoreConfig,
     corehandle::CoreHandle,
@@ -26,20 +26,18 @@ use crate::{
     storage,
     transfer::FileTransferState,
 };
-/// 命令处理
-pub mod command_handler;
+/// 命令处理 + 事件循环
+pub mod handle;
 /// 联系人操作
-pub mod contact_ops;
+pub mod contact;
 /// DHT 操作（身份发布至 Kademlia 网络）
-pub mod dht_ops;
-/// 事件处理
-pub mod event_loop;
-///（未稳定标记）文件传输
+pub mod dht;
+/// 文件传输
 pub mod file_transfer;
-/// 联系人操作
+/// 身份操作（生成、切换、删除）
 pub mod identity_ops;
 /// 消息操作
-pub mod message_ops;
+pub mod message;
 /// 定时器任务（独立 tokio::spawn）
 pub mod timers;
 
@@ -75,6 +73,9 @@ pub struct ChatCore {
     pub(crate) mldsa_identity_id: Option<String>,
     /// 当前会话的 ML-KEM 公钥 hex（临时，用于 DHT 发布和前端显示）
     pub mlkem_pubkey_hex: Option<String>,
+    /// 持久化的 PeerID 配置（Ed25519 密钥 + 端口偏好，8h~24h 随机 TTL）
+    /// 在身份切换时复用，保持设备级 PeerID 稳定
+    pub(crate) peerid_config: Option<crate::peerid_store::PeerIdConfig>,
     /// 缓存的 ML-DSA 私钥（避免每次发送消息都从 Keyring 加载）
     /// 仅在内存中保留，不持久化
     /// 使用 Zeroizing 包装，确保 drop 时自动清零内存
@@ -106,8 +107,16 @@ pub struct ChatCore {
     /// 此字段在 try_init() 中初始化，生命周期与 ChatCore 实例相同。
     /// 每次会话重新生成 ML-KEM 密钥对时，此字段也会更新。
     pub(crate) mlkem_decap_key: Option<DecapsulationKey>,
+    /// 已连接 peer 的 ML-KEM 公钥缓存（通过 FriendOnline 直接获取，无需 DHT）
+    pub(crate) peerid_to_mlkem: HashMap<PeerId, String>,
     /// 配置的中继节点列表 [(PeerId, Multiaddr)]
     pub(crate) relay_nodes: Vec<(String, String)>,
+    /// 配置的 bootstrap 节点列表 [(PeerId, Multiaddr)]
+    pub(crate) bootstrap_nodes: Vec<(String, String)>,
+    /// 每个联系人的最近发现时间（用于防重复发现冷却）
+    pub(crate) last_discovery_time: HashMap<String, Instant>,
+    /// DHT 查询键（SHA256）→ ML-DSA 公钥 hex 映射（用于 GetProvidersResult 反向查找）
+    pub(crate) dht_query_key_to_pubkey: HashMap<String, String>,
 }
 
 impl ChatCore {
@@ -157,33 +166,32 @@ impl ChatCore {
             Zeroizing::new(handle.get_private_key().to_vec())
         };
 
-        // 为当前会话生成临时的 libp2p PeerID（不持久化）
-        let keypair = identity::generate_temporary_peerid().map_err(|e| {
-            CoreError::InitFailed(format!("Failed to generate temporary PeerID: {}", e))
-        })?;
+        // 加载或创建持久化的 PeerID（8h~24h 随机 TTL，仅启动时检查）
+        let (keypair, peerid_config) = identity::load_or_create_peerid(&cfg.data_dir);
         let peer_id = keypair.public().to_peer_id();
-        tracing::info!("Generated temporary PeerID for transport: {}", peer_id);
+        tracing::info!(
+            "PeerID for transport: {} (TTL={}s, ~{}h remaining)",
+            peer_id,
+            peerid_config.ttl_secs(),
+            peerid_config.ttl_secs() / 3600,
+        );
 
         // 初始化内存 DHT 缓存
         let dht_cache = DhtCache::new();
 
-        // 启动时清理 contacts 表中过时的 ML-KEM 公钥
-        // 每次启动都会生成新的临时 ML-KEM 密钥对，旧的 ML-KEM 公钥已失效。
-        // 如果不清理，lookup_mlkem_pubkey 在 DHT 本地数据库未命中时会回退到
-        // contacts 表获取过时的公钥，导致加密消息后接收方解密失败。
-        if let Some(pool) = storage::pool() {
-            if let Err(e) = storage::clear_all_mlkem_pubkeys(pool).await {
-                tracing::warn!("启动时清理过时 ML-KEM 公钥失败: {}", e);
-            } else {
-                tracing::info!("启动时已清理 contacts 表中所有过时的 ML-KEM 公钥");
-            }
-        }
+        // ML-KEM 公钥不再存入 DHT，改为通过 FriendOnline 直接传递。
+        // 每次启动生成新的 ML-KEM 密钥对，旧的 ML-KEM 公钥自然失效。
 
         // 加载节点配置（bootstrap 节点）
         let bootstrap_nodes: Vec<(String, String)> = cfg.bootstrap_nodes.clone();
 
-        let swarm = p2p::swarm_init(&cfg.data_dir, keypair.clone(), &bootstrap_nodes)
-            .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
+        let swarm = p2p::swarm_init(
+            &cfg.data_dir,
+            keypair.clone(),
+            &bootstrap_nodes,
+            Some(&peerid_config),
+        )
+        .map_err(|e| CoreError::InitFailed(format!("Swarm init failed: {}", e)))?;
 
         // 创建消息通道：容量 32，背压控制防止内存溢出
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -198,24 +206,21 @@ impl ChatCore {
 
         let shutdown_token = CancellationToken::new();
 
-        // 创建 P2pActor 事件通道
-        let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<P2pEvent>(CHANNEL_CAPACITY);
-
-        // 创建 P2pActor 并启动
-        let p2p_actor = P2pActor::new(
-            swarm,
-            dht_cache.clone(),
-            cfg.data_dir.clone(),
-            p2p_event_tx,
-            cfg.relay_nodes.clone(),
-        );
-        let p2p_handle =
-            crate::actor::p2p::start_p2p_actor(p2p_actor, CHANNEL_CAPACITY, shutdown_token.clone());
+        // 使用构建器创建并启动 P2pActor
+        let (p2p_handle, rx_p2p_event) = crate::actor::p2p::P2pActorBuilder::new()
+            .swarm(swarm)
+            .dht_cache(dht_cache.clone())
+            .data_dir(cfg.data_dir.clone())
+            .relay_nodes(cfg.relay_nodes.clone())
+            .channel_size(CHANNEL_CAPACITY)
+            .cancellation_token(shutdown_token.clone())
+            .start();
 
         Ok(ChatCore {
             p2p_handle,
-            rx_p2p_event: p2p_event_rx,
+            rx_p2p_event,
             identity_keypair: keypair,
+            peerid_config: Some(peerid_config),
             tx_message: tx,
             rx_message: Some(rx),
             rx_cmd: cmd_rx,
@@ -235,7 +240,11 @@ impl ChatCore {
             connected_peers: std::collections::HashMap::new(),
             peerid_to_pubkey: HashMap::new(),
             mlkem_decap_key: Some(mlkem_decap_key),
+            peerid_to_mlkem: HashMap::new(),
             relay_nodes: cfg.relay_nodes.clone(),
+            bootstrap_nodes: cfg.bootstrap_nodes.clone(),
+            last_discovery_time: HashMap::new(),
+            dht_query_key_to_pubkey: HashMap::new(),
         })
     }
 
@@ -367,23 +376,14 @@ impl ChatCore {
 
 impl Drop for ChatCore {
     fn drop(&mut self) {
-        // 先触发取消信号，让 DHT 注册循环等后台任务优雅退出
-        self.core_handle.shutdown_token.cancel();
-        // 再发送关闭命令，让主事件循环退出
+        // 先发送关闭命令，确保 P2pActor 有机会处理 SaveRoutingTable 和 Shutdown
+        // 再触发取消信号，避免后台任务在命令处理前退出
         let _ = self.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
-
-        // 通知 P2pActor 保存路由表并关闭
-        // 注意：drop 是同步上下文，不能使用 send_blocking（会 panic），
-        // 使用 try_send 非阻塞发送，如果通道满则丢弃（P2pActor 即将关闭）
         let _ = self
             .p2p_handle
             .tx
-            .try_send(
-                P2pCommand::SaveRoutingTable,
-            );
-        let _ = self
-            .p2p_handle
-            .tx
-            .try_send(P2pCommand::Shutdown);
+            .try_send(P2pCommand::SaveRoutingTable);
+        let _ = self.p2p_handle.tx.try_send(P2pCommand::Shutdown);
+        self.core_handle.shutdown_token.cancel();
     }
 }

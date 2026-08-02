@@ -182,8 +182,8 @@ impl CoreHandle {
             .to_string();
 
         // 记录到已发送文件历史（sent_files 表）
-        if let Some(pool) = crate::storage::pool() {
-            if let Err(e) = crate::storage::add_sent_file(
+        if let Some(pool) = crate::storage::pool()
+            && let Err(e) = crate::storage::add_sent_file(
                 pool,
                 &file_hash,
                 file_path.to_str().unwrap_or(""),
@@ -194,7 +194,6 @@ impl CoreHandle {
             {
                 tracing::warn!("记录已发送文件失败: {e}");
             }
-        }
 
         let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
         let file_info_bytes = match postcard::to_allocvec(&file_info) {

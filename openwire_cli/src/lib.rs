@@ -130,7 +130,7 @@ pub fn detect_file_share(msg: &openwire_core::storage::Message) -> Option<FileSh
         .content
         .strip_prefix(openwire_core::command::FILE_SHARE_CONTENT_PREFIX)
     {
-        if let Some(hash_start) = rest.rfind(openwire_core::command::FILE_SHARE_HASH_PREFIX) {
+        if let Some(hash_start) = rest.find(openwire_core::command::FILE_SHARE_HASH_PREFIX) {
             let filename = rest[..hash_start].to_string();
             let hash_start_actual =
                 hash_start + openwire_core::command::FILE_SHARE_HASH_PREFIX.len();

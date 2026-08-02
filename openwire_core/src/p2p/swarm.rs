@@ -1,8 +1,9 @@
 use libp2p::kad::store::MemoryStore;
 use libp2p::kad::{self, Config as KadConfig, Mode};
+use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{
-    PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
+    Multiaddr, PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
     memory_connection_limits, noise, ping, tcp, yamux,
 };
 use std::time::Duration;
@@ -77,10 +78,12 @@ const KAD_PUBLICATION_INTERVAL_SECS: u64 = 60 * 60;
 /// - `keypair`: libp2p 身份密钥对
 /// - `relay_nodes`: Relay 中继节点列表 [(PeerId, Multiaddr)]，用于 NAT 穿透
 /// - `bootstrap_nodes`: Bootstrap 引导节点列表 [(PeerId, Multiaddr)]，用于 DHT 网络引导
+/// - `preferred_ports`: 可选端口偏好（来自 PeerIdConfig），端口被占用时自动回退到 OS 分配
 pub fn swarm_init(
     data_dir: &Path,
     keypair: libp2p::identity::Keypair,
     bootstrap_nodes: &[(String, String)],
+    preferred_ports: Option<&crate::peerid_store::PeerIdConfig>,
 ) -> P2pResult<Swarm<MyBehaviour>> {
     let mut swarm = {
         let builder = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -159,10 +162,12 @@ pub fn swarm_init(
                 let memory_limits = memory_connection_limits::Behaviour::with_max_percentage(0.05);
                 let autonat =
                     autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
+                let upnp = libp2p::upnp::tokio::Behaviour::default();
                 #[cfg(feature = "pathranker")]
                 let pathranker = libp2p_pathranker::PathRankerBehaviour::new(key.clone());
                 Ok(MyBehaviour {
                     autonat,
+                    upnp,
                     rr_msg,
                     rr_netevent,
                     mdns,
@@ -188,39 +193,76 @@ pub fn swarm_init(
             .build()
     };
 
-    // 端口 0 表示系统自动分配
-    swarm
-        .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    swarm
-        .listen_on("/ip6/::/udp/0/quic-v1".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-    swarm
-        .listen_on("/ip6/::/tcp/0".parse().map_err(|e| {
-            P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-        })?)
-        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    // 端口偏好：优先使用 PeerIdConfig 中存储的端口，被占用则回退到 OS 分配
+    let quic_port = preferred_ports.map_or(0, |p| p.preferred_quic_port());
+    let tcp_port = preferred_ports.map_or(0, |p| p.preferred_tcp_port());
+    let ws_port = preferred_ports.map_or(0, |p| p.preferred_ws_port());
+
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(quic_port))
+            .with(Protocol::QuicV1),
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    )?;
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Udp(quic_port))
+            .with(Protocol::QuicV1),
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    )?;
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(tcp_port)),
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    )?;
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(tcp_port)),
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    )?;
     #[cfg(not(target_os = "android"))]
     {
-        swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0/ws".parse().map_err(|e| {
-                P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-            })?)
-            .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
-        swarm
-            .listen_on("/ip6/::/tcp/0/ws".parse().map_err(|e| {
-                P2pError::SwarmInitFailed(format!("Failed to parse listen addr: {}", e).into())
-            })?)
-            .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+        try_listen_or_fallback(
+            &mut swarm,
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(ws_port))
+                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(0))
+                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
+        )?;
+        try_listen_or_fallback(
+            &mut swarm,
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(ws_port))
+                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
+            Multiaddr::empty()
+                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+                .with(Protocol::Tcp(0))
+                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
+        )?;
     } // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
 
     Ok(swarm)
@@ -232,7 +274,7 @@ fn create_kademlia(
     _data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
 ) -> P2pResult<kad::Behaviour<MemoryStore>> {
-    //let store = crate::server_redb_store::RedbRecordStore::new(db);
+    // let store = crate::server_redb_store::RedbRecordStore::new(db);
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
         P2pError::SwarmInitFailed("KAD_REPLICATION_FACTOR must be non-zero".into())
@@ -331,7 +373,8 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
     }
 }
 
-/// 从缓存文件加载路由表 (PeerID 临时，不再调用)
+/// 从缓存文件加载路由表 (PeerID 临时，默认禁用；需 persist_routing feature)
+#[cfg(feature = "persist_routing")]
 #[allow(dead_code)]
 fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &Path) -> usize {
     if !cache_path.exists() {
@@ -393,4 +436,43 @@ fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &P
     }
 
     loaded_count
+}
+
+/// 尝试用偏好地址监听，失败则回退到备用地址（OS 分配端口）
+///
+/// 偏好地址中的端口可能被占用，此时静默回退到端口 0 让 OS 分配。
+/// 这种"尽力而为"策略确保端口稳定时网络拓扑不变，端口冲突时不影响连接。
+fn try_listen_or_fallback(
+    swarm: &mut Swarm<MyBehaviour>,
+    preferred: Multiaddr,
+    fallback: Multiaddr,
+) -> P2pResult<()> {
+    let preferred_port = preferred
+        .iter()
+        .find_map(|p| match p {
+            Protocol::Tcp(p) | Protocol::Udp(p) => Some(p),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    if preferred_port > 0 {
+        match swarm.listen_on(preferred.clone()) {
+            Ok(_listener_id) => {
+                tracing::debug!("Listened on preferred port {}", preferred_port);
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Preferred port {} unavailable ({}), falling back to OS-assigned",
+                    preferred_port,
+                    e
+                );
+            }
+        }
+    }
+
+    swarm
+        .listen_on(fallback)
+        .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
+    Ok(())
 }

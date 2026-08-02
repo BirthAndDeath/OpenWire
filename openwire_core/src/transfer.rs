@@ -120,7 +120,7 @@ impl FileTransferState {
         if self.total_chunks == 0 {
             return 0;
         }
-        let last_chunk_size = if self.total_size % self.chunk_size as u64 == 0 {
+        let last_chunk_size = if self.total_size.is_multiple_of(self.chunk_size as u64) {
             self.chunk_size as u64
         } else {
             self.total_size % self.chunk_size as u64

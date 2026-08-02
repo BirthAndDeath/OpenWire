@@ -101,5 +101,8 @@
     "loading_nodes": "Cargando configuración de nodos...",
     "sent_files": "Enviados",
     "no_sent_files": "No hay archivos enviados",
-    "revoke": "Revocar"
+    "revoke": "Revocar",
+    "filename": "Nombre del archivo",
+    "size": "Tamaño",
+    "sent_at": "Enviado el"
 }

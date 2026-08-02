@@ -7,9 +7,10 @@ use libp2p::futures::StreamExt;
 use libp2p::kad::{self, Config as KadConfig, store::MemoryStore};
 use libp2p::request_response::{Config as RrConfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::multiaddr::Protocol;
 use libp2p::{
-    PeerId, StreamProtocol, SwarmBuilder, connection_limits, identify, identity, memory_connection_limits,
-    noise, ping, relay, tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, SwarmBuilder, connection_limits, identify, identity,
+    memory_connection_limits, noise, ping, relay, tcp, yamux,
 };
 
 use openwire_core::p2p::dht_cache::DhtCache;
@@ -91,12 +92,24 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             let pid = key.public().to_peer_id();
             let mut kademlia =
                 kad::Behaviour::with_config(pid, MemoryStore::new(pid), kad_config.clone());
+
+            // 向 bootstrap 节点注册，但排除自身（避免自引用）
+            // 如果所有 bootstrap 节点都是自身，则跳过 bootstrap 注册，
+            // 依靠客户端连接后通过 Identify 填充路由表。
+            let mut has_remote = false;
             for node in &bootstrap_nodes {
-                if let (Ok(pid), Ok(addr)) = (PeerId::from_str(&node[0]), node[1].parse()) {
-                    kademlia.add_address(&pid, addr);
+                if let (Ok(boot_pid), Ok(addr)) = (PeerId::from_str(&node[0]), node[1].parse()) {
+                    if boot_pid != pid {
+                        kademlia.add_address(&boot_pid, addr);
+                        has_remote = true;
+                    }
                 }
             }
-            let _ = kademlia.bootstrap();
+            if has_remote {
+                let _ = kademlia.bootstrap();
+            } else {
+                tracing::info!("无远程 bootstrap 节点，跳过 DHT bootstrap（依赖客户端 Identify 填充路由表）");
+            }
 
             let identify = identify::Behaviour::new(
                 identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
@@ -136,10 +149,28 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .build();
 
-    swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{port}").parse()?)?;
-    swarm.listen_on(format!("/ip6/::/tcp/{port}").parse()?)?;
-    swarm.listen_on(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?)?;
-    swarm.listen_on(format!("/ip6/::/udp/{port}/quic-v1").parse()?)?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::from(std::net::Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(port)),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::from(std::net::Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(port)),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::from(std::net::Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(port))
+            .with(Protocol::QuicV1),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::from(std::net::Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Udp(port))
+            .with(Protocol::QuicV1),
+    )?;
 
     let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY.as_bytes().to_vec());
     swarm.behaviour_mut().kademlia.start_providing(relay_key)?;
@@ -195,12 +226,8 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                             .get_peerid_by_pubkey(mldsa_pubkey_hex)
                             .ok()
                             .flatten();
-                        let mlkem = dht_cache
-                            .get_mlkem_pubkey(mldsa_pubkey_hex)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-match peer_id {
+                        // ML-KEM 公钥由 FriendOnline 直接携带，DHT 不缓存
+                        match peer_id {
                         Some(pid) => {
                             tracing::info!(
                                 "=== RELAY DISCOVER HIT: {}.. -> {} ===",
@@ -212,21 +239,19 @@ match peer_id {
                                     NetEventResponse::PeerInfo {
                                         mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
                                         peer_id: pid.to_string(),
-                                        mlkem_pubkey_hex: mlkem,
+                                        mlkem_pubkey_hex: String::new(),
                                     },
                                 );
                             }
                             None => {
                                 tracing::info!(
-                                    "=== RELAY DISCOVER MISS: {}.. ===",
+                                    "=== RELAY DISCOVER MISS: {}.. (peer not found) ===",
                                     &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
                                 );
                                 let _ = swarm.behaviour_mut().rr_netevent.send_response(
                                     channel,
-                                    NetEventResponse::PeerInfo {
+                                    NetEventResponse::PeerNotFound {
                                         mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
-                                        peer_id: String::new(),
-                                        mlkem_pubkey_hex: String::new(),
                                     },
                                 );
                             }

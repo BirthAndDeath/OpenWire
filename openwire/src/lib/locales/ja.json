@@ -101,5 +101,8 @@
     "loading_nodes": "ノード設定を読み込み中...",
     "sent_files": "送信済みファイル",
     "no_sent_files": "送信済みファイルがありません",
-    "revoke": "取り消す"
+    "revoke": "取り消す",
+    "filename": "ファイル名",
+    "size": "サイズ",
+    "sent_at": "送信日時"
 }

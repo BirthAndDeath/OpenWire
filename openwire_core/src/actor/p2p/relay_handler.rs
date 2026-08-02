@@ -28,22 +28,19 @@ impl P2pActor {
         let now = std::time::Instant::now();
 
         // 定期重置退避计数器，避免因临时 relay 不可用而永远退避
-        if self.relay_reconnect_attempt > 0 {
-            if let Some(cooldown) = self.relay_reconnect_cooldown_until {
-                if now >= cooldown + std::time::Duration::from_secs(BACKOFF_RESET_SECS) {
+        if self.relay_reconnect_attempt > 0
+            && let Some(cooldown) = self.relay_reconnect_cooldown_until
+                && now >= cooldown + std::time::Duration::from_secs(BACKOFF_RESET_SECS) {
                     tracing::debug!("退避已超过 {}s，重置 relay 重连计数器", BACKOFF_RESET_SECS);
                     self.relay_reconnect_attempt = 0;
                     self.relay_reconnect_cooldown_until = None;
                 }
-            }
-        }
 
-        if let Some(cooldown) = self.relay_reconnect_cooldown_until {
-            if now < cooldown {
+        if let Some(cooldown) = self.relay_reconnect_cooldown_until
+            && now < cooldown {
                 tracing::debug!("Relay reconnect in cooldown, skipping (until {:?})", cooldown);
                 return;
             }
-        }
 
         let has_configured = !self.relay_nodes.is_empty();
         let has_candidates = !self.relay_candidates.is_empty();
@@ -79,6 +76,18 @@ impl P2pActor {
             let full_addr = if has_p2p { candidate_addr.clone() } else {
                 candidate_addr.clone().with_p2p(*candidate_peer_id).unwrap_or(candidate_addr.clone())
             };
+            // DHT 发现的候选地址可能只有 P2p 组件（无传输层），
+            // 等待 Kademlia 路由表异步填充传输地址后再拨号
+            let has_transport = full_addr.iter().any(|p| {
+                matches!(p, Protocol::Tcp(_) | Protocol::Udp(_) | Protocol::QuicV1)
+            });
+            if !has_transport {
+                tracing::debug!(
+                    "Skipping dial for relay candidate {}: no transport address yet",
+                    candidate_peer_id
+                );
+                continue;
+            }
             attempted = true;
             if self.try_relay_connection(&candidate_peer_id.to_string(), &full_addr).is_ok() {
                 dial_success = true;
@@ -120,21 +129,27 @@ impl P2pActor {
     }
 
     /// 连接建立后向中继请求 circuit reservation
+    ///
+    /// 仅向配置的中继节点发送 reservation 请求。
+    /// 自动发现的候选节点（Identify/DHT）虽然支持 relay 协议，
+    /// 但可能是 IPFS 引导节点等非中继服务器，不会接受 reservation。
+    /// 候选节点用于拨号回退，不用于 reservation。
     pub(crate) fn on_relay_connected(&mut self, relay_peer_id: &PeerId) {
-        // 与官方 DCUtR 示例完全对齐：
-        // swarm.listen_on(relay_address.with(Protocol::P2pCircuit))
-        // relay_address 必须包含完整路径 /ip4/.../p2p/<relay_peer>
         for (pid_str, addr_str) in &self.relay_nodes {
-            if let (Ok(pid), Ok(addr)) = (pid_str.parse::<PeerId>(), addr_str.parse::<Multiaddr>()) {
-                if pid == *relay_peer_id {
+            if let (Ok(pid), Ok(addr)) = (pid_str.parse::<PeerId>(), addr_str.parse::<Multiaddr>())
+                && pid == *relay_peer_id {
                     let circuit_addr = addr.with(Protocol::P2p(pid)).with(Protocol::P2pCircuit);
                     match self.swarm.listen_on(circuit_addr) {
                         Ok(_) => tracing::info!("=== RESERVATION REQ: sent to relay {relay_peer_id} ==="),
                         Err(e) => tracing::warn!("listen_on relay {} failed: {e:?}", relay_peer_id),
                     }
+                    return;
                 }
-            }
         }
+        tracing::debug!(
+            "relay {} not in configured relay list, skipping reservation (candidate only)",
+            relay_peer_id
+        );
     }
 
     pub(crate) fn disconnect_relay_nodes(&mut self) {
@@ -156,14 +171,13 @@ impl P2pActor {
         }
         let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY);
         let _ = self.swarm.behaviour_mut().kademlia.start_providing(relay_key);
-        if let Ok(addr) = "/p2p-circuit".parse::<libp2p::Multiaddr>() {
-            match self.swarm.listen_on(addr) {
-                Ok(_) => {
-                    tracing::debug!("Relay server enabled: listening on /p2p-circuit");
-                    self.relay_server_enabled = true;
-                }
-                Err(e) => tracing::warn!("Failed to listen on /p2p-circuit: {:?}", e),
+        let addr = Multiaddr::empty().with(Protocol::P2pCircuit);
+        match self.swarm.listen_on(addr) {
+            Ok(_) => {
+                tracing::debug!("Relay server enabled: listening on /p2p-circuit");
+                self.relay_server_enabled = true;
             }
+            Err(e) => tracing::warn!("Failed to listen on /p2p-circuit: {:?}", e),
         }
     }
 

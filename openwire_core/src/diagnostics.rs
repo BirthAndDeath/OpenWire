@@ -201,24 +201,6 @@ fn diagnose_dht_records(report: &mut DiagnosticReport, dht_cache: Option<Arc<Dht
                     None
                 },
             });
-
-            // 查询 ML-KEM 公钥缓存数
-            let mut mlkem_count = 0;
-            for pk in &pubkeys {
-                if let Ok(Some(_)) = store.get_mlkem_pubkey(pk) {
-                    mlkem_count += 1;
-                }
-            }
-            report.add(DiagnosticItem {
-                name: "DHT ML-KEM 公钥缓存",
-                passed: true,
-                detail: format!(
-                    "本地 DHT 缓存中已缓存 {} 个 ML-KEM 公钥（共 {} 个身份）",
-                    mlkem_count,
-                    pubkeys.len()
-                ),
-                suggestion: None,
-            });
         }
         Err(e) => {
             report.add(DiagnosticItem {
@@ -228,31 +210,6 @@ fn diagnose_dht_records(report: &mut DiagnosticReport, dht_cache: Option<Arc<Dht
                 suggestion: Some("检查 DHT 数据库是否损坏".to_string()),
             });
         }
-    }
-
-    // 查询 ML-KEM 公钥缓存数
-    // 由于没有直接的计数 API，通过遍历 pubkeys 来检查
-    if let Ok(pubkeys) = store.get_all_pubkeys() {
-        let mut mlkem_count = 0;
-        for pk in &pubkeys {
-            if let Ok(Some(_)) = store.get_mlkem_pubkey(pk) {
-                mlkem_count += 1;
-            }
-        }
-        report.add(DiagnosticItem {
-            name: "DHT ML-KEM 公钥缓存",
-            passed: true,
-            detail: format!(
-                "本地 DHT 数据库中已缓存 {} 个 ML-KEM 公钥（共 {} 个身份）",
-                mlkem_count,
-                pubkeys.len()
-            ),
-            suggestion: if mlkem_count == 0 && !pubkeys.is_empty() {
-                Some("ML-KEM 公钥尚未缓存，消息加密将无法进行，请确保已添加联系人".to_string())
-            } else {
-                None
-            },
-        });
     }
 }
 

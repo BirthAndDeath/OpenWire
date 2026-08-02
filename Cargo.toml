@@ -13,7 +13,17 @@ resolver = "3"
 [workspace.dependencies]
 rootcell = { path = "rootcell" }
 openwire_core = { path = "openwire_core" }
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "net",
+    "io-util",
+    "io-std",
+    "time",
+    "process",
+    "signal",
+] }
 libp2p = { version = "0.56.0", features = [
     "autonat",
     "dns",
@@ -28,16 +38,20 @@ libp2p = { version = "0.56.0", features = [
     "macros",
     "quic",
     "kad",
-    "secp256k1",
     "ed25519",
     "tcp",
     "noise",
     "yamux",
     "memory-connection-limits",
     "websocket",
-    "rsa",
+    "upnp",
 ] }
 tracing = "0.1.44"
+rand = "0.10"
+[patch.crates-io]
+libp2p-mdns = { path = "patches/libp2p-mdns" }
+libp2p-request-response = { path = "patches/libp2p-request-response" }
+
 [profile.dev]
 incremental = true
 lto = false

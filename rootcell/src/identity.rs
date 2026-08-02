@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::LazyLock;
 
 use anyhow;
@@ -78,7 +79,7 @@ pub fn setup_default_keyring() {
 }
 
 pub struct PrivateKeyHandle {
-    private_key: Zeroizing<Vec<u8>>,
+    private_key: Pin<Box<[u8]>>,
     identifier: String,
     data_dir: String,
     locked: bool,
@@ -320,7 +321,7 @@ impl PrivateKeyHandle {
         Self::save_encrypted_private_key(data_dir, identifier, private_key, &master_key)?;
 
         let mut handle = Self {
-            private_key: Zeroizing::new(private_key.to_vec()),
+            private_key: private_key.to_vec().into_boxed_slice().into(),
             identifier: identifier.to_string(),
             data_dir: data_dir.to_string(),
             locked: false,
@@ -356,7 +357,7 @@ impl PrivateKeyHandle {
             ))?;
 
         let mut handle = Self {
-            private_key: Zeroizing::new(private_key),
+            private_key: private_key.into_boxed_slice().into(),
             identifier: identifier.to_string(),
             data_dir: data_dir.to_string(),
             locked: false,
@@ -398,6 +399,9 @@ impl PrivateKeyHandle {
                 );
                 return Ok(());
             }
+            // 禁止 core dump，防止私钥在崩溃时写入 core 文件
+            #[cfg(target_os = "linux")]
+            libc::prctl(libc::PR_SET_DUMPABLE, 0);
         }
         self.locked = true;
         Ok(())
@@ -477,6 +481,10 @@ impl Drop for PrivateKeyHandle {
             "Dropping PrivateKeyHandle for {}, unlocking memory",
             self.identifier
         );
+        // Zeroize the pinned buffer before munlock to prevent key material from leaking
+        // even if the memory page is swapped out after unlocking.
+        // Box<[u8]>: Unpin, so Pin::get_mut() is safe.
+        self.private_key.as_mut().get_mut().fill(0);
         self.unlock_memory();
     }
 }

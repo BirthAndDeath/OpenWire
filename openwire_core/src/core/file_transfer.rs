@@ -197,10 +197,9 @@ impl ChatCore {
         state.chunk_size = response.chunk_size.unwrap_or(0);
 
         if output_path.exists()
-            && crate::transfer::compute_file_hash(&output_path)
+            && (crate::transfer::compute_file_hash(&output_path)
                 .await
-                .ok()
-                .map_or(false, |h| h == response.file_hash)
+                .ok() == Some(response.file_hash))
         {
             tracing::info!("文件已存在且哈希匹配: {:?}", output_path);
             self.file_transfers.remove(&hash_hex);

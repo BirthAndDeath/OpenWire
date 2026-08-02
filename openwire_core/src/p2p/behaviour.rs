@@ -55,4 +55,7 @@ pub struct MyBehaviour {
     /// 路径评分协议（行为感知路由，EWMA 评分 + 信誉 + 协作评分）
     #[cfg(feature = "pathranker")]
     pub pathranker: libp2p_pathranker::PathRankerBehaviour,
+
+    /// UPnP 端口映射（自动添加公网端口转发）
+    pub upnp: libp2p::upnp::tokio::Behaviour,
 }
