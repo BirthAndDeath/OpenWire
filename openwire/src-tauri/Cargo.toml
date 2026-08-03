@@ -33,7 +33,7 @@ libp2p = { workspace = true }
 tauri-plugin-dialog = "2"
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
 ndk-context = "0.1.1"
 android-native-keyring-store = "1.0.0"
 
