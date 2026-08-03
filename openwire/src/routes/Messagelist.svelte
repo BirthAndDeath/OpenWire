@@ -554,18 +554,38 @@
 <style>
     :global(.virtua-scroll-view) {
         padding: 16px;
+        padding-top: 48px;
         background: transparent;
+    }
+    @container (max-width: 480px) {
+        :global(.virtua-scroll-view) {
+            padding: 8px;
+            padding-top: 48px;
+        }
+        .msg {
+            padding-right: 8px;
+        }
+        .msg.me {
+            padding-left: 8px;
+        }
+        .bubble {
+            max-width: 90%;
+        }
+        .msg-meta time {
+            font-size: 10px;
+        }
     }
     :global(.list) {
         height: 100%;
         display: flex;
         flex-direction: column;
+        container-type: inline-size;
     }
     .msg {
         display: flex;
         flex-direction: column;
         align-items: flex-start;
-        margin-bottom: 8px;
+        margin-bottom: var(--spacing-xs, 8px);
         position: relative;
         padding-right: 36px;
         gap: 2px;
@@ -576,12 +596,21 @@
         padding-left: 36px;
     }
     .bubble {
-        max-width: 70%;
-        padding: 8px 12px;
-        border-radius: 12px;
+        max-width: var(--bubble-max, 70%);
+        padding: var(--bubble-padding, 8px 12px);
+        border-radius: var(--bubble-radius, 12px);
         background: var(--bg-secondary, #2a2a2a);
         word-break: break-word;
         white-space: pre-wrap;
+    }
+    @container (max-width: 400px) {
+        .bubble {
+            max-width: 85%;
+            font-size: var(--font-size-sm, 13px);
+        }
+        .msg {
+            margin-bottom: 4px;
+        }
     }
     .msg.me .bubble {
         background: #3b82f6;

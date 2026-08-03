@@ -1,5 +1,6 @@
 <script lang="ts">
   import "../lib/i18n";
+  import "../lib/styles/variables.css";
   import { initTheme } from "../lib/theme";
   import { initLanguage } from "../lib/language";
   import Background from "./Background.svelte";
@@ -24,9 +25,14 @@
 
 <style>
   .app-layout {
-    min-height: 100vh;
+    min-height: 100dvh;
+    max-width: var(--layout-max-width, 1600px);
+    margin: 0 auto;
     background: transparent;
-    backdrop-filter: none;
     color: var(--text-primary);
+    padding-top: var(--safe-area-top);
+    padding-bottom: var(--safe-area-bottom);
+    padding-left: var(--safe-area-left);
+    padding-right: var(--safe-area-right);
   }
 </style>

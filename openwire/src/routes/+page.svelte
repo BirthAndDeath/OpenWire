@@ -12,11 +12,52 @@
   import NotificationBadge from "./NotificationBadge.svelte";
   import AddFriendModal from "./AddFriendModal.svelte";
   import SentFileManager from "./SentFileManager.svelte";
+  import ResizablePanel from "$lib/components/ResizablePanel.svelte";
   interface IdentityDto {
     id: number;
     identity_id: string;
     is_current: boolean;
     mlkem_pubkey_hex: string | null;
+  }
+
+  // 响应式侧边栏可见性
+  let sidebarVisible = $state(true);
+  let isMobile = $state(false);
+  $effect(() => {
+    const mq = window.matchMedia(`(max-width: 520px)`);
+    const handler = (e: MediaQueryListEvent | MediaQueryList) => {
+      isMobile = e.matches;
+      if (e.matches) sidebarVisible = false;
+      else sidebarVisible = true;
+    };
+    handler(mq);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  });
+
+  // 侧边栏宽度：与窗口宽度按比例缩放
+  let sidebarW = $state(Math.round(window.innerWidth * 0.28));
+  let lastWindowW = $state(window.innerWidth);
+  $effect(() => {
+    const onResize = () => {
+      const ratio = sidebarW / lastWindowW;
+      lastWindowW = window.innerWidth;
+      sidebarW = Math.round(window.innerWidth * ratio);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  });
+
+  // 移动端：选择联系人后自动关闭侧边栏，显示聊天界面
+  function selectMobile(id: string) {
+    selectedId = id;
+    if (isMobile) sidebarVisible = false;
+  }
+
+  // 移动端：返回联系人列表
+  function backToContacts() {
+    selectedId = null;
+    sidebarVisible = true;
   }
 
   // 主题和语言在layout.svelte 中统一初始化
@@ -108,7 +149,6 @@
   // === 状态 ===
   let msgListRef = $state<ReturnType<typeof Messagelist>>();
   let selectedId = $state<string | null>(null);
-  let sidebarW = $state(300);
   let inputH = $state(150);
 
   // 添加好友相关状态
@@ -287,41 +327,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     };
   });
 
-  // === 拖动调整 ===
-  // 使用 requestAnimationFrame 批量处理拖动事件，
-  // 避免在同一个帧内多次触发 ResizeObserver（VList 虚拟滚动组件内部使用）
-  let dragRafId: number | null = null;
-
-  function drag(min: number, max: number, vertical: boolean) {
-    return (e: MouseEvent) => {
-      if (dragRafId !== null) return; // 同一帧内只执行最后一次
-      dragRafId = requestAnimationFrame(() => {
-        dragRafId = null;
-        const val = vertical
-          ? Math.max(min, Math.min(max, e.clientX))
-          : Math.max(min, Math.min(max, window.innerHeight - e.clientY - 16));
-        vertical ? (sidebarW = val) : (inputH = val);
-      });
-    };
-  }
-
-  function startDrag(isSidebar: boolean) {
-    const handler = drag(
-      isSidebar ? 200 : 100,
-      isSidebar ? 500 : 300,
-      isSidebar,
-    );
-    const up = () => {
-      document.removeEventListener("mousemove", handler);
-      document.removeEventListener("mouseup", up);
-      if (dragRafId !== null) {
-        cancelAnimationFrame(dragRafId);
-        dragRafId = null;
-      }
-    };
-    document.addEventListener("mousemove", handler);
-    document.addEventListener("mouseup", up);
-  }
+  // === 拖动调整（使用 ResizablePanel 组件） ===
 
   // === 操作 ===
   const select = (id: string) => (selectedId = id);
@@ -358,129 +364,224 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   }
 </script>
 
-<main class="container">
-  <aside class="sidebar" style="width: {sidebarW}px">
-    <!-- 设置按钮 -->
-    <div class="icon-buttons-container">
-      <button
-        class="icon-btn"
-        onclick={goToSettings}
-        title={$_("settings")}
-        aria-label="打开设置"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          ><path
-            fill="currentColor"
-            d="M10.825 22q-.675 0-1.162-.45t-.588-1.1L8.85 18.8q-.325-.125-.612-.3t-.563-.375l-1.55.65q-.625.275-1.25.05t-.975-.8l-1.175-2.05q-.35-.575-.2-1.225t.675-1.075l1.325-1Q4.5 12.5 4.5 12.337v-.675q0-.162.025-.337l-1.325-1Q2.675 9.9 2.525 9.25t.2-1.225L3.9 5.975q.35-.575.975-.8t1.25.05l1.55.65q.275-.2.575-.375t.6-.3l.225-1.65q.1-.65.588-1.1T10.825 2h2.35q.675 0 1.163.45t.587 1.1l.225 1.65q.325.125.613.3t.562.375l1.55-.65q.625-.275 1.25-.05t.975.8l1.175 2.05q.35.575.2 1.225t-.675 1.075l-1.325 1q.025.175.025.338v.674q0 .163-.05.338l1.325 1q.525.425.675 1.075t-.2 1.225l-1.2 2.05q-.35.575-.975.8t-1.25-.05l-1.5-.65q-.275.2-.575.375t-.6.3l-.225 1.65q-.1.65-.587 1.1t-1.163.45zm1.225-6.5q1.45 0 2.475-1.025T15.55 12t-1.025-2.475T12.05 8.5q-1.475 0-2.488 1.025T8.55 12t1.013 2.475T12.05 15.5"
-          /></svg
+<main class="container" class:mobile={isMobile} class:sidebar-open={sidebarVisible && isMobile} style={!isMobile ? `grid-template-columns: ${sidebarW}px 1fr` : ''}>
+  <!-- 移动端侧边栏遮罩层 -->
+  {#if isMobile && sidebarVisible}
+    <div class="mobile-overlay" onclick={() => (sidebarVisible = false)} role="presentation" aria-hidden="true"></div>
+  {/if}
+
+  <!-- 桌面端：侧边栏作为可拖拽面板 -->
+  {#if !isMobile}
+    <ResizablePanel
+      min={200}
+      max={500}
+      defaultSize={300}
+      bind:size={sidebarW}
+      position="left"
+    >
+      <aside class="sidebar">
+        <div class="icon-buttons-container">
+          <button
+            class="icon-btn"
+            onclick={goToSettings}
+            title={$_("settings")}
+            aria-label="打开设置"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              ><path
+                fill="currentColor"
+                d="M10.825 22q-.675 0-1.162-.45t-.588-1.1L8.85 18.8q-.325-.125-.612-.3t-.563-.375l-1.55.65q-.625.275-1.25.05t-.975-.8l-1.175-2.05q-.35-.575-.2-1.225t.675-1.075l1.325-1Q4.5 12.5 4.5 12.337v-.675q0-.162.025-.337l-1.325-1Q2.675 9.9 2.525 9.25t.2-1.225L3.9 5.975q.35-.575.975-.8t1.25.05l1.55.65q.275-.2.575-.375t.6-.3l.225-1.65q.1-.65.588-1.1T10.825 2h2.35q.675 0 1.163.45t.587 1.1l.225 1.65q.325.125.613.3t.562.375l1.55-.65q.625-.275 1.25-.05t.975.8l1.175 2.05q.35.575.2 1.225t-.675 1.075l-1.325 1q.025.175.025.338v.674q0 .163-.05.338l1.325 1q.525.425.675 1.075t-.2 1.225l-1.2 2.05q-.35.575-.975.8t-1.25-.05l-1.5-.65q-.275.2-.575.375t-.6.3l-.225 1.65q-.1.65-.587 1.1t-1.163.45zm1.225-6.5q1.45 0 2.475-1.025T15.55 12t-1.025-2.475T12.05 8.5q-1.475 0-2.488 1.025T8.55 12t1.013 2.475T12.05 15.5"
+              /></svg
+            >
+          </button>
+
+          <button
+            class="icon-btn"
+            onclick={goToIdentity}
+            title={$_("identity_management")}
+            aria-label="身份管理"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              ><path
+                fill="currentColor"
+                d="M10.95 19.55q.5.3 1.05.288t1.05-.313l4.55-2.775q-1.25-.875-2.675-1.312T12 15t-2.937.438t-2.713 1.287zm3.525-7.575Q15.5 10.95 15.5 9.5t-1.025-2.475T12 6T9.525 7.025T8.5 9.5t1.025 2.475T12 13t2.475-1.025m-3.525 9.9l-7-4.3q-.45-.275-.7-.725T3 15.875v-7.75q0-.525.25-.975t.7-.725l7-4.3q.5-.3 1.05-.3t1.05.3l7 4.3q.45.275.7.725t.25.975v7.75q0 .525-.25.975t-.7.725l-7 4.3q-.5.3-1.05.3t-1.05-.3"
+              /></svg
+            >
+          </button>
+
+          <button
+            class="icon-btn"
+            onclick={openSentFiles}
+            title={$_("sent_files")}
+            aria-label="已发送文件"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              ><path
+                fill="currentColor"
+                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM6 20V4h7v5h5v11z"
+              /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
+            >
+          </button>
+        </div>
+
+        <Contactlist
+          {contacts}
+          {selectedId}
+          onselect={select}
+          ondelete={(id) => {
+            contacts = contacts.filter((c) => c.pubkey_hex !== id);
+            if (selectedId === id)
+              selectedId = contacts.length > 0 ? contacts[0].pubkey_hex : null;
+          }}
+        />
+
+        <div class="add-friend-wrapper">
+          <button
+            class="add-friend-btn"
+            onclick={() => (showAddFriendModal = true)}
+            aria-label={$_("add_friend")}
+          >
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <line x1="19" y1="8" x2="19" y2="14" />
+              <line x1="22" y1="11" x2="16" y2="11" />
+            </svg>
+            <span>{$_("add_friend")}</span>
+          </button>
+        </div>
+      </aside>
+    </ResizablePanel>
+  {:else}
+    <!-- 移动端：侧边栏以全屏覆盖层方式显示 -->
+    <aside class="sidebar sidebar-mobile" class:visible={sidebarVisible}>
+      <div class="icon-buttons-container">
+        <button
+          class="icon-btn"
+          onclick={goToSettings}
+          title={$_("settings")}
+          aria-label="打开设置"
         >
-      </button>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            ><path
+              fill="currentColor"
+              d="M10.825 22q-.675 0-1.162-.45t-.588-1.1L8.85 18.8q-.325-.125-.612-.3t-.563-.375l-1.55.65q-.625.275-1.25.05t-.975-.8l-1.175-2.05q-.35-.575-.2-1.225t.675-1.075l1.325-1Q4.5 12.5 4.5 12.337v-.675q0-.162.025-.337l-1.325-1Q2.675 9.9 2.525 9.25t.2-1.225L3.9 5.975q.35-.575.975-.8t1.25.05l1.55.65q.275-.2.575-.375t.6-.3l.225-1.65q.1-.65.588-1.1T10.825 2h2.35q.675 0 1.163.45t.587 1.1l.225 1.65q.325.125.613.3t.562.375l1.55-.65q.625-.275 1.25-.05t.975.8l1.175 2.05q.35.575.2 1.225t-.675 1.075l-1.325 1q.025.175.025.338v.674q0 .163-.05.338l1.325 1q.525.425.675 1.075t-.2 1.225l-1.2 2.05q-.35.575-.975.8t-1.25-.05l-1.5-.65q-.275.2-.575.375t-.6.3l-.225 1.65q-.1.65-.587 1.1t-1.163.45zm1.225-6.5q1.45 0 2.475-1.025T15.55 12t-1.025-2.475T12.05 8.5q-1.475 0-2.488 1.025T8.55 12t1.013 2.475T12.05 15.5"
+            /></svg
+          >
+        </button>
 
-      <button
-        class="icon-btn"
-        onclick={goToIdentity}
-        title={$_("identity_management")}
-        aria-label="身份管理"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          ><path
-            fill="currentColor"
-            d="M10.95 19.55q.5.3 1.05.288t1.05-.313l4.55-2.775q-1.25-.875-2.675-1.312T12 15t-2.937.438t-2.713 1.287zm3.525-7.575Q15.5 10.95 15.5 9.5t-1.025-2.475T12 6T9.525 7.025T8.5 9.5t1.025 2.475T12 13t2.475-1.025m-3.525 9.9l-7-4.3q-.45-.275-.7-.725T3 15.875v-7.75q0-.525.25-.975t.7-.725l7-4.3q.5-.3 1.05-.3t1.05.3l7 4.3q.45.275.7.725t.25.975v7.75q0 .525-.25.975t-.7.725l-7 4.3q-.5.3-1.05.3t-1.05-.3"
-          /></svg
+        <button
+          class="icon-btn"
+          onclick={goToIdentity}
+          title={$_("identity_management")}
+          aria-label="身份管理"
         >
-      </button>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            ><path
+              fill="currentColor"
+              d="M10.95 19.55q.5.3 1.05.288t1.05-.313l4.55-2.775q-1.25-.875-2.675-1.312T12 15t-2.937.438t-2.713 1.287zm3.525-7.575Q15.5 10.95 15.5 9.5t-1.025-2.475T12 6T9.525 7.025T8.5 9.5t1.025 2.475T12 13t2.475-1.025m-3.525 9.9l-7-4.3q-.45-.275-.7-.725T3 15.875v-7.75q0-.525.25-.975t.7-.725l7-4.3q.5-.3 1.05-.3t1.05.3l7 4.3q.45.275.7.725t.25.975v7.75q0 .525-.25.975t-.7.725l-7 4.3q-.5.3-1.05.3t-1.05-.3"
+            /></svg
+          >
+        </button>
 
-      <button
-        class="icon-btn"
-        onclick={openSentFiles}
-        title={$_("sent_files")}
-        aria-label="已发送文件"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          ><path
-            fill="currentColor"
-            d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM6 20V4h7v5h5v11z"
-          /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
+        <button
+          class="icon-btn"
+          onclick={openSentFiles}
+          title={$_("sent_files")}
+          aria-label="已发送文件"
         >
-      </button>
-    </div>
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            ><path
+              fill="currentColor"
+              d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM6 20V4h7v5h5v11z"
+            /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
+          >
+        </button>
+      </div>
 
-    <Contactlist
-      {contacts}
-      {selectedId}
-      onselect={select}
-      ondelete={(id) => {
-        // 从联系人列表中移除
-        contacts = contacts.filter((c) => c.pubkey_hex !== id);
-        // 如果删除的是当前选中的联系人，清空选择
-        if (selectedId === id)
-          selectedId = contacts.length > 0 ? contacts[0].pubkey_hex : null;
-      }}
-    />
+      <Contactlist
+        {contacts}
+        {selectedId}
+        onselect={selectMobile}
+        ondelete={(id) => {
+          contacts = contacts.filter((c) => c.pubkey_hex !== id);
+          if (selectedId === id)
+            selectedId = contacts.length > 0 ? contacts[0].pubkey_hex : null;
+        }}
+      />
 
-    <!-- 添加好友按钮 -->
-    <div class="add-friend-wrapper">
-      <button
-        class="add-friend-btn"
-        onclick={() => (showAddFriendModal = true)}
-        aria-label={$_("add_friend")}
-      >
-        <svg
-          width="20"
-          height="20"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
+      <div class="add-friend-wrapper">
+        <button
+          class="add-friend-btn"
+          onclick={() => (showAddFriendModal = true)}
+          aria-label={$_("add_friend")}
         >
-          <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-          <circle cx="9" cy="7" r="4" />
-          <line x1="19" y1="8" x2="19" y2="14" />
-          <line x1="22" y1="11" x2="16" y2="11" />
-        </svg>
-        <span>{$_("add_friend")}</span>
-      </button>
-    </div>
-  </aside>
-
-  <!-- 添加好友模态框 -->
-  <AddFriendModal
-    bind:show={showAddFriendModal}
-    {currentIdentityId}
-    onFriendAdded={loadContacts}
-  />
-
-  <!-- 已发送文件管理 -->
-  <SentFileManager bind:show={showSentFiles} />
-
-  <div
-    class="resizer-v"
-    style="left: {sidebarW}px"
-    onmousedown={() => startDrag(true)}
-    role="button"
-    aria-label="调整侧边栏宽度"
-    tabindex="0"
-  ></div>
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+            <circle cx="9" cy="7" r="4" />
+            <line x1="19" y1="8" x2="19" y2="14" />
+            <line x1="22" y1="11" x2="16" y2="11" />
+          </svg>
+          <span>{$_("add_friend")}</span>
+        </button>
+      </div>
+    </aside>
+  {/if}
 
   <div class="main">
+    <!-- 移动端标题栏：返回按钮 + 关于 -->
+    <div class="mobile-header" class:visible={isMobile && selectedId != null}>
+      <button class="back-btn" onclick={backToContacts} aria-label="返回联系人列表">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
+      </button>
+    </div>
+
     <a class="about" href="./about">{$_("about")}</a>
 
-    <div class="chat" style="height: calc(100% - {inputH}px)">
+    <div class="chat">
       {#if selectedId}
         <Messagelist bind:this={msgListRef} contactId={selectedId} />
-      {:else}
+      {:else if !isMobile}
         <div class="empty">{$_("select_contact_to_chat")}</div>
       {/if}
     </div>
@@ -488,25 +589,35 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     <Toast message={warning || ""} />
     <NotificationBadge onNotification={(cb) => { onNotif = cb; }} />
 
-    <div
-      class="resizer-h"
-      style="top: calc(100% - {inputH}px)"
-      onmousedown={() => startDrag(false)}
-      role="button"
-      aria-label="调整输入框高度"
-      tabindex="0"
-    ></div>
-
-    <div class="input-box" style="height: {inputH}px">
-      <Input
-        onsend={send}
-        disabled={!selectedId}
-        mldsaPubkeyHex={selectedId ?? ""}
-        fill
-      />
-    </div>
+    <ResizablePanel
+      min={80}
+      max={300}
+      defaultSize={150}
+      bind:size={inputH}
+      position="bottom"
+      mobileHidden={isMobile}
+    >
+      <div class="input-box">
+        <Input
+          onsend={send}
+          disabled={!selectedId}
+          mldsaPubkeyHex={selectedId ?? ""}
+          fill
+        />
+      </div>
+    </ResizablePanel>
   </div>
 </main>
+
+<!-- 添加好友模态框 -->
+<AddFriendModal
+  bind:show={showAddFriendModal}
+  {currentIdentityId}
+  onFriendAdded={loadContacts}
+/>
+
+<!-- 已发送文件管理 -->
+<SentFileManager bind:show={showSentFiles} />
 
 <style>
   :global(:root) {
@@ -534,8 +645,10 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   }
 
   .container {
-    display: flex;
-    height: 100vh;
+    display: grid;
+    grid-template-columns: var(--sidebar-default) 1fr;
+    grid-template-rows: 1fr;
+    height: 100dvh;
     overflow: hidden;
     background: transparent;
     color: var(--text-primary);
@@ -543,11 +656,76 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     z-index: 1;
   }
 
+  .container.mobile {
+    grid-template-columns: 1fr !important;
+  }
+
   .sidebar {
     display: flex;
     flex-direction: column;
+    height: 100%;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border-color);
+  }
+
+  /* 移动端侧边栏：全屏覆盖层 */
+  .sidebar-mobile {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 85vw;
+    max-width: 320px;
+    height: 100dvh;
+    z-index: 100;
+    border-right: 1px solid var(--border-color);
+    transform: translateX(-100%);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .sidebar-mobile.visible {
+    transform: translateX(0);
+  }
+
+  /* 移动端遮罩层 */
+  .mobile-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(4px);
+  }
+
+  /* 移动端标题栏 */
+  .mobile-header {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 44px;
+    z-index: 20;
+    align-items: center;
+    padding-left: 4px;
+    background: transparent;
+  }
+  .mobile-header.visible {
+    display: flex;
+  }
+  .back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 50%;
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .back-btn:active {
+    background: var(--border-color);
+    transform: scale(0.95);
   }
 
   .icon-buttons-container {
@@ -590,32 +768,12 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     transform: rotate(30deg) scale(0.95);
   }
 
-  .resizer-v,
-  .resizer-h {
-    position: absolute;
-    background: var(--border-color);
-    z-index: 10;
-  }
-  .resizer-v {
-    width: 6px;
-    height: 100%;
-    cursor: col-resize;
-  }
-  .resizer-h {
-    height: 6px;
-    width: 100%;
-    cursor: row-resize;
-  }
-  .resizer-v:hover,
-  .resizer-h:hover {
-    background: #3b82f6;
-  }
-
   .main {
-    flex: 1;
     display: flex;
     flex-direction: column;
     position: relative;
+    min-width: 0;
+    overflow: hidden;
   }
   .about {
     position: absolute;
@@ -631,6 +789,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
 
   .chat {
     flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
   .empty {

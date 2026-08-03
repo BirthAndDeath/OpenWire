@@ -1,0 +1,70 @@
+:root {
+  /* ========== 侧边栏 ========== */
+  --sidebar-collapse: 520px;
+  --sidebar-min: clamp(200px, 25vw, 400px);
+  --sidebar-default: clamp(200px, 28vw, 400px);
+
+  /* ========== 间距 ========== */
+  --spacing-xs: clamp(4px, 0.5vw, 8px);
+  --spacing-sm: clamp(8px, 1vw, 16px);
+  --spacing-md: clamp(12px, 1.5vw, 24px);
+  --spacing-lg: clamp(16px, 2vw, 32px);
+
+  /* ========== 字体 ========== */
+  --font-size-xs: clamp(10px, 0.8vw, 12px);
+  --font-size-sm: clamp(11px, 1vw, 13px);
+  --font-size-base: clamp(13px, 1.2vw, 15px);
+  --font-size-lg: clamp(15px, 1.5vw, 18px);
+  --font-size-xl: clamp(18px, 2vw, 24px);
+
+  /* ========== 消息气泡 ========== */
+  --bubble-max: clamp(55%, 70%, 80%);
+  --bubble-padding: clamp(6px, 1vw, 12px);
+  --bubble-radius: clamp(10px, 1.2vw, 14px);
+
+  /* ========== 头像 ========== */
+  --avatar-size: clamp(36px, 5vw, 48px);
+  --avatar-font: clamp(12px, 1.5vw, 16px);
+
+  /* ========== 布局 ========== */
+  --layout-max-width: 1600px;
+  --resizer-size: 6px;
+
+  /* ========== 安全区域（适配刘海屏/挖孔屏） ========== */
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-left: env(safe-area-inset-left, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
+}
+
+/* 小窗口（< 800px 宽） */
+@media (width <= 800px) {
+  :root {
+    --sidebar-default: clamp(180px, 25vw, 280px);
+    --bubble-max: 80%;
+  }
+}
+
+/* 手机竖屏（< 480px 宽） */
+@media (width <= 480px) {
+  :root {
+    --sidebar-default: 100vw;
+    --sidebar-collapse: 100vw;
+    --bubble-max: 90%;
+    --avatar-size: 40px;
+    --font-size-base: 14px;
+    --font-size-sm: 12px;
+    --font-size-lg: 16px;
+    --spacing-sm: 8px;
+    --spacing-md: 12px;
+    --resizer-size: 0px;
+  }
+}
+
+/* 超大窗口（>= 1920px 宽） */
+@media (width >= 1920px) {
+  :root {
+    --sidebar-default: 380px;
+    --bubble-max: 60%;
+  }
+}

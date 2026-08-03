@@ -171,4 +171,29 @@
         background: var(--bg-tertiary);
         color: var(--text-primary);
     }
+
+    @media (width <= 480px) {
+        .scan-modal-content {
+            width: 100%;
+            max-width: 100%;
+            height: 100dvh;
+            border-radius: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            padding: 16px;
+            padding-top: calc(16px + var(--safe-area-top));
+            padding-bottom: calc(16px + var(--safe-area-bottom));
+        }
+        .scan-action-btn {
+            font-size: 16px;
+            padding: 14px 20px;
+        }
+        .btn-cancel {
+            flex: 1;
+            text-align: center;
+            padding: 12px 16px;
+            font-size: 16px;
+        }
+    }
 </style>

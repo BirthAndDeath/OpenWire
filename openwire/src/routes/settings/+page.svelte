@@ -475,12 +475,28 @@
   .settings-container {
     display: flex;
     flex-direction: column;
-    height: 100vh;
+    height: 100dvh;
     background: transparent;
     color: var(--text-primary, #f6f6f6);
     font-family: system-ui;
     position: relative;
     z-index: 1;
+  }
+
+  @media (width <= 480px) {
+    .settings-container {
+      padding-top: var(--safe-area-top);
+      padding-bottom: var(--safe-area-bottom);
+    }
+    .settings-header {
+      padding: 12px 12px;
+    }
+    .settings-content {
+      padding: 12px;
+    }
+    .settings-section {
+      padding: 16px;
+    }
   }
 
   .settings-header {

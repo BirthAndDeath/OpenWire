@@ -376,4 +376,39 @@
         background: rgba(34, 197, 94, 0.1);
         color: #22c55e;
     }
+
+    @media (width <= 480px) {
+        .wrap {
+            border-radius: 0;
+            border-left: none;
+            border-right: none;
+            border-bottom: none;
+            padding: 8px 8px;
+            padding-bottom: calc(8px + var(--safe-area-bottom));
+        }
+        .badge {
+            display: none;
+        }
+        .row {
+            gap: 6px;
+        }
+        .box {
+            padding: 8px 10px;
+        }
+        textarea {
+            font-size: 16px;
+            min-height: 22px;
+        }
+        .btn {
+            width: 44px;
+            height: 44px;
+        }
+        .hints span:first-child {
+            display: none;
+        }
+        .hints {
+            margin-top: 4px;
+            font-size: 10px;
+        }
+    }
 </style>

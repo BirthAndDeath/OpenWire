@@ -243,8 +243,36 @@ function toggle(e: MouseEvent) {
     flex-shrink: 0;
   }
 
-  .notif-dismiss:hover {
-    color: var(--text-primary, #eee);
-    background: var(--bg-tertiary, #333);
-  }
+.notif-dismiss:hover {
+        color: var(--text-primary, #eee);
+        background: var(--bg-tertiary, #333);
+    }
+
+    @media (width <= 480px) {
+        .notif-badge-container {
+            top: auto;
+            right: 8px;
+            bottom: calc(80px + var(--safe-area-bottom));
+        }
+        .notif-popover {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            width: 100%;
+            max-height: 100dvh;
+            border-radius: 0;
+            border: none;
+            z-index: 1000;
+        }
+        .notif-list {
+            max-height: none;
+            flex: 1;
+        }
+        .notif-badge {
+            width: 44px;
+            height: 44px;
+        }
+    }
 </style>

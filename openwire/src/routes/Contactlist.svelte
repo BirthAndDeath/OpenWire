@@ -388,8 +388,8 @@
     }
     .avatar img,
     .fallback {
-        width: 44px;
-        height: 44px;
+        width: var(--avatar-size, 44px);
+        height: var(--avatar-size, 44px);
         border-radius: 50%;
         object-fit: cover;
     }
@@ -398,7 +398,7 @@
         place-items: center;
         background: linear-gradient(135deg, #3b82f6, #2563eb);
         color: white;
-        font-size: 14px;
+        font-size: var(--avatar-font, 14px);
         font-weight: 600;
     }
     .dot {

@@ -186,4 +186,32 @@
         line-height: 1.6;
         margin-top: 2rem;
     }
+
+    @media (width <= 480px) {
+        main {
+            padding: 1rem;
+            padding-top: calc(1rem + var(--safe-area-top));
+            padding-bottom: calc(1rem + var(--safe-area-bottom));
+        }
+        h1 {
+            font-size: 1.8rem;
+        }
+        .logo-link img {
+            height: 80px;
+            width: 80px;
+        }
+        .support {
+            flex-direction: column;
+            text-align: center;
+            gap: 0.5rem;
+        }
+        .links {
+            flex-direction: column;
+            width: 100%;
+            max-width: 280px;
+        }
+        .btn {
+            justify-content: center;
+        }
+    }
 </style>

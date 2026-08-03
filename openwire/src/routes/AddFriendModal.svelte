@@ -379,4 +379,34 @@
     .btn-scan:hover {
         background: rgba(16, 185, 129, 0.1);
     }
+
+    @media (width <= 480px) {
+        .modal-content {
+            width: 100%;
+            max-width: 100%;
+            height: 100dvh;
+            border-radius: 0;
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+            padding-top: calc(16px + var(--safe-area-top));
+            padding-bottom: calc(16px + var(--safe-area-bottom));
+        }
+        .modal-actions {
+            margin-top: auto;
+            padding-top: 16px;
+        }
+        .btn-cancel,
+        .btn-confirm,
+        .btn-scan {
+            flex: 1;
+            text-align: center;
+            padding: 12px 16px;
+            font-size: 16px;
+        }
+        .form-group input {
+            font-size: 16px;
+            padding: 12px;
+        }
+    }
 </style>

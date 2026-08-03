@@ -53,13 +53,12 @@
 </script>
 
 {#if show}
-  <div class="overlay" onclick={() => (show = false)} onkeydown={(e) => e.key === "Escape" && (show = false)} role="presentation">
+  <div class="overlay" onclick={() => (show = false)} onkeydown={(e) => e.key === "Escape" && (show = false)}>
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}} role="dialog" aria-label="已发送文件管理" tabindex="-1">
       <div class="header">
         <h2>{$_("sent_files")}</h2>
         <button class="close" onclick={() => (show = false)} aria-label="关闭">&times;</button>
       </div>
-
       {#if loading}
         <div class="loading">{$_("loading")}</div>
       {:else if files.length === 0}
@@ -95,11 +94,14 @@
 <style>
   .overlay {
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
     background: rgba(0, 0, 0, 0.5);
     display: grid;
     place-items: center;
-    z-index: 100;
+    z-index: 1000;
   }
   .modal {
     background: var(--bg-primary);
@@ -107,6 +109,7 @@
     border-radius: 12px;
     width: min(640px, 90vw);
     max-height: 80vh;
+    height: 80vh;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -199,5 +202,31 @@
   .revoke:hover {
     background: #ef4444;
     color: #fff;
+  }
+
+  @media (width <= 480px) {
+    .modal {
+      width: 100%;
+      max-width: 100%;
+      height: 100dvh;
+      max-height: 100dvh;
+      border-radius: 0;
+    }
+    .header {
+      padding: calc(12px + var(--safe-area-top)) 16px 12px;
+    }
+    .col-date {
+      display: none;
+    }
+    .col-size {
+      width: 60px;
+    }
+    .row {
+      padding: 12px 16px;
+    }
+    .revoke {
+      padding: 8px 16px;
+      font-size: 14px;
+    }
   }
 </style>
