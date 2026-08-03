@@ -93,7 +93,7 @@ version = "0.2.12"
 version = "0.47.0"
 
 [dependencies.rand]
-version = "0.8"
+version = "0.10"
 
 [dependencies.serde]
 version = "1.0"
@@ -116,7 +116,7 @@ version = "1.0.86"
 version = "0.4.0"
 
 [dev-dependencies.rand]
-version = "0.8"
+version = "0.10"
 
 [dev-dependencies.serde]
 version = "1.0"

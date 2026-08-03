@@ -60,7 +60,7 @@ required-features = [
 version = "0.3.30"
 
 [dependencies.hickory-proto]
-version = "0.25.2"
+version = "0.26.1"
 features = ["mdns"]
 default-features = false
 
@@ -77,7 +77,7 @@ version = "0.2.12"
 version = "0.47.0"
 
 [dependencies.rand]
-version = "0.8.3"
+version = "0.10.2"
 
 [dependencies.smallvec]
 version = "1.13.2"
