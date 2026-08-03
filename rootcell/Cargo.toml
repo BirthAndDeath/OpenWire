@@ -15,7 +15,7 @@ aes-gcm = "0.11.0"
 blake3 = "1.8.5"
 rand = "0.10.2"
 hkdf = "0.13"
-sha2 = "0.10"
+sha2 = "0.11"
 
 keyring = { version = "4.1.5" }
 keyring-core = "1.0.0"
