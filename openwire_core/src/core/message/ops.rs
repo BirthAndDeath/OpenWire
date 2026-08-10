@@ -134,20 +134,12 @@ impl ChatCore {
             tracing::debug!("send_text_impl: is_retry=true, 跳过 save_pending_message_with_hash");
         }
 
-        // 发送消息到网络
-        self.send_message(recipient_peer_id, message).await;
+        // 发送消息到网络（不立即标记已发送，由 P2P 事件确认或送达回执标记）
+        self.send_message(recipient_peer_id, message, Some(&message_hash)).await;
 
-        // 首次发送成功后立即标记为已发送，防止重制定时器重复发送消息
+        // 首次发送时，P2P 层的 MessageSent 事件或送达回执会将消息标记为已发送
+        // 如果首次发送失败，OutboundFailure 事件会触发重试
         // 重试路径由 retry_single_pending_message 中的 mark_sent 按 ID 标记
-        if !is_retry
-            && let Some(pool) = storage::pool()
-                && let Err(e) = storage::mark_sent_by_hash(pool, &message_hash).await {
-                    tracing::warn!(
-                        "标记消息 {}.. 为已发送失败: {}（消息已发送，但 pending 状态未更新，可能触发重试）",
-                        &message_hash[..16],
-                        e,
-                    );
-                }
 
         Ok(message_hash)
     }
@@ -252,15 +244,11 @@ impl ChatCore {
     ) {
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
         if let Some(pool) = storage::pool() {
-            let hash_input = format!(
-                "{}:{}:{}",
-                mldsa_pubkey_hex,
-                msgtype as u8,
-                hex::encode(data)
-            );
             let message_hash = {
                 let mut hasher = Sha256::new();
-                hasher.update(hash_input.as_bytes());
+                hasher.update(mldsa_pubkey_hex.as_bytes());
+                hasher.update([msgtype as u8]);
+                hasher.update(data);
                 hex::encode(hasher.finalize())
             };
 
@@ -312,47 +300,49 @@ impl ChatCore {
         msgtype: ChatMessageType,
         data: &[u8],
         message_hash: &str,
-    ) {
+    ) -> Option<i64> {
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
-        if let Some(pool) = storage::pool() {
-            let content = match msgtype {
-                ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
-                _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
-            };
+        let Some(pool) = storage::pool() else { return None };
+        let content = match msgtype {
+            ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
+            _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
+        };
 
-            tracing::debug!(
-                "save_pending_message_with_hash: msgtype={:?}, hash={}.., data_len={}",
-                msgtype,
-                &message_hash[..16],
-                data.len(),
-            );
+        tracing::debug!(
+            "save_pending_message_with_hash: msgtype={:?}, hash={}.., data_len={}",
+            msgtype,
+            &message_hash[..16],
+            data.len(),
+        );
 
-            match storage::add_message_with_hash(
-                pool,
-                owner_identity_id,
-                mldsa_pubkey_hex,
-                &content,
-                true,
-                true,
-                message_hash,
-            )
-            .await
-            {
-                Ok(Some(id)) => {
-                    tracing::info!("消息已保存到数据库（pending），id={}", id);
-                }
-                Ok(None) => {
-                    tracing::debug!("数据库中已存在相同哈希的消息，跳过");
-                }
-                Err(e) => {
-                    tracing::warn!("保存消息到数据库失败: {}", e);
-                }
+        match storage::add_message_with_hash(
+            pool,
+            owner_identity_id,
+            mldsa_pubkey_hex,
+            &content,
+            true,
+            true,
+            message_hash,
+        )
+        .await
+        {
+            Ok(Some(id)) => {
+                tracing::info!("消息已保存到数据库（pending），id={}", id);
+                Some(id)
+            }
+            Ok(None) => {
+                tracing::debug!("数据库中已存在相同哈希的消息，跳过");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("保存消息到数据库失败: {}", e);
+                None
             }
         }
     }
 
-    /// 重试发送所有待发送消息
-    pub(crate) async fn retry_pending_messages(&mut self) {
+    /// 重试发送待发送消息，可指定过滤特定联系人
+    pub(crate) async fn retry_pending_messages(&mut self, peer_pubkey_hex: Option<&str>) {
         let pool = match storage::pool() {
             Some(p) => p,
             None => {
@@ -361,12 +351,15 @@ impl ChatCore {
             }
         };
 
-        let pending_msgs = match storage::list_pending(pool).await {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                tracing::warn!("查询待发送消息列表失败: {}", e);
-                return;
-            }
+        let pending_msgs = match peer_pubkey_hex {
+            Some(pk) => match storage::list_pending_by_peer(pool, pk).await {
+                Ok(msgs) => msgs,
+                Err(e) => { tracing::warn!("查询待发送消息列表失败: {}", e); return; }
+            },
+            None => match storage::list_pending(pool).await {
+                Ok(msgs) => msgs,
+                Err(e) => { tracing::warn!("查询待发送消息列表失败: {}", e); return; }
+            },
         };
 
         if pending_msgs.is_empty() {
@@ -375,13 +368,11 @@ impl ChatCore {
         }
 
         tracing::info!("开始重试 {} 条待发送消息", pending_msgs.len());
-
         for msg in &pending_msgs {
             if let Err(e) = self.retry_single_pending_message(pool, msg).await {
                 tracing::warn!("重试消息 {} 失败: {}", msg.id, e);
             }
         }
-
         tracing::info!("离线消息重试完成");
     }
 
@@ -434,104 +425,6 @@ impl ChatCore {
         storage::mark_sent(pool, msg.id).await?;
 
         Ok(())
-    }
-
-    /// 重试指定联系人的待发送消息
-    /// 用于 FriendOnline 事件，只重试该联系人的消息，避免重复发送
-    pub(crate) async fn retry_pending_for_peer(&mut self, peer_pubkey_hex: &str) {
-        let pool = match storage::pool() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("数据库不可用，无法重试待发送消息");
-                return;
-            }
-        };
-
-        let pending_msgs = match storage::list_pending_by_peer(pool, peer_pubkey_hex).await {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                tracing::warn!("查询待发送消息列表失败: {}", e);
-                return;
-            }
-        };
-
-        if pending_msgs.is_empty() {
-            tracing::debug!("联系人 {}.. 没有待发送的消息", &peer_pubkey_hex[..16]);
-            return;
-        }
-
-        tracing::info!(
-            "开始重试联系人 {}.. 的 {} 条待发送消息",
-            &peer_pubkey_hex[..16],
-            pending_msgs.len()
-        );
-
-        for msg in &pending_msgs {
-            if let Err(e) = self.retry_single_pending_message(pool, msg).await {
-                tracing::warn!("重试给 {}.. 的消息 {} 失败: {}", &peer_pubkey_hex[..16], msg.id, e);
-            }
-        }
-    }
-
-    /// 仅向当前在线的好友重试待发送消息
-    ///
-    /// 与 retry_pending_messages() 的区别：
-    /// - 只处理接收方 PeerID 在 connected_peers 中（当前在线）的消息
-    /// - 对不在线的联系人跳过，不发起 DHT 查询（避免无效网络开销）
-    /// - 由主循环中 1 秒间隔的定时器触发，替代 ConnectionEstablished 过早的重试
-    ///
-    /// # 设计说明
-    /// 当对方上线后，FriendOnline 通知会缓存 (公钥→PeerID) 映射到 DHT 本地数据库，
-    /// 但 FriendOnline 可能延迟或丢失。此定时器确保：
-    ///   1. FriendOnline 到达后最多 1 秒内重试成功
-    ///   2. FriendOnline 丢失时不会永久等待，下一次定时器触发即可重试
-    ///   3. 只触达在线节点，不会对离线联系人做无效的 DHT 网络查询
-    pub(crate) async fn retry_pending_for_online_peers(&mut self) {
-        let pool = match storage::pool() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("数据库不可用，无法重试待发送消息");
-                return;
-            }
-        };
-
-        // Collect the pubkeys of currently connected peers for targeted query
-        let online_pubkeys: Vec<String> = {
-            let store = self.get_dht_store();
-            self.connected_peers.keys().filter_map(|peer_id| {
-                store.get_pubkey_by_peerid(peer_id).ok().flatten()
-            }).collect()
-        };
-
-        if online_pubkeys.is_empty() {
-            tracing::debug!("没有在线好友的待发送消息（无在线好友）");
-            return;
-        }
-
-        let pending_msgs = match storage::list_pending_by_peers(pool, &online_pubkeys).await {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                tracing::warn!("查询在线好友待发送消息失败: {}", e);
-                return;
-            }
-        };
-
-        if pending_msgs.is_empty() {
-            tracing::debug!("没有面向在线好友的待发送消息");
-            return;
-        }
-
-        tracing::info!(
-            "定时重试: 向 {} 位在线好友重试 {} 条待发送消息",
-            online_pubkeys.len(),
-            pending_msgs.len()
-        );
-
-        for msg in &pending_msgs {
-            if let Err(e) = self.retry_single_pending_message(pool, msg).await {
-                tracing::warn!("定时重试: 消息 {} 失败: {}", msg.id, e);
-            }
-        }
     }
 
     /// 通过 DHT 网络查询或已建立的连接查找对方的 PeerID
@@ -623,6 +516,9 @@ impl ChatCore {
 
 /// 根据消息内容检测消息类型
 fn detect_msgtype(content: &str) -> ChatMessageType {
+    if content.starts_with(crate::command::FILE_SHARE_CONTENT_PREFIX) {
+        return ChatMessageType::FileHash;
+    }
     if let Some(stripped) = content.strip_prefix('[') {
         if let Some(rest) = stripped.split(']').next() {
             match rest.parse::<u8>() {

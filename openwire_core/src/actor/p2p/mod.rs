@@ -18,7 +18,7 @@
 pub mod netevent;
 pub mod swarm_ops;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -28,6 +28,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{
     Event as RequestResponseEvent, Message as RequestResponseMessage,
 };
+use libp2p::request_response::OutboundRequestId;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm, autonat, core, dcutr, identify, mdns, relay};
 use tokio::sync::mpsc;
@@ -55,6 +56,8 @@ pub enum P2pCommand {
         peer_id: PeerId,
         /// 要发送的消息
         message: ChatMessage,
+        /// 消息哈希（用于发送结果回调标记 pending）
+        message_hash: String,
     },
     /// 发送 NetEvent 请求
     SendNetEvent {
@@ -72,6 +75,11 @@ pub enum P2pCommand {
     },
     /// 发布身份到 DHT（使用 SHA256(公钥) 作为 key）
     PublishIdentity {
+        /// ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+    },
+    /// 停止在 DHT 提供身份（删除 identity 时调用，替代原本的重新发布）
+    StopProviding {
         /// ML-DSA 公钥 hex
         mldsa_pubkey_hex: String,
     },
@@ -106,6 +114,8 @@ pub enum P2pCommand {
     },
     /// 保存路由表
     SaveRoutingTable,
+    /// 随机刷新路由表（随机桶查询，扩展路由表覆盖）
+    RefreshRoutingTable,
     /// 通过中继发现对端 PeerID
     DiscoverPeer {
         /// 目标 ML-DSA 公钥 hex
@@ -186,6 +196,11 @@ pub enum P2pEvent {
         /// 查询到的记录值
         value: Vec<u8>,
     },
+    /// DHT 发布记录失败
+    DhtPublishFailed {
+        /// 发布失败的错误信息
+        error: String,
+    },
     /// 日志
     Log(String),
     /// DHT 网络就绪：Kademlia 路由表已添加至少一个节点，可执行 DHT 查询
@@ -203,6 +218,27 @@ pub enum P2pEvent {
     PeerNotFound {
         /// 查询的 ML-DSA 公钥 hex
         mldsa_pubkey_hex: String,
+    },
+    /// 发出的 FriendOnline 被对方拒绝（含结构化原因）
+    FriendOnlineNack {
+        /// 拒绝本节点 FriendOnline 的对端 PeerID
+        peer: PeerId,
+        /// 拒绝原因
+        reason: crate::p2p::netevent::NackReason,
+    },
+    /// 消息发送成功（P2P 层确认收到响应）
+    MessageSent {
+        /// 目标节点 PeerId
+        peer: PeerId,
+        /// 消息哈希
+        message_hash: String,
+    },
+    /// 消息发送失败（P2P 层 OutboundFailure）
+    MessageSendFailed {
+        /// 目标节点 PeerId
+        peer: PeerId,
+        /// 消息哈希
+        message_hash: String,
     },
 }
 
@@ -251,6 +287,8 @@ pub struct P2pActor {
     listen_addrs: HashSet<libp2p::Multiaddr>,
     /// Relay 节点配置 [(PeerId, Multiaddr)]
     relay_nodes: Vec<(String, String)>,
+    /// 当前所有已连接的 peer（含 relay 和直连），每个 peer 的引用计数
+    connected_peers: HashMap<PeerId, usize>,
     /// 通过 Identify 自动发现的 relay 候选节点 (PeerId, first_known_addr)
     relay_candidates: Vec<(PeerId, libp2p::Multiaddr)>,
     /// Relay 重连冷却时间（防止无限循环重试）
@@ -276,6 +314,9 @@ pub struct P2pActor {
 
     /// 是否已发送 BootstrapReady 事件
     bootstrap_ready_sent: bool,
+
+    /// 追踪待发送请求的 request_id → message_hash 映射
+    pending_requests: HashMap<OutboundRequestId, String>,
 }
 
 impl P2pActor {
@@ -295,6 +336,7 @@ impl P2pActor {
             
             mdns_cache: lru::LruCache::new(std::num::NonZeroUsize::new(2000).unwrap()),
             relay_connections: HashSet::new(),
+            connected_peers: HashMap::new(),
             // kademlia_mode 已移除，由 set_mode(Some(...)) 直接管理
             nat_status: autonat::NatStatus::Unknown,
             listen_addrs: HashSet::new(),
@@ -307,6 +349,7 @@ impl P2pActor {
             reservation_attempted: HashSet::new(),
             dht_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DHT_QUERIES)),
             bootstrap_ready_sent: false,
+            pending_requests: HashMap::new(),
         }
     }
 
@@ -316,13 +359,19 @@ impl P2pActor {
 
     /// 发送事件到 ChatCore
     ///
-    /// 使用 try_send 避免背压死锁：当 ChatCore 事件循环繁忙导致 rx_event 通道满时，
-    /// blocking send 会导致 P2pActor 事件循环阻塞，进而无法处理 ChatCore 发来的命令，
-    /// 形成循环依赖死锁（P2pActor 等 ChatCore 消费事件，ChatCore 等 P2pActor 响应命令）。
-    /// try_send 在通道满时丢弃事件并记录 warning（比死锁更安全）。
+    /// 关键事件（MessageReceived/GetProvidersResult）使用 send() 确保不丢失；
+    /// 非关键事件使用 try_send() 避免背压死锁。
     async fn send_event(&mut self, event: P2pEvent) {
-        if let Err(e) = self.event_tx.try_send(event) {
-            tracing::warn!("事件通道满，丢弃 P2pEvent: {e:?}");
+        let is_critical = matches!(
+            event,
+            P2pEvent::MessageReceived { .. } | P2pEvent::GetProvidersResult { .. }
+        );
+        if is_critical {
+            if let Err(e) = self.event_tx.send(event).await {
+                tracing::error!("事件通道关闭，P2pActor 退出: {e:?}");
+            }
+        } else if let Err(e) = self.event_tx.try_send(event) {
+            tracing::warn!("事件通道满，丢弃非关键 P2pEvent: {e:?}");
         }
     }
 
@@ -398,19 +447,28 @@ impl P2pActor {
 
             // --- rr_msg: 收到响应 ---
             SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(RequestResponseEvent::Message {
-                message: RequestResponseMessage::Response { response, .. },
+                message: RequestResponseMessage::Response { response, request_id, .. },
+                peer,
                 ..
-            })) => match response.verify() {
-                Ok(true) => tracing::debug!("收到签名响应: timestamp={}", response.timestamp),
-                Ok(false) => tracing::warn!("收到无效签名的响应，已忽略"),
-                Err(e) => tracing::warn!("验证响应签名时出错: {}", e),
-            },
+            })) => {
+                match response.verify() {
+                    Ok(true) => tracing::debug!("收到签名响应: timestamp={}", response.timestamp),
+                    Ok(false) => tracing::warn!("收到无效签名的响应，已忽略"),
+                    Err(e) => tracing::warn!("验证响应签名时出错: {}", e),
+                }
+                if let Some(hash) = self.pending_requests.remove(&request_id) {
+                    self.send_event(P2pEvent::MessageSent { peer, message_hash: hash }).await;
+                }
+            }
 
             // --- rr_msg: 出站失败 ---
             SwarmEvent::Behaviour(MyBehaviourEvent::RrMsg(
-                RequestResponseEvent::OutboundFailure { peer, error, .. },
+                RequestResponseEvent::OutboundFailure { peer, error, request_id, .. },
             )) => {
                 tracing::error!("向 {} 发送消息失败: {:?}", peer, error);
+                if let Some(hash) = self.pending_requests.remove(&request_id) {
+                    self.send_event(P2pEvent::MessageSendFailed { peer, message_hash: hash }).await;
+                }
             }
 
             // --- rr_msg: 入站失败 ---
@@ -447,6 +505,7 @@ impl P2pActor {
             // --- rr_netevent: 收到 NetEvent 响应 ---
             SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(
                 RequestResponseEvent::Message {
+                    peer,
                     message: RequestResponseMessage::Response { response, .. },
                     ..
                 },
@@ -458,19 +517,41 @@ impl P2pActor {
                         peer_id,
                         mlkem_pubkey_hex,
                     } if !peer_id.is_empty() => {
-                        if let Ok(pid) = peer_id.parse::<PeerId>() {
-                            self.send_event(P2pEvent::PeerInfoReceived {
-                                mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
-                                peer_id: pid,
-                                mlkem_pubkey_hex: mlkem_pubkey_hex.clone(),
-                            }).await;
-                            return;
+                        match peer_id.parse::<PeerId>() {
+                            Ok(pid) => {
+                                self.send_event(P2pEvent::PeerInfoReceived {
+                                    mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
+                                    peer_id: pid,
+                                    mlkem_pubkey_hex: mlkem_pubkey_hex.clone(),
+                                }).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!("PeerInfo invalid peer_id '{peer_id}': {e}");
+                            }
                         }
+                        return;
                     }
                     NetEventResponse::PeerNotFound { mldsa_pubkey_hex } => {
                         self.send_event(P2pEvent::PeerNotFound {
                             mldsa_pubkey_hex: mldsa_pubkey_hex.clone(),
                         }).await;
+                        return;
+                    }
+                    NetEventResponse::Nack { reason } => {
+                        tracing::warn!(
+                            "对方 {} 拒绝了 FriendOnline: {:?}",
+                            peer,
+                            reason
+                        );
+                        self.send_event(P2pEvent::FriendOnlineNack {
+                            peer,
+                            reason: reason.clone(),
+                        })
+                        .await;
+                        return;
+                    }
+                    NetEventResponse::Ack => {
+                        tracing::debug!("NetEvent 请求被 {} 确认（Ack）", peer);
                         return;
                     }
                     _ => {}
@@ -555,7 +636,13 @@ impl P2pActor {
                                 && !s.contains("::1")
                                 && !s.contains("/p2p-circuit")
                         });
-                        let selected_addr = first_usable.unwrap_or_else(|| &info.listen_addrs[0]);
+                        let Some(selected_addr) = first_usable.or_else(|| info.listen_addrs.first()) else {
+                            tracing::debug!(
+                                "Discovered relay-capable candidate {} but no usable address",
+                                peer_id
+                            );
+                            return;
+                        };
                         self.relay_candidates.push((peer_id, selected_addr.clone()));
                             tracing::debug!(
                                 "Discovered relay-capable candidate: {} at {}",
@@ -594,6 +681,7 @@ impl P2pActor {
                         ..
                     } => Self::is_relay_addr(address),
                 };
+                *self.connected_peers.entry(peer_id).or_insert(0) += 1;
                 if is_relay {
                     if self.relay_connections.insert(peer_id) {
                         tracing::debug!("Relay connection to {}", peer_id);
@@ -611,6 +699,12 @@ impl P2pActor {
             // --- 连接关闭 ---
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::debug!("Connection closed with {}", peer_id);
+                if let std::collections::hash_map::Entry::Occupied(mut e) = self.connected_peers.entry(peer_id) {
+                    *e.get_mut() = e.get().saturating_sub(1);
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
                 self.relay_connections.remove(&peer_id);
                 self.send_event(P2pEvent::ConnectionClosed { peer_id })
                     .await;
@@ -851,7 +945,11 @@ impl P2pActor {
                 ..
             } => match result {
                 Ok(ok) => tracing::debug!("Successfully published DHT record to {:?}", ok.key),
-                Err(e) => tracing::warn!("Failed to publish DHT record: {:?}", e),
+                Err(e) => {
+                    let err_msg = format!("{:?}", e);
+                    tracing::warn!("Failed to publish DHT record: {}", err_msg);
+                    self.send_event(P2pEvent::DhtPublishFailed { error: err_msg }).await;
+                }
             },
 
             kad::Event::OutboundQueryProgressed {
@@ -866,12 +964,6 @@ impl P2pActor {
                             providers.len(),
                             &key_str[..16.min(key_str.len())]
                         );
-
-                        // 缓存到本地 DHT 缓存
-                        let store = &self.dht_cache;
-                        for provider in &providers {
-                            let _ = store.set_pubkey_peerid(key_str, provider);
-                        }
 
                         // 通知等待的 oneshot callbacks
                         if let Ok(mut callbacks) = DHT_PROVIDER_CALLBACKS.lock()
@@ -960,8 +1052,11 @@ impl P2pActor {
     #[tracing::instrument(skip(self, cmd))]
     async fn handle_command(&mut self, cmd: P2pCommand) {
         match cmd {
-            P2pCommand::SendMessage { peer_id, message } => {
-                p2p_swarm_ops::send_message(&mut self.swarm, &peer_id, message);
+            P2pCommand::SendMessage { peer_id, message, message_hash } => {
+                let req_id = p2p_swarm_ops::send_message(&mut self.swarm, &peer_id, message);
+                if !message_hash.is_empty() {
+                    self.pending_requests.insert(req_id, message_hash);
+                }
             }
             P2pCommand::SendNetEvent { peer_id, request } => {
                 p2p_swarm_ops::send_netevent_request(&mut self.swarm, &peer_id, request);
@@ -971,6 +1066,9 @@ impl P2pActor {
             }
             P2pCommand::PublishIdentity { mldsa_pubkey_hex } => {
                 p2p_swarm_ops::publish_identity_to_dht(&mut self.swarm, &mldsa_pubkey_hex);
+            }
+            P2pCommand::StopProviding { mldsa_pubkey_hex } => {
+                p2p_swarm_ops::stop_providing_to_dht(&mut self.swarm, &mldsa_pubkey_hex);
             }
             P2pCommand::GetProviders { key } => {
                 let sem = self.dht_semaphore.clone();
@@ -1060,7 +1158,10 @@ impl P2pActor {
             }
             P2pCommand::SaveRoutingTable => {
                 let cache_path = self.data_dir.join("routing_table.cache");
-                p2p::save_routing_table(&mut self.swarm, &cache_path);
+                p2p::save_routing_table(&mut self.swarm, &cache_path, &self.connected_peers).await;
+            }
+            P2pCommand::RefreshRoutingTable => {
+                p2p_swarm_ops::refresh_routing_table(&mut self.swarm);
             }
             P2pCommand::DiscoverPeer { mldsa_pubkey_hex } => {
                 // 向所有已连接的中继节点发送 DiscoverPeer 查询
@@ -1251,7 +1352,7 @@ impl P2pActorBuilder {
                                 tracing::info!("P2pActor 收到关闭命令");
                                 actor.disable_relay_server();
                                 let cache_path = actor.data_dir.join("routing_table.cache");
-                                p2p::save_routing_table(&mut actor.swarm, &cache_path);
+                                p2p::save_routing_table(&mut actor.swarm, &cache_path, &actor.connected_peers).await;
                                 break;
                             }
                             Some(cmd) => actor.handle_command(cmd).await,
@@ -1262,7 +1363,7 @@ impl P2pActorBuilder {
                         tracing::info!("P2pActor 收到取消信号");
                         actor.disable_relay_server();
                         let cache_path = actor.data_dir.join("routing_table.cache");
-                        p2p::save_routing_table(&mut actor.swarm, &cache_path);
+                        p2p::save_routing_table(&mut actor.swarm, &cache_path, &actor.connected_peers);
                         break;
                     }
                 }

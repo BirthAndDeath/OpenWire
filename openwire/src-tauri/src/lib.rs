@@ -583,6 +583,26 @@ async fn request_file_download(
         return Err("保存路径不能为空".to_string());
     }
 
+    // 限制保存路径必须在下载目录内，防止路径遍历
+    let data_dir = {
+        let inner = state.inner.read().await;
+        inner.data_dir.clone()
+    };
+    let downloads_dir = data_dir.join("downloads");
+    let save_canon = {
+        let parent = std::path::Path::new(&save_path).parent().unwrap_or(std::path::Path::new(""));
+        std::fs::create_dir_all(downloads_dir.clone())
+            .map_err(|e| format!("创建下载目录失败: {}", e))?;
+        parent.canonicalize().map_err(|e| format!("无效的保存路径: {}", e))?
+    };
+    let downloads_canon = downloads_dir
+        .canonicalize()
+        .map_err(|e| format!("下载目录不可用: {}", e))?;
+    if !save_canon.starts_with(&downloads_canon) {
+        return Err("保存路径必须在下载目录内".to_string());
+    }
+    drop(data_dir);
+
     let inner = state.inner.read().await;
     let result = inner
         .cmd_tx
@@ -731,11 +751,11 @@ pub struct AppDataInner {
     pub core_ready: bool,
 }
 
-fn create_placeholder_appdata() -> AppData {
+fn create_placeholder_appdata(data_dir: PathBuf) -> AppData {
     AppData {
         inner: Arc::new(RwLock::new(AppDataInner {
             cmd_tx: None,
-            data_dir: PathBuf::new(),
+            data_dir,
             mlkem_pubkey_hex: None,
             core_ready: false,
         })),
@@ -830,6 +850,87 @@ async fn setup_core_and_event_loop(
     }
 }
 
+#[tauri::command]
+async fn copy_file(state: tauri::State<'_, AppData>, src: String, dst: String) -> Result<(), String> {
+    let data_dir = {
+        let inner = state.inner.read().await;
+        inner.data_dir.clone()
+    };
+    let data_canon = data_dir.canonicalize().map_err(|e| format!("data dir unavailable: {e}"))?;
+    let src_path = std::path::PathBuf::from(&src);
+    let src_canon = src_path.canonicalize().map_err(|e| format!("source file not found: {e}"))?;
+    let ext = src_canon.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") {
+        return Err(format!("unsupported source file type: .{ext}"));
+    }
+    let dst_path = std::path::PathBuf::from(&dst);
+    let parent = dst_path.parent().ok_or("no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("create dir failed: {e}"))?;
+    let parent_canon = parent.canonicalize().map_err(|e| format!("destination dir unavailable: {e}"))?;
+    if !parent_canon.starts_with(&data_canon) {
+        return Err("destination path outside app data directory".into());
+    }
+    // 用父目录 canonical + 文件名构造目标路径。
+    // 不能直接对 dst_path.canonicalize()：目标文件尚不存在时会失败。
+    let file_name = dst_path
+        .file_name()
+        .ok_or("invalid destination filename")?;
+    let dst_canon = parent_canon.join(file_name);
+    if !dst_canon.starts_with(&data_canon) {
+        return Err("destination path outside app data directory after resolution".into());
+    }
+    // 文件复制，最多重试 3 次（Windows 下目标文件可能被短暂占用）
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match std::fs::copy(&src_canon, &dst_canon) {
+            Ok(_) => {
+                // 复制成功后清理同目录下其他 background* 文件，防止堆积
+                cleanup_old_backgrounds(&parent_canon, &dst_canon);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "copy file failed after 3 attempts: {}",
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into())
+    ))
+}
+
+/// 删除 dir 下除 keep 之外的所有 background* 文件
+fn cleanup_old_backgrounds(dir: &std::path::Path, keep: &std::path::Path) {
+    let keep_name = keep.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if name == keep_name {
+            continue;
+        }
+        if name.starts_with("background") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -839,16 +940,11 @@ pub fn run() {
         .setup(|app| {
             let apphandle = app.handle().clone();
 
-            apphandle.manage(create_placeholder_appdata());
+            let data_dir = apphandle.path().app_data_dir().unwrap_or_default();
+            std::fs::create_dir_all(&data_dir).ok();
+            apphandle.manage(create_placeholder_appdata(data_dir.clone()));
 
             tauri::async_runtime::spawn(async move {
-                let data_dir = match apphandle.path().app_data_dir() {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        tracing::error!("Failed to get app data directory: {}", e);
-                        return;
-                    }
-                };
                 let log_path = match apphandle.path().app_log_dir() {
                     Ok(dir) => dir,
                     Err(e) => {
@@ -857,7 +953,6 @@ pub fn run() {
                     }
                 };
 
-                std::fs::create_dir_all(&data_dir).ok();
                 std::fs::create_dir_all(&log_path).ok();
                 #[cfg(debug_assertions)]
                 let log_level = "debug";
@@ -922,7 +1017,9 @@ pub fn run() {
             save_nodes_config,
             reset_nodes_config,
             list_sent_files,
-            delete_sent_file
+            delete_sent_file,
+copy_file,
+            get_version
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

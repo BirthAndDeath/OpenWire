@@ -20,7 +20,12 @@ fn sanitize_filename(filename: &str) -> Option<String> {
     {
         return None;
     }
-    Some(f.chars().take(MAX_FILENAME_BYTES).collect())
+    let sanitized: String = f
+        .chars()
+        .filter(|&c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' || c == '(' || c == ')')
+        .take(MAX_FILENAME_BYTES)
+        .collect();
+    if sanitized.is_empty() { None } else { Some(sanitized) }
 }
 
 fn validate_path_within_base(path: &Path, base: &Path) -> bool {
@@ -56,22 +61,10 @@ impl ChatCore {
             return self.downloads_dir();
         };
 
-        let canonical = match std::fs::canonicalize(&raw) {
-            Ok(d) => d,
-            Err(_) => {
-                let _ = std::fs::create_dir_all(&raw);
-                match std::fs::canonicalize(&raw) {
-                    Ok(d) => d,
-                    Err(_) => return self.downloads_dir(),
-                }
-            }
-        };
-        let data = std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| {
-            let _ = std::fs::create_dir_all(&self.data_dir);
-            std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone())
-        });
+        let _ = std::fs::create_dir_all(&raw);
+        let canonical = std::fs::canonicalize(&raw).unwrap_or_else(|_| self.downloads_dir());
+        let data = std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
         if canonical.starts_with(&data) {
-            let _ = std::fs::create_dir_all(&canonical);
             return canonical;
         }
         let fallback = self.downloads_dir();
@@ -355,23 +348,18 @@ impl ChatCore {
                 .extension()
                 .map(|e| format!(".{}", e.to_string_lossy()))
                 .unwrap_or_default();
-            (1..)
+            (1..10000)
                 .map(|i| {
                     self.downloads_dir()
                         .join(format!("{} ({}){}", stem, i, ext))
                 })
-                .find(|p| !p.exists())
+                .find(|p| !p.try_exists().unwrap_or(true))
                 .unwrap_or_else(|| {
-                    // 极端情况：所有 0..9999 序号都被占用，使用时间戳
-                    self.downloads_dir().join(format!(
-                        "{} ({}).{}",
-                        stem,
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis(),
-                        ext
-                    ))
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    self.downloads_dir().join(format!("{} ({}).{}", stem, ts, ext))
                 })
         } else {
             output

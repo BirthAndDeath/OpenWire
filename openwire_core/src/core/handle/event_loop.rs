@@ -133,113 +133,22 @@ impl ChatCore {
                     peer_id: claimed_peer_id,
                     listen_addrs,
                     mlkem_pubkey_hex,
+                    signature,
+                    version,
+                    ..
                 } = &request {
-                    // 验证：声称的 PeerID 必须与实际连接的 PeerID 一致
-                    if *claimed_peer_id != peer.to_string() {
-                        tracing::warn!(
-                            "FriendOnline PeerID 不匹配: 声称={}, 实际={}，忽略",
-                            claimed_peer_id,
-                            peer
-                        );
-                        // 发送响应确认并跳过处理
-                        if let Err(e) = self.p2p_handle.tx.try_send(
-                            P2pCommand::SendNetEventResponse {
-                                channel,
-                                response: crate::p2p::netevent::NetEventResponse::Ack,
-                            },
-                        ) {
-                            tracing::warn!("Failed to send NetEventResponse on PeerID mismatch: {e:?}");
-                        }
-                        return;
-                    } else {
-                        tracing::debug!(
-                            "收到有效的 FriendOnline: {}.. (PeerID={})",
-                            &mldsa_pubkey_hex[..16],
-                            peer
-                        );
-
-                        // 缓存 (ML-DSA 公钥 → PeerID) 映射到 DHT 存储
-                        let store = self.get_dht_store();
-                        let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
-                        // 同步更新内存缓存，如果已连接则刷新在线状态
-                        self.update_peerid_pubkey_mapping(peer, mldsa_pubkey_hex.clone())
-                            .await;
-
-                        // 缓存 ML-KEM 公钥（直接从 FriendOnline 获取，不经过 DHT）
-                        if !mlkem_pubkey_hex.is_empty() {
-                            self.peerid_to_mlkem.insert(peer, mlkem_pubkey_hex.clone());
-                        }
-
-// 检查对方是否已在联系人列表中
-                        let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
-                        if !owner_id.is_empty()
-                            && let Some(pool) = storage::pool() {
-                                let is_known = storage::is_contact_exists(
-                                    pool,
-                                    owner_id,
-                                    mldsa_pubkey_hex,
-                                )
-                                .await
-                                .unwrap_or(false);
-
-                                if !is_known {
-                                    tracing::debug!(
-                                        "FriendOnline 来自非联系人 {}..，仅缓存身份，跳过自动添加",
-                                        &mldsa_pubkey_hex[..16]
-                                    );
-                                } else {
-                                    // === Fix 7: FriendOnline 处理后检查并重试待发送消息 ===
-                                    // ConnectionEstablished → retry_pending_messages 在 FriendOnline
-                                    // 到达前运行，使用旧 DHT 存储找不到 PeerID 就跳过。
-                                    // FriendOnline 到达后缓存了 (公钥→PeerID) 映射，此时重试能成功。
-                                    match storage::list_pending_by_peer(pool, mldsa_pubkey_hex).await {
-                                        Ok(msgs) => {
-                                            if !msgs.is_empty() {
-                                                tracing::debug!(
-                                                    "FriendOnline 处理后 {}.. 有 {} 条待发消息，立即重试",
-                                                    &mldsa_pubkey_hex[..16],
-                                                    msgs.len()
-                                                );
-                                                self.retry_pending_for_peer(mldsa_pubkey_hex).await;
-                                            }
-                                        }
-                                        Err(e) => tracing::warn!(
-                                            "FriendOnline 处理后查询待发消息失败: {}", e
-                                        ),
-                                    }
-                                }
-                            }
-                    }
-
-                // 先尝试拨号对方监听地址（包括中继地址，用于 NAT 穿透）
-                for addr_str in listen_addrs {
-                    if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                        // 缓存到 DHT 缓存，供后续 Dial 命令使用
-                        if let Err(e) = self.p2p_handle.tx.try_send(
-                            P2pCommand::AddKademliaAddress { peer_id: peer, addr: addr.clone() },
-                        ) {
-                            tracing::warn!("Failed to send AddKademliaAddress for FriendOnline: {e:?}");
-                        }
-                        // 使用 try_send 避免阻塞
-                        if let Err(e) = self.p2p_handle.tx.try_send(
-                            P2pCommand::DialAddr { addr },
-                        ) {
-                            tracing::warn!("Failed to send DialAddr: {e:?}");
-                        }
-                    }
-                }
-
-// 发送响应确认（通过 P2pActor 发送 NetEvent 响应）
-                if let Err(e) = self.p2p_handle.tx.try_send(
-                    P2pCommand::SendNetEventResponse {
+                    self.handle_friend_online_request(
+                        mldsa_pubkey_hex.clone(),
+                        claimed_peer_id.clone(),
+                        listen_addrs.clone(),
+                        mlkem_pubkey_hex.clone(),
+                        *version,
+                        signature.clone(),
+                        peer,
                         channel,
-                        response: crate::p2p::netevent::NetEventResponse::Ack,
-                    },
-                ) {
-                    tracing::warn!("Failed to send NetEventResponse: {e:?}");
+                    ).await;
+                    return;
                 }
-            }
-
             }
 
             P2pEvent::ConnectionEstablished { peer_id, listen_addrs } => {
@@ -265,15 +174,21 @@ impl ChatCore {
                 // 不支持 NetEvent 协议，发送会报 UnsupportedProtocols 错误，在 P2pActor
                 // 中静默处理，不影响其他流程。
                 if let Some(mldsa_pubkey_hex) = self.mldsa_pubkey_hex.clone()
-                    && let Some(current_peer_id) = self.current_peer_id {
+                    && let Some(current_peer_id) = self.current_peer_id
+                    && let Some(mldsa_private_key) = self.mldsa_private_key.as_ref() {
                         let mlkem = self.mlkem_pubkey_hex.clone().unwrap_or_default();
-                        let friend_online =
+                        let Some(friend_online) =
                             crate::actor::p2p::netevent::build_friend_online_request(
                                 &mldsa_pubkey_hex,
                                 &current_peer_id,
                                 &listen_addrs,
                                 &mlkem,
-                            );
+                                mldsa_private_key,
+                            )
+                        else {
+                            tracing::warn!("FriendOnline 签名失败，跳过发送");
+                            return;
+                        };
                         if let Err(e) = self.p2p_handle.tx.try_send(
                             P2pCommand::SendNetEvent {
                                 peer_id,
@@ -342,36 +257,8 @@ impl ChatCore {
                     return;
                 }
 
-                // 反向查找：从 DHT 查询键（SHA256）还原 ML-DSA 公钥
+                // 仅用于拨号标签，不写入身份映射（身份映射仅由 FriendOnline 签名验证后建立）
                 let actual_pubkey = self.dht_query_key_to_pubkey.get(&key).cloned();
-
-                // 先更新 DHT 缓存（不涉及 self 的可变借用）
-                {
-                    let store = self.get_dht_store();
-                    for provider in &providers {
-                        if let Some(ref pubkey) = actual_pubkey {
-                            let _ = store.set_pubkey_peerid(pubkey, provider);
-                            tracing::debug!(
-                                "GetProvidersResult: 成功映射 {}.. → {}",
-                                &pubkey[..16],
-                                provider
-                            );
-                        } else {
-                            let _ = store.set_pubkey_peerid(&key, provider);
-                            tracing::debug!(
-                                "GetProvidersResult: 临时存储 key={}.. → {} (无实际公钥)",
-                                &key[..16.min(key.len())],
-                                provider
-                            );
-                        }
-                    }
-                }
-                // 再更新内存缓存（需要 self 的可变借用，与 store 作用域不重叠）
-                if let Some(ref pubkey) = actual_pubkey {
-                    for provider in &providers {
-                        self.peerid_to_pubkey.insert(*provider, pubkey.clone());
-                    }
-                }
 
                 // === 拨号每个发现的 provider，建立 P2P 连接 ===
                 for provider in &providers {
@@ -402,7 +289,7 @@ impl ChatCore {
                 }
 
                 // 触发所有待发送消息的重试
-                self.retry_pending_messages().await;
+                self.retry_pending_messages(None).await;
             }
             P2pEvent::PeerInfoReceived {
                 mldsa_pubkey_hex,
@@ -428,6 +315,36 @@ impl ChatCore {
                 // 对方尚未添加本节点为联系人，中继无此记录。
                 // 不执行任何操作，等待对方添加后通过 FriendOnline 通知本节点。
             }
+            P2pEvent::FriendOnlineNack { peer, reason } => {
+                match reason {
+                    crate::p2p::netevent::NackReason::SignatureVerificationFailed => {
+                        // 对方无法验证本节点身份签名，可能是本节点私钥损坏或对方实现问题。
+                        // 记录为错误，但不主动断开（可能是对方 bug，非本节点问题）。
+                        tracing::error!(
+                            "对方 {} 拒绝本节点 FriendOnline：签名验证失败",
+                            peer
+                        );
+                    }
+                    crate::p2p::netevent::NackReason::VersionMismatch { expected, got } => {
+                        tracing::warn!(
+                            "对方 {} 拒绝本节点 FriendOnline：协议版本不兼容（期望 {expected}，本节点 {got}）",
+                            peer
+                        );
+                    }
+                    crate::p2p::netevent::NackReason::PeerIdMismatch => {
+                        tracing::warn!(
+                            "对方 {} 拒绝本节点 FriendOnline：PeerID 不匹配",
+                            peer
+                        );
+                    }
+                    crate::p2p::netevent::NackReason::Other { description } => {
+                        tracing::warn!(
+                            "对方 {} 拒绝本节点 FriendOnline：{description}",
+                            peer
+                        );
+                    }
+                }
+            }
             P2pEvent::GetRecordResult { .. } => {
                 // GetRecordResult 由 events.rs 中的 DHT 查询回调处理，
                 // 此处无需额外逻辑
@@ -440,10 +357,23 @@ impl ChatCore {
                     tracing::info!("P2pActor: {}", msg);
                 }
             }
+            P2pEvent::DhtPublishFailed { error } => {
+                tracing::warn!("DHT 发布失败: {}", error);
+                self.send_warning_mpsc(format!("DHT 发布失败: {}", error)).await;
+            }
+            P2pEvent::MessageSent { peer, message_hash } => {
+                // P2P 层确认消息已发送，标记为已发送
+                if let Some(pool) = storage::pool() {
+                    let _ = storage::mark_sent_by_hash(pool, &message_hash).await;
+                    tracing::debug!("P2P 确认消息 {}.. 发送成功", &message_hash[..16]);
+                }
+            }
+            P2pEvent::MessageSendFailed { peer, message_hash } => {
+                tracing::warn!("P2P 发送消息 {}.. 失败（消息已保持待发送状态，等待重试）", &message_hash[..16]);
+            }
             P2pEvent::BootstrapReady => {
                 tracing::info!("DHT bootstrap ready, discovering contacts");
-                // ⚠️ 启动发现弱点：discover_all_contacts 依赖 DHT GetProviders 查询，
-                // 而此查询需要路由表中有足够节点。BootstrapOk 不代表查询一定能成功：
+                // 启动发现弱点：discover_all_contacts 依赖 DHT GetProviders 查询，
                 //
                 // 1. 路由表节点数不足 → GetProviders 进入空网络，超时无结果
                 // 2. 中继节点在路由表中但中继不参与 DHT → GetProviders 发往中继，无响应
@@ -549,5 +479,96 @@ impl ChatCore {
             stale_keys.len(),
             stale_query_keys.len()
         );
+    }
+
+    /// 发送 NetEvent 响应（支持 Ack / Nack，用于错误路径快速返回）
+    fn send_netevent_response(
+        &self,
+        channel: libp2p::request_response::ResponseChannel<crate::p2p::netevent::NetEventResponse>,
+        response: crate::p2p::netevent::NetEventResponse,
+    ) {
+        if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::SendNetEventResponse {
+            channel,
+            response,
+        }) {
+            tracing::warn!("Failed to send NetEventResponse: {e:?}");
+        }
+    }
+
+    async fn handle_friend_online_request(
+        &mut self,
+        mldsa_pubkey_hex: String,
+        claimed_peer_id: String,
+        listen_addrs: Vec<String>,
+        mlkem_pubkey_hex: String,
+        version: Option<u8>,
+        signature: Option<Vec<u8>>,
+        peer: libp2p::PeerId,
+        channel: libp2p::request_response::ResponseChannel<crate::p2p::netevent::NetEventResponse>,
+    ) {
+        if claimed_peer_id != peer.to_string() {
+            tracing::warn!("FriendOnline PeerID 不匹配: 声称={}, 实际={}", claimed_peer_id, peer);
+            self.send_netevent_response(
+                channel,
+                crate::p2p::netevent::NetEventResponse::Nack {
+                    reason: crate::p2p::netevent::NackReason::PeerIdMismatch,
+                },
+            );
+            return;
+        }
+        if let Some(v) = version {
+            if v != crate::p2p::netevent::NETEVENT_VERSION {
+                tracing::warn!("FriendOnline 协议版本不兼容: 期望=1, 实际={} (PeerID={})", v, peer);
+                self.send_netevent_response(
+                    channel,
+                    crate::p2p::netevent::NetEventResponse::Nack {
+                        reason: crate::p2p::netevent::NackReason::VersionMismatch {
+                            expected: crate::p2p::netevent::NETEVENT_VERSION, got: v,
+                        },
+                    },
+                );
+                return;
+            }
+        }
+        if let Some(sig) = &signature {
+            if !crate::p2p::netevent::verify_friend_online_signature(
+                &mldsa_pubkey_hex, &claimed_peer_id, &listen_addrs, &mlkem_pubkey_hex, sig,
+            ) {
+                let short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
+                tracing::warn!("FriendOnline 签名验证失败: 声称公钥 {}.. (PeerID={})", short, peer);
+                self.send_netevent_response(
+                    channel,
+                    crate::p2p::netevent::NetEventResponse::Nack {
+                        reason: crate::p2p::netevent::NackReason::SignatureVerificationFailed,
+                    },
+                );
+                return;
+            }
+        }
+        tracing::debug!("收到有效的 FriendOnline: {}.. (PeerID={})", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())], peer);
+        let store = self.get_dht_store();
+        let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer);
+        self.update_peerid_pubkey_mapping(peer, mldsa_pubkey_hex.clone()).await;
+        if !mlkem_pubkey_hex.is_empty() {
+            self.peerid_to_mlkem.insert(peer, mlkem_pubkey_hex.clone());
+        }
+        let owner_id = self.mldsa_identity_id.as_deref().unwrap_or("");
+        if !owner_id.is_empty()
+            && let Some(pool) = storage::pool() {
+                if storage::is_contact_exists(pool, owner_id, &mldsa_pubkey_hex).await.unwrap_or(false) {
+                    if let Ok(msgs) = storage::list_pending_by_peer(pool, &mldsa_pubkey_hex).await {
+                        if !msgs.is_empty() {
+                            self.retry_pending_messages(Some(&mldsa_pubkey_hex)).await;
+                        }
+                    }
+                }
+            }
+        for addr_str in &listen_addrs {
+            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                let _ = self.p2p_handle.tx.try_send(P2pCommand::AddKademliaAddress { peer_id: peer, addr: addr.clone() });
+                let _ = self.p2p_handle.tx.try_send(P2pCommand::DialAddr { addr });
+            }
+        }
+        self.send_netevent_response(channel, crate::p2p::netevent::NetEventResponse::Ack);
     }
 }

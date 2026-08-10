@@ -3,6 +3,9 @@
     import { tick } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { save } from "@tauri-apps/plugin-dialog";
+    import { fontSizeScale } from "../lib/settings";
+
+    let fontSize = $derived($fontSizeScale * 13 + "px");
 
     interface Msg {
         id: string;
@@ -439,7 +442,7 @@
 >
     {#snippet children(m: Msg)}
         <div class="msg" class:me={m.me}>
-            <div class="bubble" class:file-hash={m.type === "file_hash"}>
+            <div class="bubble" class:file-hash={m.type === "file_hash"} style="font-size: {fontSize}">
                 {#if m.type === "file_hash" && m.file_hash_info}
                     <!-- FileHash 消息：可点击下载 -->
                     <div
@@ -606,7 +609,6 @@
     @container (max-width: 400px) {
         .bubble {
             max-width: 85%;
-            font-size: var(--font-size-sm, 13px);
         }
         .msg {
             margin-bottom: 4px;
@@ -709,7 +711,6 @@
 
     .bubble p {
         margin: 0;
-        font-size: 14px;
         line-height: 1.5;
         word-break: break-word;
     }

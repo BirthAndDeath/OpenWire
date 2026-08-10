@@ -552,13 +552,16 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
 
 /// 使用 App 中复用的剪贴板实例复制文本
 fn copy_to_clipboard(app: &mut App, text: &str) -> bool {
-    let clipboard = app.clipboard.get_or_insert_with(|| {
-        arboard::Clipboard::new().unwrap_or_else(|_| {
-            // 如果创建失败，使用占位值，后续操作会失败
-            panic!("Failed to create clipboard");
-        })
-    });
-    clipboard.set_text(text.to_string()).is_ok()
+    if app.clipboard.is_none() {
+        match arboard::Clipboard::new() {
+            Ok(c) => app.clipboard = Some(c),
+            Err(e) => {
+                eprintln!("Warning: Failed to create clipboard: {e}");
+                return false;
+            }
+        }
+    }
+    app.clipboard.as_mut().unwrap().set_text(text.to_string()).is_ok()
 }
 
 impl Focus {

@@ -37,7 +37,7 @@
         "default-src": "'self'",
         "script-src": "'self'",
         "style-src": "'self'",
-        "img-src": "'self'",
+        "img-src": "'self' asset: data:",
         "font-src": "'self'",
         "connect-src": "'self'",
         "media-src": "'self'",
@@ -46,6 +46,10 @@
         "base-uri": "'self'",
         "form-action": "'self'",
         "upgrade-insecure-requests": "true"
+      },
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**", "$RESOURCE/**"]
       }
     }
   },

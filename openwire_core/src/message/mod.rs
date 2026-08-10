@@ -63,10 +63,14 @@ pub struct ChatResponse {
     pub timestamp: u64,
     /// 随机 nonce，用于防止重放攻击
     pub nonce: [u8; 16],
-    /// 响应方的 ML-DSA 签名，签名内容为 (timestamp, nonce)
+    /// 响应方的 ML-DSA 签名，签名内容为 (timestamp, nonce, request_hash)
     pub signature: Vec<u8>,
     /// 响应方的 ML-DSA 公钥（原始格式，1952 字节）
     pub sender_public_key: Vec<u8>,
+    /// 对应请求的消息哈希，绑定响应到请求以防止跨请求重放
+    /// `None` 表示来自旧版客户端，跳过请求绑定检查
+    #[serde(default)]
+    pub request_hash: Option<Vec<u8>>,
 }
 
 impl ChatResponse {
@@ -74,6 +78,7 @@ impl ChatResponse {
     pub fn new_signed(
         mldsa_private_key: &[u8],
         mldsa_public_key: &[u8],
+        request_hash: Option<&[u8]>,
     ) -> crate::error::MessageResult<Self> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -81,7 +86,7 @@ impl ChatResponse {
         let mut nonce = [0u8; 16];
         rand::rng().fill(&mut nonce);
 
-        let hash = Self::compute_hash(timestamp, &nonce);
+        let hash = Self::compute_hash(timestamp, &nonce, request_hash);
         let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
             crate::error::MessageError::SignFailed(Box::new(std::io::Error::other(e.to_string())))
         })?;
@@ -91,12 +96,13 @@ impl ChatResponse {
             nonce,
             signature,
             sender_public_key: mldsa_public_key.to_vec(),
+            request_hash: request_hash.map(|h| h.to_vec()),
         })
     }
 
     /// 验证响应签名
     pub fn verify(&self) -> crate::error::MessageResult<bool> {
-        let hash = Self::compute_hash(self.timestamp, &self.nonce);
+        let hash = Self::compute_hash(self.timestamp, &self.nonce, self.request_hash.as_deref());
         crate::signature::verify_signature(&self.sender_public_key, &hash, &self.signature).map_err(
             |e| {
                 crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::other(
@@ -106,11 +112,14 @@ impl ChatResponse {
         )
     }
 
-    fn compute_hash(timestamp: u64, nonce: &[u8]) -> Vec<u8> {
+    fn compute_hash(timestamp: u64, nonce: &[u8], request_hash: Option<&[u8]>) -> Vec<u8> {
         let mut hasher = sha2::Sha256::new();
-        hasher.update(b"ChatResponse-v1");
+        hasher.update(b"ChatResponse-v2");
         hasher.update(timestamp.to_be_bytes());
         hasher.update(nonce);
+        if let Some(rh) = request_hash {
+            hasher.update(rh);
+        }
         hasher.finalize().to_vec()
     }
 }

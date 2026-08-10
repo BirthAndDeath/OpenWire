@@ -124,7 +124,7 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Min(5),    // 右上：消息列表
             Constraint::Length(3), // 中间：输入框
-            Constraint::Length(1), // 右下：状态栏
+            Constraint::Length(2), // 右下：状态栏（含上边框）
         ])
         .split(horizontal_chunks[1]);
 
@@ -255,7 +255,7 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
 
     // 如果焦点在输入框，设置光标位置
     if let Focus::Input = app.current_focus {
-        frame.set_cursor_position((input_area.x + app.input.len() as u16 + 1, input_area.y + 1));
+        frame.set_cursor_position((input_area.x.saturating_add(app.input.chars().count() as u16).saturating_add(1), input_area.y.saturating_add(1)));
     }
 
     // 渲染状态栏

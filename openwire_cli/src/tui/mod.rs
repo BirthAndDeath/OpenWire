@@ -5,7 +5,7 @@ use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 use std::io::stdout;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::time::interval;
 
 use crate::{App, Focus};
@@ -26,10 +26,6 @@ pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
         .ok_or(CliError::ChannelNotInitialized)?;
     let mut tick = interval(Duration::from_millis(16));
     let core_joinhandle = core.run();
-
-    // 粘贴检测：记录上次字符输入时间，快速连续输入时跳过中间渲染
-    let mut last_char_time = Instant::now();
-    let paste_debounce = Duration::from_millis(50);
 
     loop {
         let should_render;
@@ -63,18 +59,14 @@ pub async fn tui_run(app: &mut App) -> Result<(), CliError> {
                         }
                     }
                 }
-                // 粘贴优化：如果连续字符输入间隔 < 50ms，跳过渲染，由 tick 定时器负责刷新
+                // 字符输入（打字/粘贴）不触发渲染，由 60 FPS tick 定时器负责刷新。
+                // 渲染上限锁定在 16ms 间隔，用户感知不到延迟（人眼阈值约 30ms），
+                // 但避免了 3904 字符 ML-DSA 公钥粘贴时逐字重绘的性能爆炸。
                 if let Event::Key(key) = &event
-                    && let KeyCode::Char(_) = key.code
                     && key.kind == KeyEventKind::Press
                 {
-                    let now = Instant::now();
-                    if now - last_char_time < paste_debounce {
-                        should_render = false;
-                    } else {
-                        should_render = true;
-                    }
-                    last_char_time = now;
+                    let is_char_input = matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace);
+                    should_render = !is_char_input;
                 } else {
                     should_render = true;
                 }

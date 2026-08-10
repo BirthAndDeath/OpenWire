@@ -8,6 +8,7 @@ const ALLOWED_COMMANDS = new Set([
     'is_keyring_available',
     'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'list_sent_files', 'delete_sent_file',
+    'copy_file',
     'plugin:window|set_content_protected'
 ]);
 
@@ -17,7 +18,8 @@ const SENSITIVE_COMMANDS = new Set([
     'send', 'send_file', 'delete_identity', 'select_identity',
     'generate_identity', 'add_contact', 'delete_contact',
     'request_file_download', 'delete_sent_file',
-    'set_download_dir'
+    'set_download_dir', 'copy_file',
+    'save_nodes_config', 'reset_nodes_config'
 ]);
 
 const RATE_LIMITS = {
@@ -38,6 +40,7 @@ const RATE_LIMITS = {
     check_core_ready: { maxCalls: 300, windowMs: 60000 },
     list_sent_files: { maxCalls: 60, windowMs: 60000 },
     delete_sent_file: { maxCalls: 10, windowMs: 60000 },
+    copy_file: { maxCalls: 10, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -161,7 +164,12 @@ const VALIDATORS = {
         if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
         return null;
     },
-    set_download_dir: (p) => requiredString(p.path, 'path', 4096),
+    set_download_dir: (p) => {
+        let err = requiredString(p.path, 'path', 4096);
+        if (err) return err;
+        if (/\.\./.test(p.path)) return 'path traversal not allowed';
+        return null;
+    },
     list_contacts: () => null,
     list_identities: () => null,
     generate_identity: () => null,
@@ -183,6 +191,14 @@ const VALIDATORS = {
         if (err) return err;
         if (!isHex(p.fileHashHex)) return 'fileHashHex must be hex';
         if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
+        return null;
+    },
+    copy_file: (p) => {
+        let err = requiredString(p.src, 'src', 4096);
+        if (err) return err;
+        err = requiredString(p.dst, 'dst', 4096);
+        if (err) return err;
+        if (/\.\./.test(p.src) || /\.\./.test(p.dst)) return 'path traversal not allowed';
         return null;
     },
     save_nodes_config: (p) => {

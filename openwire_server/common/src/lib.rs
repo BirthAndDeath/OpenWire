@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::Path;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use libp2p::futures::StreamExt;
 use libp2p::kad::{self, Config as KadConfig, store::MemoryStore};
@@ -39,7 +40,18 @@ fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
     }
     let kp = identity::Keypair::generate_ed25519();
     std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, kp.to_protobuf_encoding()?)?;
+    let encoded = kp.to_protobuf_encoding()?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).mode(0o600);
+        let mut f = opts.open(path)?;
+        f.write_all(&encoded)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, &encoded)?;
     Ok(kp)
 }
 
@@ -175,6 +187,9 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
     let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY.as_bytes().to_vec());
     swarm.behaviour_mut().kademlia.start_providing(relay_key)?;
 
+    let mut friend_online_rate: HashMap<PeerId, Instant> = HashMap::new();
+    const FRIEND_ONLINE_COOLDOWN: Duration = Duration::from_secs(5);
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -200,21 +215,56 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                     NetEventRequest::FriendOnline {
                         mldsa_pubkey_hex,
                         peer_id,
+                        listen_addrs,
+                        mlkem_pubkey_hex,
+                        signature,
                         ..
                     } => {
-                        if *peer_id == peer.to_string() {
-                            let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
-                            tracing::info!(
-                                "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
-                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
-                                peer
-                            );
-                        } else {
+                        if *peer_id != peer.to_string() {
                             tracing::warn!(
                                 "relay FriendOnline PeerID mismatch: claimed={}, actual={}",
                                 peer_id,
                                 peer
                             );
+                        } else if let Some(sig) = signature {
+                            if !openwire_core::p2p::netevent::verify_friend_online_signature(
+                                mldsa_pubkey_hex,
+                                peer_id,
+                                listen_addrs,
+                                mlkem_pubkey_hex,
+                                sig,
+                            ) {
+                                tracing::warn!(
+                                    "relay FriendOnline signature verification failed for {}..",
+                                    &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
+                                );
+                            } else if friend_online_rate
+                                .get(&peer)
+                                .map_or(true, |last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
+                            {
+                                let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                                friend_online_rate.insert(peer, Instant::now());
+                                tracing::info!(
+                                    "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
+                                    &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                                    peer
+                                );
+                            } else {
+                                tracing::debug!("FriendOnline rate limited for {}", peer);
+                            }
+                        } else if friend_online_rate
+                            .get(&peer)
+                            .map_or(true, |last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
+                        {
+                            let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                            friend_online_rate.insert(peer, Instant::now());
+                            tracing::info!(
+                                "=== RELAY CACHED FriendOnline (unsigned): {}.. -> {} ===",
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                                peer
+                            );
+                        } else {
+                            tracing::debug!("FriendOnline rate limited for {}", peer);
                         }
                         let _ = swarm
                             .behaviour_mut()

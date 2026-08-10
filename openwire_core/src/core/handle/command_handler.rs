@@ -45,7 +45,7 @@ impl ChatCore {
                 }
             },
             ChatCommand::RetryPendingMessages => {
-                self.retry_pending_messages().await;
+                self.retry_pending_messages(None).await;
             }
             ChatCommand::AddContact {
                 mldsa_pubkey_hex,
@@ -95,9 +95,6 @@ impl ChatCore {
                 }
             }
             // ===== 定时器事件处理 =====
-            ChatCommand::TimerRetryPendingOnline => {
-                self.retry_pending_for_online_peers().await;
-            }
             ChatCommand::TimerSaveRoutingTable => {
                 if let Err(e) = self
                     .p2p_handle
@@ -111,14 +108,23 @@ impl ChatCore {
             }
             ChatCommand::TimerDiscoverAllContacts => {
                 self.discover_all_contacts().await;
-                // 连接维护后触发离线消息重试
-                self.retry_pending_messages().await;
             }
             ChatCommand::TimerCleanupDht => {
                 self.cleanup_expired_dht_records();
             }
             ChatCommand::TimerPublishIdentity => {
                 self.publish_current_identity_to_dht();
+            }
+            ChatCommand::TimerRefreshRoutingTable => {
+                if let Err(e) = self
+                    .p2p_handle
+                    .tx
+                    .try_send(
+                        P2pCommand::RefreshRoutingTable,
+                    )
+                {
+                    tracing::warn!("Failed to send RefreshRoutingTable: {e:?}");
+                }
             }
         }
     }

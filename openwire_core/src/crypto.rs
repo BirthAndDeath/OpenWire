@@ -1,9 +1,10 @@
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
 use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey, ML_KEM_768};
-use blake3;
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 /// ML-KEM-768 公钥大小（字节）
 ///
@@ -24,13 +25,17 @@ pub const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 /// 当前加密协议版本
 ///
 /// 此版本号在 encrypt_message() 中写入加密载荷的第一个字节，
-/// 在 decrypt_message() 中检查并拒绝不匹配的版本。
+/// 在 decrypt_message() 中根据版本选择对应 KDF 派生密钥。
+///
+/// 版本历史：
+/// - v1 (0.1.x): BLAKE3 XOF 派生 AES-256 密钥（已移除，不再支持）
+/// - v2 (0.2.0+): HKDF-SHA256 派生 AES-256 密钥
 ///
 /// 注意：此版本号仅用于加密协议（ML-KEM + AES-GCM）的兼容性管理，
 /// 不用于 ChatMessage 结构体的序列化格式版本管理。
 /// 若需支持消息序列化格式的向前兼容，应在 ChatMessage 结构体中
 /// 添加独立的 version 字段。
-const CURRENT_ENCRYPTION_VERSION: u8 = 1;
+const CURRENT_ENCRYPTION_VERSION: u8 = 2;
 
 /// 使用 ML-KEM/Kyber + AES-GCM 进行混合加密
 ///
@@ -63,18 +68,20 @@ pub fn encrypt_message(
         .encapsulate()
         .map_err(crate::error::CryptoError::KemEncapsulationFailed)?;
 
-    // 2. 从共享密钥派生 AES-256 密钥
-    let aes_key = derive_aes_key_from_mlkem(shared_secret.as_ref());
+    // 2. 从共享密钥派生 AES-256 密钥（使用当前版本 KDF）
+    let aes_key = derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref());
 
     // 3. 生成随机 nonce
     let nonce_bytes: [u8; 12] = rand::random();
     #[allow(deprecated)]
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // 4. 使用 AES-GCM 加密数据
+    // 4. 使用 AES-GCM 加密数据（版本字节作为 AAD 防降级攻击）
     let cipher = Aes256Gcm::new(&aes_key.into());
+    let version_aad = [CURRENT_ENCRYPTION_VERSION];
+    let payload = Payload { msg: data, aad: &version_aad };
     let ciphertext = cipher
-        .encrypt(nonce, data)
+        .encrypt(nonce, payload)
         .map_err(|e| crate::error::CryptoError::AesGcmEncryptionFailed(e.to_string()))?;
 
     // 5. 组合: version + ciphertext_kem + nonce + ciphertext
@@ -123,12 +130,6 @@ pub fn decrypt_message(
     }
 
     let version = encrypted_data[0];
-    if version != CURRENT_ENCRYPTION_VERSION {
-        return Err(crate::error::CryptoError::UnsupportedEncryptionVersion {
-            version,
-            current: CURRENT_ENCRYPTION_VERSION,
-        });
-    }
 
     let data_without_version = &encrypted_data[1..];
 
@@ -147,8 +148,17 @@ pub fn decrypt_message(
         .decapsulate(ciphertext)
         .map_err(crate::error::CryptoError::KemDecapsulationFailed)?;
 
-    // 4. 从共享密钥派生 AES-256 密钥
-    let aes_key = derive_aes_key_from_mlkem(shared_secret.as_ref());
+    // 4. 根据版本选择对应的 KDF 派生 AES-256 密钥
+    let aes_key = match version {
+        1 => derive_aes_key_from_mlkem_v1_blake3(shared_secret.as_ref()),
+        2 => derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref()),
+        _ => {
+            return Err(crate::error::CryptoError::UnsupportedEncryptionVersion {
+                version,
+                current: CURRENT_ENCRYPTION_VERSION,
+            });
+        }
+    };
 
     // 5. 分离 nonce 和 ciphertext
     if rest.len() < 12 {
@@ -158,10 +168,12 @@ pub fn decrypt_message(
     #[allow(deprecated)]
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    // 6. 使用 AES-GCM 解密
+    // 6. 使用 AES-GCM 解密（版本字节作为 AAD 防降级攻击）
     let cipher = Aes256Gcm::new(&aes_key.into());
+    let version_aad = [version];
+    let payload = Payload { msg: ciphertext, aad: &version_aad };
     let plaintext = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(nonce, payload)
         .map_err(|e| crate::error::CryptoError::AesGcmDecryptionFailed(e.to_string()))?;
 
     Ok(plaintext)
@@ -169,20 +181,30 @@ pub fn decrypt_message(
 
 // ========== 内部辅助函数 ==========
 
-/// 从 ML-KEM 共享密钥派生 AES-256 密钥
+/// 从 ML-KEM 共享密钥派生 AES-256 密钥（v1, BLAKE3 XOF）
 ///
-/// 使用 BLAKE3 的 KDF 模式，添加上下文信息以提高安全性
-fn derive_aes_key_from_mlkem(shared_secret: &[u8]) -> [u8; 32] {
+/// 仅用于解密旧版本消息（解密回退），新消息使用 v2 HKDF 派生。
+fn derive_aes_key_from_mlkem_v1_blake3(shared_secret: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
     let mut hasher = blake3::Hasher::new();
-
-    // 添加上下文信息以防止密钥误用
     hasher.update(b"ChatCore-AES-256-Key-Derivation-v1");
     hasher.update(shared_secret);
-
-    // 使用 XOF（可扩展输出函数）模式派生密钥
     hasher.finalize_xof().fill(&mut key);
+    key
+}
 
+/// 从 ML-KEM 共享密钥派生 AES-256 密钥（v2, HKDF-SHA256）
+///
+/// 使用 HKDF-SHA256 提取-扩展范式，添加上下文信息以防止密钥误用。
+/// 用于 CURRENT_ENCRYPTION_VERSION >= 2 的新加密消息。
+fn derive_aes_key_from_mlkem_v2_hkdf(shared_secret: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let hk = Hkdf::<Sha256>::new(
+        Some(b"ChatCore-AES-256-Key-Derivation-v2"),
+        shared_secret,
+    );
+    hk.expand(&[], &mut key)
+        .expect("HKDF expand should not fail for valid output length");
     key
 }
 
@@ -220,7 +242,7 @@ mod tests {
             encrypted.len() - 1 - MLKEM768_CIPHERTEXT_SIZE - 12
         );
 
-        assert_eq!(encrypted[0], CURRENT_ENCRYPTION_VERSION, "版本字节应为 1");
+        assert_eq!(encrypted[0], CURRENT_ENCRYPTION_VERSION, "版本字节应为 2");
 
         let decrypted = decrypt_message(&encrypted, &decap_key).unwrap();
         assert_eq!(decrypted, plaintext, "解密后的数据应与原始明文一致");

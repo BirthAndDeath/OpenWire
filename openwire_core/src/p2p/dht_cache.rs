@@ -230,7 +230,7 @@ impl DhtCache {
         }
         #[cfg(not(feature = "mem_dht"))]
         {
-            let map = self.multiaddrs.lock().unwrap();
+            let map = self.multiaddrs.lock().unwrap_or_else(|e| e.into_inner());
             Ok(map.get(&key).map_or(Vec::new(), |addrs| {
                 addrs.iter().filter_map(|s| s.parse().ok()).collect()
             }))

@@ -15,6 +15,7 @@
 ### 重启后网络拓扑变化
 
 ```
+
 启动 A:  PeerID=A1,  listen=/ip4/0.0.0.0/tcp/45001
 重新启动:  PeerID=A2,  listen=/ip4/0.0.0.0/tcp/45002
 ```

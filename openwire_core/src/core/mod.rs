@@ -146,25 +146,12 @@ impl ChatCore {
         let mldsa_identity_id = hex::encode(&mldsa_public_key);
         let mlkem_pubkey_hex = hex::encode(&identity.mlkem_public_key);
         let mlkem_decap_key = identity.mlkem_decap_key;
+        let mldsa_private_key = identity.mldsa_private_key;
         tracing::info!(
             "Loaded identity: ML-DSA={}, ML-KEM={} (ephemeral)",
             &mldsa_identity_id[..16],
             &mlkem_pubkey_hex[..16]
         );
-
-        // 加载 ML-DSA 私钥并缓存到内存（避免每次发送消息都访问 Keyring）
-        // 使用 Zeroizing 包装，确保私钥在内存中可被自动清零
-        let mldsa_private_key = {
-            let handle = rootcell::identity::PrivateKeyHandle::load(
-                &cfg.data_dir.to_string_lossy(),
-                &format!("{}_mldsa", mldsa_identity_id),
-            )
-            .map_err(|e| {
-                CoreError::InitFailed(format!("Failed to load ML-DSA private key: {}", e))
-            })?;
-
-            Zeroizing::new(handle.get_private_key().to_vec())
-        };
 
         // 加载或创建持久化的 PeerID（8h~24h 随机 TTL，仅启动时检查）
         let (keypair, peerid_config) = identity::load_or_create_peerid(&cfg.data_dir);
@@ -264,13 +251,19 @@ impl ChatCore {
     }
 
     /// 通过 P2pActor 发送消息到网络
-    pub(crate) async fn send_message(&mut self, peerid: PeerId, message: ChatMessage) {
+    pub(crate) async fn send_message(
+        &mut self,
+        peerid: PeerId,
+        message: ChatMessage,
+        message_hash: Option<&str>,
+    ) {
         let _ = self
             .p2p_handle
             .send(
                 P2pCommand::SendMessage {
                     peer_id: peerid,
                     message,
+                    message_hash: message_hash.unwrap_or("").to_string(),
                 },
             )
             .await;

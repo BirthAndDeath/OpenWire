@@ -77,10 +77,6 @@ pub async fn delete_identity(
         &data_dir_str,
         &format!("{}_mldsa", identity_id),
     );
-    rootcell::identity::PrivateKeyHandle::delete_encrypted_private_key(
-        &data_dir_str,
-        &format!("{}_mlkem", identity_id),
-    );
 
     // 2. 删除数据库记录
     let rows = sqlx::query("DELETE FROM identities WHERE identity_id = ?")

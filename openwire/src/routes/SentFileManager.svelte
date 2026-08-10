@@ -53,7 +53,7 @@
 </script>
 
 {#if show}
-  <div class="overlay" onclick={() => (show = false)} onkeydown={(e) => e.key === "Escape" && (show = false)}>
+  <div class="overlay" role="button" tabindex="-1" onclick={() => (show = false)} onkeydown={(e) => e.key === "Escape" && (show = false)}>
     <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}} role="dialog" aria-label="已发送文件管理" tabindex="-1">
       <div class="header">
         <h2>{$_("sent_files")}</h2>

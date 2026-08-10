@@ -150,35 +150,18 @@ impl ChatCore {
         self.peerid_config = Some(peerid_config);
         let peer_id = keypair.public().to_peer_id();
 
-        let swarm = match p2p::swarm_init(&self.data_dir, keypair.clone(), &self.bootstrap_nodes, self.peerid_config.as_ref()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to reinitialize swarm: {e}");
-                self.send_warning_mpsc(format!("切换身份失败：无法重建网络连接: {}", e))
-                    .await;
-                return;
-            }
-        };
+        if let Err(e) = self.rebuild_p2p_stack(keypair).await {
+            self.send_warning_mpsc(format!("切换身份失败：{}", e)).await;
+            return;
+        }
 
         self.peerid_to_mlkem.clear();
-        self.identity_keypair = keypair;
         self.mldsa_pubkey_hex = Some(mldsa_pubkey_hex.clone());
         self.current_peer_id = Some(peer_id);
         self.mldsa_identity_id = Some(identity_id.clone());
         self.mlkem_pubkey_hex = Some(mlkem_pubkey_hex.clone());
         self.mlkem_decap_key = Some(mlkem_decap_key);
         self.mldsa_private_key = Some(Zeroizing::new(mldsa_handle.get_private_key().to_vec()));
-
-        let (p2p_handle, rx_p2p_event) = P2pActorBuilder::new()
-            .swarm(swarm)
-            .dht_cache(self.dht_cache.clone())
-            .data_dir(self.data_dir.clone())
-            .relay_nodes(self.relay_nodes.clone())
-            .channel_size(crate::core::CHANNEL_CAPACITY)
-            .cancellation_token(self.core_handle.shutdown_token.clone())
-            .start();
-        self.p2p_handle = p2p_handle;
-        self.rx_p2p_event = rx_p2p_event;
 
         let store = self.get_dht_store();
         let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
@@ -203,7 +186,7 @@ impl ChatCore {
                     let store = self.get_dht_store();
                     let _ = store.remove_pubkey_peerid(&identity_id);
 
-                    self.publish_tombstone_records(&identity_id).await;
+                    self.stop_dht_providing(&identity_id).await;
 
                     if self.mldsa_identity_id.as_deref() == Some(&identity_id) {
                         self.mldsa_pubkey_hex = None;
@@ -235,6 +218,24 @@ impl ChatCore {
         }
     }
 
+    async fn rebuild_p2p_stack(&mut self, keypair: libp2p::identity::Keypair) -> Result<(), String> {
+        let swarm = p2p::swarm_init(&self.data_dir, keypair.clone(), &self.bootstrap_nodes, self.peerid_config.as_ref())
+            .map_err(|e| format!("Failed to reinitialize swarm: {}", e))?;
+        self.identity_keypair = keypair;
+        self.current_peer_id = Some(*swarm.local_peer_id());
+        let (p2p_handle, rx_p2p_event) = P2pActorBuilder::new()
+            .swarm(swarm)
+            .dht_cache(self.dht_cache.clone())
+            .data_dir(self.data_dir.clone())
+            .relay_nodes(self.relay_nodes.clone())
+            .channel_size(crate::core::CHANNEL_CAPACITY)
+            .cancellation_token(self.core_handle.shutdown_token.clone())
+            .start();
+        self.p2p_handle = p2p_handle;
+        self.rx_p2p_event = rx_p2p_event;
+        Ok(())
+    }
+
     async fn reinitialize_swarm(&mut self) {
         shutdown_old_actor(&self.p2p_handle).await;
         let (keypair, peerid_config) = match self.peerid_config.take() {
@@ -248,39 +249,19 @@ impl ChatCore {
             None => crate::identity::load_or_create_peerid(&self.data_dir),
         };
         self.peerid_config = Some(peerid_config);
-        let peer_id = keypair.public().to_peer_id();
-        match p2p::swarm_init(&self.data_dir, keypair.clone(), &self.bootstrap_nodes, self.peerid_config.as_ref()) {
-                    Ok(swarm) => {
-                        self.identity_keypair = keypair;
-                        self.current_peer_id = Some(peer_id);
+        if let Err(e) = self.rebuild_p2p_stack(keypair).await {
+            tracing::error!("{e}");
+        }
+    }
 
-                        let (p2p_handle, rx_p2p_event) = P2pActorBuilder::new()
-                            .swarm(swarm)
-                            .dht_cache(self.dht_cache.clone())
-                            .data_dir(self.data_dir.clone())
-                            .relay_nodes(self.relay_nodes.clone())
-                            .channel_size(crate::core::CHANNEL_CAPACITY)
-                            .cancellation_token(self.core_handle.shutdown_token.clone())
-                            .start();
-                        self.p2p_handle = p2p_handle;
-                        self.rx_p2p_event = rx_p2p_event;
-
-                        tracing::info!("Swarm reinitialized, PeerID={}", peer_id);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to reinitialize swarm: {e}");
-                    }
-                }
-            }
-
-    async fn publish_tombstone_records(&mut self, identity_id: &str) {
+    async fn stop_dht_providing(&mut self, identity_id: &str) {
         let _ = self.p2p_handle.tx.try_send(
-            crate::actor::p2p::P2pCommand::PublishIdentity {
+            crate::actor::p2p::P2pCommand::StopProviding {
                 mldsa_pubkey_hex: identity_id.to_string(),
             },
         );
         tracing::info!(
-            "Published tombstone records to DHT network for deleted identity: {}",
+            "Stopped DHT providing for deleted identity: {}",
             &identity_id[..16]
         );
     }

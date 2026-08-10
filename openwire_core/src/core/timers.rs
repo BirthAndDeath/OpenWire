@@ -28,18 +28,6 @@ pub fn spawn_all(
         shutdown_token.clone(),
     );
 
-    // 在线消息重试（10秒间隔，降低 CPU 开销和日志噪声；
-    // 对于大多数场景，10s 延迟对用户体验影响可忽略，
-    // 且减少重试频率有助于降低 P2pActor 的通道压力）
-    spawn_interval_task(
-        &rt_handle,
-        "online_retry",
-        Duration::from_secs(10),
-        || ChatCommand::TimerRetryPendingOnline,
-        cmd_tx.clone(),
-        shutdown_token.clone(),
-    );
-
     // 路由表保存（5分钟）
     spawn_interval_task(
         &rt_handle,
@@ -56,6 +44,16 @@ pub fn spawn_all(
         "dht_cleanup",
         Duration::from_secs(3600),
         || ChatCommand::TimerCleanupDht,
+        cmd_tx.clone(),
+        shutdown_token.clone(),
+    );
+
+    // 路由表随机刷新（30分钟）：随机桶查询，扩展路由表覆盖范围
+    spawn_interval_task(
+        &rt_handle,
+        "routing_table_refresh",
+        Duration::from_secs(1800),
+        || ChatCommand::TimerRefreshRoutingTable,
         cmd_tx.clone(),
         shutdown_token.clone(),
     );

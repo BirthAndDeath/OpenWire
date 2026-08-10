@@ -1,6 +1,7 @@
 use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use aws_lc_rs::signature::KeyPair;
 use libp2p::identity;
+use rootcell::store::EncryptedStore;
 use zeroize::Zeroizing;
 
 use crate::{coreconfig::CoreConfig, peerid_store::PeerIdConfig, storage};
@@ -26,10 +27,17 @@ pub fn load_or_create_peerid(
         }
         Err(e) => {
             tracing::warn!("Failed to restore PeerID from config, generating new: {e}");
-            // 删除损坏的文件，避免 load_or_create 再次读取相同损坏数据
+            // 删除加密存储中的损坏条目，避免 load_or_create 再次读取相同损坏数据
+            let data_dir_str = data_dir.to_string_lossy();
+            if let Ok(store) = EncryptedStore::open() {
+                store.delete(&data_dir_str, crate::peerid_store::STORE_IDENTIFIER);
+            }
+            // 同时清理旧的明文文件（若存在）
             let config_path = PeerIdConfig::path(data_dir);
-            if let Err(e) = std::fs::remove_file(&config_path) {
-                tracing::warn!("Failed to remove corrupt PeerIdConfig file: {e}");
+            if config_path.exists() {
+                if let Err(e) = std::fs::remove_file(&config_path) {
+                    tracing::warn!("Failed to remove corrupt PeerIdConfig file: {e}");
+                }
             }
             let config = PeerIdConfig::load_or_create(data_dir);
             let kp = config
@@ -40,10 +48,12 @@ pub fn load_or_create_peerid(
     }
 }
 
-/// 完整身份信息（ML-DSA 签名 + ML-KEM 封装密钥）
+/// 完整身份信息（ML-DSA 签名 + ML-KEM 封装密钥 + ML-DSA 私钥）
 pub struct CompleteIdentity {
     /// ML-DSA 公钥（用于身份标识与消息验签）
     pub mldsa_public_key: Zeroizing<Vec<u8>>,
+    /// ML-DSA 私钥（用于消息签名，已从 Keyring 加载）
+    pub mldsa_private_key: Zeroizing<Vec<u8>>,
     /// ML-KEM 公钥（用于临时密钥交换）
     pub mlkem_public_key: Vec<u8>,
     /// ML-KEM 解封装密钥（会话级，缓存在内存中）
@@ -68,14 +78,12 @@ pub async fn generate_complete_identity(
     let data_dir = cfg.data_dir.to_string_lossy().to_string();
     let identifier = format!("{}_mldsa", identity_id);
 
-    let _handle =
-        rootcell::identity::PrivateKeyHandle::save(&data_dir, &identifier, &mldsa_secret_key)
-            .map_err(|e| {
-                crate::error::IdentityError::RootCellIdentityLoadFailed(Box::new(
-                    std::io::Error::other(e.to_string()),
-                ))
-            })?;
-    drop(_handle);
+    rootcell::identity::PrivateKeyHandle::save(&data_dir, &identifier, &mldsa_secret_key)
+        .map_err(|e| {
+            crate::error::IdentityError::RootCellIdentityLoadFailed(Box::new(
+                std::io::Error::other(e.to_string()),
+            ))
+        })?;
 
     tracing::info!("ML-DSA identity saved: {}", &identity_id[..16]);
 
@@ -98,6 +106,7 @@ pub async fn generate_complete_identity(
 
     Ok(CompleteIdentity {
         mldsa_public_key: Zeroizing::new(mldsa_public_key),
+        mldsa_private_key: mldsa_secret_key,
         mlkem_public_key: mlkem_public_key.as_ref().to_vec(),
         mlkem_decap_key: decap_key,
     })
@@ -124,6 +133,7 @@ pub async fn load_or_generate_complete_identity(
             Ok(mldsa_handle) => {
                 tracing::info!("Loaded ML-DSA identity: {}..", &identity_id[..16]);
 
+                let mldsa_private_key = Zeroizing::new(mldsa_handle.get_private_key().to_vec());
                 let mldsa_public_key =
                     extract_public_key_from_private(mldsa_handle.get_private_key(), true)?;
 
@@ -140,6 +150,7 @@ pub async fn load_or_generate_complete_identity(
 
                 Ok(CompleteIdentity {
                     mldsa_public_key: Zeroizing::new(mldsa_public_key),
+                    mldsa_private_key,
                     mlkem_public_key: mlkem_public_key.as_ref().to_vec(),
                     mlkem_decap_key: decap_key,
                 })

@@ -42,12 +42,17 @@ pub async fn handle_incoming_request(
         Some(id) => id,
         None => {
             tracing::warn!("未找到当前身份，无法处理入站消息");
-            send_response(core, channel).await;
+            send_response(core, channel, None).await;
             return;
         }
     };
 
-    // 检查是否是已添加的联系人
+    // 先验证消息签名（轻量操作，无需数据库），防止非联系人消耗数据库资源
+    if !handle_message_verification(core, &request, &peer).await {
+        return;
+    }
+
+    // 签名验证通过后再检查联系人（需要数据库查询）
     let is_known_contact =
         storage::is_contact_exists(pool, &owner_identity_id, &sender_mldsa_pubkey_hex)
             .await
@@ -55,14 +60,26 @@ pub async fn handle_incoming_request(
 
     if !is_known_contact {
         tracing::warn!("收到来自未知用户 {} 的消息，已拒绝", peer);
-        send_response(core, channel).await;
+        send_response(core, channel, None).await;
         return;
     }
 
-    // === 收到消息后，将发送方的 (ML-DSA 公钥 → PeerID) 映射缓存到本地 DHT 数据库 ===
-    // 这样当回复消息时，dht_lookup_peerid 的步骤 1（connected_peers 反向查找）能直接命中，
-    // 无需等待 DHT 网络查询完成，解决两个在线节点之间 DHT 记录尚未传播时的通信问题。
+    // === 签名验证通过后，记录身份绑定漂移（不阻断） ===
+    // 签名验证已确认发送者持有该公钥对应私钥，因此绑定漂移只可能是同一身份
+    // 经多个 PeerID 使用（多设备 / 轮换重叠），故仅告警，不阻断消息处理。
     let store = core.get_dht_store();
+    if let Ok(Some(existing_peer)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
+        if existing_peer != peer && core.connected_peers.contains_key(&existing_peer) {
+            tracing::warn!(
+                "身份绑定漂移: sender={}.. 声称 peer={}, 但缓存中为 {}（仍在线），更新绑定",
+                &sender_mldsa_pubkey_hex[..16],
+                peer,
+                existing_peer
+            );
+        }
+    }
+
+    // 缓存发送方 (ML-DSA 公钥 → PeerID) 映射，用于后续回复消息时直接查找
     let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
     // 同步更新内存缓存，如果该 PeerID 已连接则触发在线状态刷新
     core.update_peerid_pubkey_mapping(peer, sender_mldsa_pubkey_hex.clone())
@@ -73,14 +90,8 @@ pub async fn handle_incoming_request(
         peer
     );
 
-    // 验证消息签名
-    if !handle_message_verification(core, &request, &peer).await {
-        return;
-    }
-
-    // 先发送响应确认，避免 request-response 协议超时重试
-    // 注意：即使后续解密失败，也发送响应确认，因为协议层需要响应
-    send_response(core, channel).await;
+    // 先发送响应确认（绑定到请求哈希防止跨请求重放）
+    send_response(core, channel, Some(&request.hash)).await;
 
     // 解密并处理消息
     // handle_decrypted_message 返回 true 表示解密成功，false 表示失败
@@ -134,7 +145,7 @@ pub async fn handle_incoming_request(
                     return;
                 }
             };
-            core.send_message(sender_peer_id, receipt_msg).await;
+            core.send_message(sender_peer_id, receipt_msg, None).await;
             tracing::info!("已向 {} 发送加密的送达回执", &sender_mldsa_pubkey_hex[..16]);
         } else {
             tracing::debug!(
@@ -494,6 +505,15 @@ async fn handle_file_download_request(
         }
     };
     let file_size = metadata.len();
+    if file_size > crate::transfer::MAX_FILE_SIZE {
+        tracing::warn!(
+            "拒绝发送过大文件: {} (size={} > MAX={})",
+            filename,
+            file_size,
+            crate::transfer::MAX_FILE_SIZE
+        );
+        return;
+    }
     let chunk_size: u32 = 256 * 1024;
     let total_chunks = file_size.div_ceil(chunk_size as u64) as u32;
 
@@ -639,6 +659,10 @@ async fn handle_file_download_request(
         if chunk.is_last {
             break;
         }
+        // 每发送 10 个分片主动让出控制权，让事件循环处理其他消息
+        if sent_count % 10 == 0 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
@@ -718,8 +742,9 @@ async fn fallback_handle_download_response(core: &mut ChatCore, response: crate:
 async fn send_response(
     core: &mut ChatCore,
     channel: libp2p::request_response::ResponseChannel<ChatResponse>,
+    request_hash: Option<&[u8]>,
 ) {
-    let response = match build_signed_response(core) {
+    let response = match build_signed_response(core, request_hash) {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("构建签名响应失败: {}，无法发送响应", e);
@@ -739,7 +764,7 @@ async fn send_response(
 }
 
 /// 构建带 ML-DSA 签名的 ChatResponse
-fn build_signed_response(core: &ChatCore) -> P2pResult<ChatResponse> {
+fn build_signed_response(core: &ChatCore, request_hash: Option<&[u8]>) -> P2pResult<ChatResponse> {
     let mldsa_private_key = core
         .mldsa_private_key
         .as_ref()
@@ -747,7 +772,7 @@ fn build_signed_response(core: &ChatCore) -> P2pResult<ChatResponse> {
     let mldsa_public_key =
         crate::identity::extract_public_key_from_private(mldsa_private_key, true)
             .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
-    ChatResponse::new_signed(mldsa_private_key, &mldsa_public_key)
+    ChatResponse::new_signed(mldsa_private_key, &mldsa_public_key, request_hash)
         .map_err(|e| P2pError::SwarmInitFailed(e.into()))
 }
 

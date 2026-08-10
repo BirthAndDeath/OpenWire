@@ -6,7 +6,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
     memory_connection_limits, noise, ping, tcp, yamux,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use std::num::NonZero;
 use std::ops::Deref;
@@ -83,8 +83,9 @@ pub fn swarm_init(
     data_dir: &Path,
     keypair: libp2p::identity::Keypair,
     bootstrap_nodes: &[(String, String)],
-    preferred_ports: Option<&crate::peerid_store::PeerIdConfig>,
+    peerid_config: Option<&crate::peerid_store::PeerIdConfig>,
 ) -> P2pResult<Swarm<MyBehaviour>> {
+    let peerid_was_rotated = peerid_config.map_or(true, |c| c.was_rotated());
     let mut swarm = {
         let builder = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -144,7 +145,7 @@ pub fn swarm_init(
                         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
                 // 创建 Kademlia 行为实例
-                let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes)?;
+                let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes, peerid_was_rotated)?;
                 let identify_config =
                     identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
                         .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
@@ -194,9 +195,9 @@ pub fn swarm_init(
     };
 
     // 端口偏好：优先使用 PeerIdConfig 中存储的端口，被占用则回退到 OS 分配
-    let quic_port = preferred_ports.map_or(0, |p| p.preferred_quic_port());
-    let tcp_port = preferred_ports.map_or(0, |p| p.preferred_tcp_port());
-    let ws_port = preferred_ports.map_or(0, |p| p.preferred_ws_port());
+    let quic_port = peerid_config.map_or(0, |p| p.preferred_quic_port());
+    let tcp_port = peerid_config.map_or(0, |p| p.preferred_tcp_port());
+    let ws_port = peerid_config.map_or(0, |p| p.preferred_ws_port());
 
     use std::net::{Ipv4Addr, Ipv6Addr};
     try_listen_or_fallback(
@@ -271,10 +272,10 @@ pub fn swarm_init(
 /// 创建 Kademlia 行为
 fn create_kademlia(
     peer_id: PeerId,
-    _data_dir: &Path,
+    data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
+    peerid_was_rotated: bool,
 ) -> P2pResult<kad::Behaviour<MemoryStore>> {
-    // let store = crate::server_redb_store::RedbRecordStore::new(db);
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
         P2pError::SwarmInitFailed("KAD_REPLICATION_FACTOR must be non-zero".into())
@@ -292,8 +293,16 @@ fn create_kademlia(
     let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
     kademlia.set_mode(Some(Mode::Client));
 
-    // 不加载路由表缓存——PeerID 临时，缓存不可跨 session 复用
-    // 直接使用 nodes.json bootstrap 节点（需 RSA 支持）
+    // PeerID 未轮换时加载路由表缓存，加速节点发现
+    if !peerid_was_rotated {
+        let cache_path = data_dir.join("routing_table.cache");
+        let loaded = load_routing_table(&mut kademlia, &cache_path);
+        if loaded > 0 {
+            tracing::info!("从路由表缓存加载了 {} 个节点", loaded);
+        }
+    }
+
+    // 始终使用 bootstrap 节点作为基础路由
     if !bootstrap_nodes.is_empty() {
         for (peerid, addr) in bootstrap_nodes {
             let peer_id = PeerId::from_str(peerid).map_err(|e| {
@@ -320,8 +329,20 @@ fn create_kademlia(
 // 路由表持久化（PEX）
 // ============================================================================
 
+const ROUTING_CACHE_MAX_AGE_SECS: u64 = 86400; // 24h
+const ROUTING_CACHE_MAX_LOAD: usize = 100;
+
 /// 将当前 Kademlia 路由表中的已知 peers 保存到缓存文件。
-pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
+///
+/// 仅保存 `connected_peers` 集合中的 peer（跳过已断开连接的陈旧条目），
+/// 避免持久化过期节点、防止缓存无限累积。
+///
+/// 文件格式:
+/// ```text
+/// #ts={unix_timestamp}
+/// {base58_peerid} {multiaddr1} {multiaddr2} ...
+/// ```
+pub async fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path, connected_peers: &std::collections::HashMap<PeerId, usize>) {
     let entries = {
         let kademlia = swarm.behaviour_mut();
         let mut peers: Vec<(PeerId, Vec<String>)> = Vec::new();
@@ -329,6 +350,9 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
         for bucket in kademlia.kademlia.kbuckets() {
             for entry in bucket.iter() {
                 let peer_id = entry.node.key.preimage();
+                if !connected_peers.contains_key(peer_id) {
+                    continue;
+                }
                 let addrs: Vec<String> = entry.node.value.iter().map(|a| a.to_string()).collect();
                 if !addrs.is_empty() {
                     peers.push((*peer_id, addrs));
@@ -343,19 +367,25 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
         return;
     }
 
-    match std::fs::File::create(cache_path) {
-        Ok(file) => {
-            use std::io::Write;
-            let mut writer = std::io::BufWriter::new(file);
-            for (peer_id, addrs) in &entries {
-                let line = format!("{} {}\n", peer_id.to_base58(), addrs.join(" "));
-                if let Err(e) = writer.write_all(line.as_bytes()) {
-                    tracing::warn!("Failed to write routing table cache entry: {}", e);
-                    return;
-                }
-            }
-            if let Err(e) = writer.flush() {
-                tracing::warn!("Failed to flush routing table cache: {}", e);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut content_lines = Vec::with_capacity(entries.len() + 1);
+    content_lines.push(format!("#ts={}", now));
+    for (peer_id, addrs) in &entries {
+        content_lines.push(format!("{} {}", peer_id.to_base58(), addrs.join(" ")));
+    }
+
+    let content = content_lines.join("\n");
+
+    match tokio::fs::write(cache_path, content.as_bytes()).await {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(cache_path, std::fs::Permissions::from_mode(0o600));
             }
             tracing::info!(
                 "Saved {} peers to routing table cache: {:?}",
@@ -373,9 +403,9 @@ pub fn save_routing_table(swarm: &mut Swarm<MyBehaviour>, cache_path: &Path) {
     }
 }
 
-/// 从缓存文件加载路由表 (PeerID 临时，默认禁用；需 persist_routing feature)
-#[cfg(feature = "persist_routing")]
-#[allow(dead_code)]
+/// 从缓存文件加载路由表，验证完整性，过滤过期条目。
+///
+/// 仅在 PeerID 未轮换时调用，否则缓存内容不可复用。
 fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &Path) -> usize {
     if !cache_path.exists() {
         return 0;
@@ -389,10 +419,42 @@ fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &P
         }
     };
 
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        tracing::warn!("Routing table cache too short ({} lines), ignoring", lines.len());
+        return 0;
+    }
+
+    // 解析时间戳
+    let ts_line = lines[0].trim();
+    let cache_ts: u64 = match ts_line.strip_prefix("#ts=").and_then(|s| s.parse().ok()) {
+        Some(ts) => ts,
+        None => {
+            tracing::warn!("Routing table cache missing timestamp header, ignoring");
+            return 0;
+        }
+    };
+
+    // 检查过期
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now.saturating_sub(cache_ts) > ROUTING_CACHE_MAX_AGE_SECS {
+        tracing::info!("Routing table cache expired ({}s old), ignoring", now.saturating_sub(cache_ts));
+        let _ = std::fs::remove_file(cache_path);
+        return 0;
+    }
+
     let mut loaded_count = 0;
-    for line in content.lines() {
+    for line in &lines[1..] {
+        if loaded_count >= ROUTING_CACHE_MAX_LOAD {
+            tracing::info!("Reached max load limit ({})", ROUTING_CACHE_MAX_LOAD);
+            break;
+        }
+
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
@@ -435,6 +497,9 @@ fn load_routing_table(kademlia: &mut kad::Behaviour<MemoryStore>, cache_path: &P
         loaded_count += 1;
     }
 
+    if loaded_count > 0 {
+        tracing::info!("Loaded {} peers from routing table cache", loaded_count);
+    }
     loaded_count
 }
 

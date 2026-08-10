@@ -1,18 +1,24 @@
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
-use anyhow;
-use tracing;
-use zeroize::Zeroizing;
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use tracing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(unix)]
 use libc;
 
-const KEYRING_SERVICE: &str = "rootcell";
-const MASTER_KEY_IDENTIFIER: &str = "rc_master";
+pub(crate) const KEYRING_SERVICE: &str = "rootcell";
+pub(crate) const MASTER_KEY_IDENTIFIER: &str = "rc_master";
+/// 加密文件格式版本号
+pub(crate) const FILE_FORMAT_VERSION: u8 = 0x01;
+
+/// 保护 master key 检查与生成串行化，避免并发 TOCTOU 竞态。
+static MASTER_KEY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 static KEYRING_INIT: LazyLock<()> = LazyLock::new(|| {
     #[cfg(target_os = "windows")]
@@ -48,7 +54,7 @@ static KEYRING_INIT: LazyLock<()> = LazyLock::new(|| {
             keyring_core::set_default_store(store);
             tracing::info!("iOS Keychain store set as default");
         } else {
-            tracing::warn!("iOS Keychain store initialization failed");
+            tracing::warn!("iOS Keychain initialization failed");
         }
     }
     #[cfg(all(
@@ -65,7 +71,7 @@ static KEYRING_INIT: LazyLock<()> = LazyLock::new(|| {
     }
 });
 
-fn ensure_keyring_init() {
+pub(crate) fn ensure_keyring_init() {
     LazyLock::force(&KEYRING_INIT);
 }
 
@@ -75,7 +81,7 @@ fn ensure_keyring_init() {
 /// Android 平台需在 JNI 主线程（JVM 上下文就绪后）显式调用此函数，确保 keyring
 /// 在正确的线程上完成初始化。
 pub fn setup_default_keyring() {
-    LazyLock::force(&KEYRING_INIT);
+    ensure_keyring_init();
 }
 
 pub struct PrivateKeyHandle {
@@ -86,73 +92,120 @@ pub struct PrivateKeyHandle {
 }
 
 impl PrivateKeyHandle {
-    pub fn generate_and_save_master_key() -> anyhow::Result<[u8; 32]> {
-        let key: [u8; 32] = rand::random();
-        let key_hex = hex::encode(key);
-        match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
-            Ok(entry) => {
-                entry.set_password(&key_hex)?;
-                tracing::info!("Generated and saved master key to Keyring");
-                Ok(key)
-            }
-            Err(e) => {
-                anyhow::bail!("Failed to create Keyring entry for master key: {e}")
-            }
-        }
+    pub fn generate_and_save_master_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let mut key: [u8; 32] = rand::random();
+        let key_hex = Zeroizing::new(hex::encode(key));
+        let result = keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).and_then(|entry| {
+            entry.set_password(&key_hex)?;
+            tracing::info!("Generated and saved master key to Keyring");
+            Ok(Zeroizing::new(key))
+        });
+        // 清零栈上的原始 key 副本（Zeroizing::new 对 Copy 类型只做了拷贝）
+        key.zeroize();
+        result.map_err(|e: keyring::Error| {
+            anyhow::anyhow!("Failed to create Keyring entry for master key: {e}")
+        })
     }
 
+    /// 加载 master key。
+    ///
+    /// 返回 `None` 表示密钥不存在（首次启动），
+    /// 返回 `Err` 表示密钥存在但无法读取（损坏或密钥环错误）。
+    /// 调用方必须区分这两种情况，避免在损坏时覆盖密钥导致数据丢失。
     pub fn load_master_key() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
         match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
             Ok(entry) => match entry.get_password() {
-                Ok(pwd) if !pwd.trim().is_empty() => {
+                Ok(mut pwd) if !pwd.trim().is_empty() => {
                     let decoded = Zeroizing::new(hex::decode(pwd.trim())?);
+                    pwd.zeroize();
                     if decoded.len() == 32 {
                         let mut key = Zeroizing::new([0u8; 32]);
                         key.copy_from_slice(&decoded);
                         Ok(Some(key))
                     } else {
-                        tracing::warn!(
+                        anyhow::bail!(
                             "Master key in Keyring has unexpected length: {}",
                             decoded.len()
                         );
-                        Ok(None)
                     }
                 }
                 Ok(_) => {
                     tracing::debug!("Master key entry in Keyring is empty");
                     Ok(None)
                 }
-                Err(e) => {
-                    tracing::debug!("Failed to get master key from Keyring: {e}");
+                Err(keyring::Error::NoEntry) => {
+                    tracing::debug!("Master key not found in Keyring");
                     Ok(None)
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to get master key from Keyring: {e}");
                 }
             },
             Err(e) => {
-                tracing::debug!("Failed to create Keyring entry for master key: {e}");
-                Ok(None)
+                anyhow::bail!("Failed to create Keyring entry for master key: {e}");
             }
         }
     }
 
-    pub fn has_master_key() -> bool {
-        Self::load_master_key().ok().flatten().is_some()
+    pub fn has_master_key() -> anyhow::Result<bool> {
+        Ok(Self::load_master_key()?.is_some())
     }
 
-    /// 使用 HKDF 从 master key 派生出每个身份专用的 AES 密钥
-    fn derive_aes_key(master_key: &[u8; 32], identifier: &str) -> [u8; 32] {
+    /// 确保 master key 存在并返回。并发安全：持有全局锁，避免重复生成导致数据丢失。
+    pub(crate) fn ensure_master_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let _guard = MASTER_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(key) = Self::load_master_key()? {
+            Ok(key)
+        } else {
+            tracing::info!("No master key found in Keyring, generating new one");
+            Self::generate_and_save_master_key()
+        }
+    }
+
+    /// 使用随机 salt 派生 AES 密钥（每保存派生新密钥）。
+    ///
+    /// salt 作为 HKDF 的 salt 参数，使每次保存的派生密钥均不同。
+    /// 即使同一 identifier 的两次保存产生相同的 nonce，由于密钥不同，
+    /// GCM nonce 重用攻击完全失效。salt 需与密文一同存储。
+    pub(crate) fn derive_aes_key(
+        master_key: &[u8; 32],
+        identifier: &str,
+        salt: &[u8; 16],
+    ) -> Zeroizing<[u8; 32]> {
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_slice()), master_key);
+        let mut aes_key = Zeroizing::new([0u8; 32]);
+        hk.expand(identifier.as_bytes(), &mut *aes_key)
+            .expect("HKDF expand should not fail with valid output length");
+        aes_key
+    }
+
+    /// 旧格式 AES 密钥派生（无 salt，使用固定 HKDF salt）。
+    ///
+    /// 仅用于解密旧格式加密文件迁移，不用于新加密。
+    /// HKDF info 参数必须为 identifier.as_bytes()，不可修改。
+    pub(crate) fn derive_aes_key_legacy(
+        master_key: &[u8; 32],
+        identifier: &str,
+    ) -> Zeroizing<[u8; 32]> {
         let hk = Hkdf::<Sha256>::new(Some(b"openwire-key-derivation"), master_key);
-        let mut aes_key = [0u8; 32];
-        hk.expand(identifier.as_bytes(), &mut aes_key)
+        let mut aes_key = Zeroizing::new([0u8; 32]);
+        hk.expand(identifier.as_bytes(), &mut *aes_key)
             .expect("HKDF expand should not fail with valid output length");
         aes_key
     }
 
     pub fn check_keyring_available() -> bool {
         ensure_keyring_init();
-        keyring::Entry::new(KEYRING_SERVICE, "test_availability").is_ok()
+        // Entry::new 只构造句柄，不写入凭据，因此不会残留测试条目。
+        keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).is_ok()
     }
 
     pub fn delete_master_key() -> anyhow::Result<()> {
+        let _guard = MASTER_KEY_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let entry = keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
         match entry.get_password() {
             Ok(_) => {
@@ -166,17 +219,17 @@ impl PrivateKeyHandle {
             }
             Err(e) => {
                 tracing::error!("Failed to check master key in Keyring: {e:?}");
-                Err(anyhow::anyhow!("Keyring 不可用，无法删除 master key: {e}"))
+                Err(anyhow::anyhow!("Keyring is unavailable, cannot delete master key: {e}"))
             }
         }
     }
 
-    fn hash_identifier(identifier: &str) -> String {
+    pub(crate) fn hash_identifier(identifier: &str) -> String {
         let hash = blake3::hash(identifier.as_bytes());
         hex::encode(&hash.as_bytes()[..16])
     }
 
-    fn encrypted_file_path(data_dir: &str, identifier: &str) -> std::path::PathBuf {
+    pub(crate) fn encrypted_file_path(data_dir: &str, identifier: &str) -> std::path::PathBuf {
         let short_name = Self::hash_identifier(identifier);
         Path::new(data_dir).join("keys").join(format!("{}.enc", short_name))
     }
@@ -187,117 +240,25 @@ impl PrivateKeyHandle {
         private_key: &[u8],
         master_key: &[u8; 32],
     ) -> anyhow::Result<()> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-
-        // 安全校验：规范化路径防止 ../ 遍历，但不改变写入路径
-        let data_path = Path::new(data_dir);
-        let _ = data_path.canonicalize()
-            .map_err(|e| anyhow::anyhow!("无效的 data_dir '{}': {}", data_path.display(), e))?;
-        let keys_dir = data_path.join("keys");
-        std::fs::create_dir_all(&keys_dir)?;
-
-        // 使用 HKDF 派生出每个身份专用的 AES 密钥
-        let derived = Self::derive_aes_key(master_key, identifier);
-        let key = Key::<Aes256Gcm>::from(derived);
-        let cipher = Aes256Gcm::new(&key);
-
-        let nonce = Nonce::from(rand::random::<[u8; 12]>());
-        let ciphertext = cipher
-            .encrypt(&nonce, private_key)
-            .map_err(|e| anyhow::anyhow!("AES-256-GCM encryption failed: {e:?}"))?;
-
-        let path = Self::encrypted_file_path(data_dir, identifier);
-        let mut file_content = nonce.to_vec();
-        file_content.extend_from_slice(&ciphertext);
-        std::fs::write(&path, file_content)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-        }
-
-        Ok(())
+        save_bytes(data_dir, identifier, private_key, master_key)
     }
 
     pub fn load_encrypted_private_key(
         data_dir: &str,
         identifier: &str,
         master_key: &[u8; 32],
-    ) -> anyhow::Result<Option<Vec<u8>>> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
-
-        let path = Self::encrypted_file_path(data_dir, identifier);
-        let file_content = match std::fs::read(&path) {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        if file_content.len() < 12 {
-            tracing::warn!(
-                "Encrypted key file for {} is too short ({} bytes), ignoring",
-                identifier,
-                file_content.len()
-            );
-            return Ok(None);
-        }
-
-        let (nonce_bytes, ciphertext) = file_content.split_at(12);
-        let nonce_array: [u8; 12] = nonce_bytes
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid nonce length"))?;
-        let nonce = Nonce::from(nonce_array);
-        // 使用 HKDF 派生出每个身份专用的 AES 密钥
-        let derived = Self::derive_aes_key(master_key, identifier);
-        let key = Key::<Aes256Gcm>::from(derived);
-        let cipher = Aes256Gcm::new(&key);
-
-        match cipher.decrypt(&nonce, ciphertext) {
-            Ok(plaintext) => return Ok(Some(plaintext)),
-            Err(_) => {
-                // 回退到旧格式（无 HKDF）：直接用 master_key 作为 AES 密钥
-                let old_key = Key::<Aes256Gcm>::from(*master_key);
-                let old_cipher = Aes256Gcm::new(&old_key);
-                match old_cipher.decrypt(&nonce, ciphertext) {
-                    Ok(plaintext) => {
-                        tracing::info!("以旧格式解密身份 {} 成功，自动迁移到 HKDF 格式", identifier);
-                        if let Err(e) = Self::save_encrypted_private_key(data_dir, identifier, &plaintext, master_key) {
-                            tracing::warn!("迁移身份 {} 到 HKDF 格式失败: {e}", identifier);
-                        }
-                        Ok(Some(plaintext))
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            "Failed to decrypt private key for {} (wrong key or corrupted file)",
-                            identifier
-                        );
-                        Ok(None)
-                    }
-                }
-            }
-        }
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        load_bytes(data_dir, identifier, master_key)
     }
 
     pub fn delete_encrypted_private_key(data_dir: &str, identifier: &str) {
-        let path = Self::encrypted_file_path(data_dir, identifier);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!(
-                    "Failed to delete encrypted key file for {}: {}",
-                    identifier,
-                    e
-                );
-            }
-        }
+        delete_file(data_dir, identifier);
     }
 
-    pub fn save(data_dir: &str, identifier: &str, private_key: &[u8]) -> anyhow::Result<Self> {
+    /// 将私钥加密保存到 Keyring + 加密文件。
+    ///
+    /// 仅负责持久化，不构造内存驻留句柄；如需在内存保留密钥，请使用 `load`。
+    pub fn save(data_dir: &str, identifier: &str, private_key: &[u8]) -> anyhow::Result<()> {
         tracing::debug!("Saving private key for identifier: {}", identifier);
 
         if !Self::check_keyring_available() {
@@ -309,29 +270,14 @@ impl PrivateKeyHandle {
             );
         }
 
-        let master_key = match Self::load_master_key()? {
-            Some(key) => key,
-            None => {
-                tracing::info!("No master key found in Keyring, generating new one");
-                let raw_key = Self::generate_and_save_master_key()?;
-                Zeroizing::new(raw_key)
-            }
-        };
+        let master_key = Self::ensure_master_key()?;
 
         Self::save_encrypted_private_key(data_dir, identifier, private_key, &master_key)?;
-
-        let mut handle = Self {
-            private_key: private_key.to_vec().into_boxed_slice().into(),
-            identifier: identifier.to_string(),
-            data_dir: data_dir.to_string(),
-            locked: false,
-        };
-        handle.lock_memory()?;
         tracing::info!(
             "Saved private key for {} (Keyring + encrypted file)",
             identifier
         );
-        Ok(handle)
+        Ok(())
     }
 
     pub fn load(data_dir: &str, identifier: &str) -> anyhow::Result<Self> {
@@ -356,8 +302,10 @@ impl PrivateKeyHandle {
                 "Private key not found for {identifier}. Keyring is available but no matching encrypted key file exists."
             ))?;
 
+        let mut private_key = private_key;
+        let private_key_vec = std::mem::take(&mut *private_key);
         let mut handle = Self {
-            private_key: private_key.into_boxed_slice().into(),
+            private_key: Box::into_pin(private_key_vec.into_boxed_slice()),
             identifier: identifier.to_string(),
             data_dir: data_dir.to_string(),
             locked: false,
@@ -371,7 +319,7 @@ impl PrivateKeyHandle {
     }
 
     pub fn get_private_key(&self) -> &[u8] {
-        &self.private_key
+        &*self.private_key
     }
 
     pub fn identifier(&self) -> &str {
@@ -464,12 +412,18 @@ impl PrivateKeyHandle {
         self.locked = false;
     }
 
-    pub fn diagnose_storage(identifier: &str) -> String {
+    pub fn diagnose_storage(data_dir: &str, identifier: &str) -> String {
         let mut report = format!("=== Private Key Storage for {identifier} ===\n");
         match Self::load_master_key() {
             Ok(Some(_)) => report.push_str("Keyring master key: Available\n"),
             Ok(None) => report.push_str("Keyring master key: Not available\n"),
             Err(e) => report.push_str(&format!("Keyring master key error: {e}\n")),
+        }
+        let path = Self::encrypted_file_path(data_dir, identifier);
+        if path.exists() {
+            report.push_str(&format!("Encrypted key file: Present ({})\n", path.display()));
+        } else {
+            report.push_str("Encrypted key file: Missing\n");
         }
         report
     }
@@ -481,10 +435,294 @@ impl Drop for PrivateKeyHandle {
             "Dropping PrivateKeyHandle for {}, unlocking memory",
             self.identifier
         );
-        // Zeroize the pinned buffer before munlock to prevent key material from leaking
-        // even if the memory page is swapped out after unlocking.
-        // Box<[u8]>: Unpin, so Pin::get_mut() is safe.
-        self.private_key.as_mut().get_mut().fill(0);
+        // 在 munlock 前对密钥缓冲区清零，防止解锁后内存页被换出时泄露密钥材料。
+        // 使用 Zeroize（volatile 写）而非 fill(0)，避免编译器把清零优化为 dead store。
+        self.private_key.zeroize();
         self.unlock_memory();
+    }
+}
+
+// ============================================================================
+// 共享字节级加密原语（PrivateKeyHandle + EncryptedStore 共用）
+// ============================================================================
+
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+const HEADER_LEN: usize = 1 + SALT_LEN + NONCE_LEN;
+
+/// 加密并写入字节到文件。每保存生成随机 salt 派生独立密钥。
+pub(crate) fn save_bytes(
+    data_dir: &str,
+    identifier: &str,
+    bytes: &[u8],
+    master_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let keys_dir = Path::new(data_dir).join("keys");
+    std::fs::create_dir_all(&keys_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let salt: [u8; SALT_LEN] = rand::random();
+    let derived = PrivateKeyHandle::derive_aes_key(master_key, identifier, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&*derived)
+        .map_err(|e| anyhow::anyhow!("Invalid AES key length: {e}"))?;
+
+    let nonce = Nonce::from(rand::random::<[u8; NONCE_LEN]>());
+    // 版本字节作为 AAD 认证，防止被篡改导致有效文件被拒绝
+    let aad = [FILE_FORMAT_VERSION];
+    let ciphertext = cipher
+        .encrypt(&nonce, Payload { msg: bytes, aad: &aad })
+        .map_err(|e| anyhow::anyhow!("AES-256-GCM encryption failed: {e:?}"))?;
+
+    let path = PrivateKeyHandle::encrypted_file_path(data_dir, identifier);
+    let mut file_content = vec![FILE_FORMAT_VERSION];
+    file_content.extend_from_slice(&salt);
+    file_content.extend_from_slice(&nonce);
+    file_content.extend_from_slice(&ciphertext);
+    atomic_write(&path, &file_content)?;
+
+    Ok(())
+}
+
+/// 原子写入：先写同目录临时文件再 rename，避免中途崩溃留下截断/损坏的密钥文件。
+///
+/// 临时文件在创建后立即设置 0o600 权限（仅 unix），避免 umask 默认权限下的
+/// TOCTOU 窗口；rename 保留源文件权限。
+fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp_path);
+    std::fs::write(&tmp_path, content)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Windows 的 rename 在目标已存在时会失败，先移除目标（非原子，但可避免半写文件）
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
+    std::fs::rename(&tmp_path, path)
+}
+
+/// 从文件读取并解密字节。返回 `None` 表示文件不存在。
+///
+/// 自动检测旧格式文件（无版本字节）并迁移到新格式。
+pub(crate) fn load_bytes(
+    data_dir: &str,
+    identifier: &str,
+    master_key: &[u8; 32],
+) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    let path = PrivateKeyHandle::encrypted_file_path(data_dir, identifier);
+    let file_content = match std::fs::read(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if file_content.len() < NONCE_LEN {
+        tracing::warn!(
+            "Encrypted file for {} is too short ({} bytes), ignoring",
+            identifier,
+            file_content.len()
+        );
+        return Ok(None);
+    }
+
+    let version = file_content[0];
+    if version == FILE_FORMAT_VERSION {
+        return decode_v1_format(identifier, &file_content, master_key)
+            .map(|v| Some(Zeroizing::new(v)));
+    }
+
+    // 检测旧格式（无版本字节，nonce[12] + ciphertext）
+    if version != FILE_FORMAT_VERSION {
+        return match decode_legacy_format(identifier, &file_content, master_key) {
+            Ok(plaintext) => {
+                tracing::info!(
+                    "Migrated encrypted file for {} from legacy format to v1",
+                    identifier
+                );
+                let _ = save_bytes(data_dir, identifier, &plaintext, master_key);
+                Ok(Some(Zeroizing::new(plaintext)))
+            }
+            Err(e) => {
+                tracing::warn!("Legacy encrypted file for {} migration failed: {e}", identifier);
+                Ok(None)
+            }
+        };
+    }
+
+    Ok(None)
+}
+
+/// 解密 v1 格式：version(1) + salt(16) + nonce(12) + AES-GCM-AAD(ciphertext)
+fn decode_v1_format(
+    identifier: &str,
+    file_content: &[u8],
+    master_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    if file_content.len() < HEADER_LEN {
+        anyhow::bail!("file too short for v1 format");
+    }
+    let salt: [u8; SALT_LEN] = file_content[1..=SALT_LEN]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid salt length"))?;
+    let (nonce_bytes, ciphertext) = file_content[1 + SALT_LEN..].split_at(NONCE_LEN);
+    let nonce_array: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid nonce length"))?;
+
+    let derived = PrivateKeyHandle::derive_aes_key(master_key, identifier, &salt);
+    let cipher = Aes256Gcm::new_from_slice(&*derived)
+        .map_err(|e| anyhow::anyhow!("Invalid AES key length: {e}"))?;
+    let aad = [FILE_FORMAT_VERSION];
+    cipher
+        .decrypt(&Nonce::from(nonce_array), Payload { msg: ciphertext, aad: &aad })
+        .map_err(|_| anyhow::anyhow!(
+            "Failed to decrypt file for {} (wrong key or corrupted file)", identifier
+        ))
+}
+
+/// 解密旧格式（无版本字节，nonce[12] + AES-GCM(ciphertext)，使用旧 derive_aes_key）
+fn decode_legacy_format(
+    identifier: &str,
+    file_content: &[u8],
+    master_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    let (nonce_bytes, ciphertext) = file_content.split_at(NONCE_LEN);
+    let nonce_array: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid legacy nonce length"))?;
+
+    let derived = PrivateKeyHandle::derive_aes_key_legacy(master_key, identifier);
+    let cipher = Aes256Gcm::new_from_slice(&*derived)
+        .map_err(|e| anyhow::anyhow!("Invalid legacy AES key length: {e}"))?;
+    cipher
+        .decrypt(&Nonce::from(nonce_array), ciphertext)
+        .map_err(|_| anyhow::anyhow!(
+            "Failed to decrypt legacy file for {} (wrong key or corrupted file)", identifier
+        ))
+}
+
+/// 删除加密文件（不存在时静默成功）。
+pub(crate) fn delete_file(data_dir: &str, identifier: &str) {
+    let path = PrivateKeyHandle::encrypted_file_path(data_dir, identifier);
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("Failed to delete encrypted file for {}: {}", identifier, e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rootcell_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn derive_aes_key_is_deterministic() {
+        let master = [42u8; 32];
+        let salt = [7u8; 16];
+        let k1 = PrivateKeyHandle::derive_aes_key(&master, "alice", &salt);
+        let k2 = PrivateKeyHandle::derive_aes_key(&master, "alice", &salt);
+        assert_eq!(&*k1, &*k2);
+
+        let k3 = PrivateKeyHandle::derive_aes_key(&master, "bob", &salt);
+        assert_ne!(&*k1, &*k3);
+
+        let master2 = [43u8; 32];
+        let k4 = PrivateKeyHandle::derive_aes_key(&master2, "alice", &salt);
+        assert_ne!(&*k1, &*k4);
+
+        // 不同 salt 产生不同密钥
+        let salt2 = [8u8; 16];
+        let k5 = PrivateKeyHandle::derive_aes_key(&master, "alice", &salt2);
+        assert_ne!(&*k1, &*k5);
+    }
+
+    #[test]
+    fn hash_identifier_is_stable() {
+        let h1 = PrivateKeyHandle::hash_identifier("hello");
+        let h2 = PrivateKeyHandle::hash_identifier("hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 32); // 16 bytes hex -> 32 chars
+        assert_ne!(h1, PrivateKeyHandle::hash_identifier("world"));
+    }
+
+    #[test]
+    fn encrypted_private_key_roundtrip() {
+        let dir = temp_dir();
+        let master = [7u8; 32];
+        let key_bytes: Vec<u8> = (0..64).map(|i| i as u8).collect();
+
+        PrivateKeyHandle::save_encrypted_private_key(
+            dir.to_str().unwrap(),
+            "alice",
+            &key_bytes,
+            &master,
+        )
+        .unwrap();
+
+        let loaded = PrivateKeyHandle::load_encrypted_private_key(
+            dir.to_str().unwrap(),
+            "alice",
+            &master,
+        )
+        .unwrap()
+        .expect("key should exist");
+        assert_eq!(&*loaded, &key_bytes);
+
+        // 错误 master key 应解密失败
+        let wrong_master = [8u8; 32];
+        assert!(
+            PrivateKeyHandle::load_encrypted_private_key(
+                dir.to_str().unwrap(),
+                "alice",
+                &wrong_master,
+            )
+            .is_err()
+        );
+
+        // 不存在的 identifier 应返回 None
+        assert!(
+            PrivateKeyHandle::load_encrypted_private_key(dir.to_str().unwrap(), "nobody", &master)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encrypted_file_path_is_hashed() {
+        let dir = temp_dir();
+        let p1 = PrivateKeyHandle::encrypted_file_path(dir.to_str().unwrap(), "a/b");
+        let p2 = PrivateKeyHandle::encrypted_file_path(dir.to_str().unwrap(), "a%2Fb");
+        // 路径分隔符不会影响哈希结果，文件名始终为 32 位 hex + .enc
+        let f1 = p1.file_name().unwrap().to_str().unwrap().to_string();
+        let f2 = p2.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(f1.len(), 32 + 4);
+        assert_eq!(f2.len(), 32 + 4);
+        assert!(f1.ends_with(".enc"));
+        assert!(f2.ends_with(".enc"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

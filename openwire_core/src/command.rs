@@ -135,8 +135,6 @@ pub enum ChatCommand {
     SetRelayServerAllowed(bool),
 
     // ===== 定时器事件（由 timers.rs 触发，不对外暴露） =====
-    /// 定时器：重试在线联系人的待发送消息
-    TimerRetryPendingOnline,
     /// 定时器：保存路由表到磁盘
     TimerSaveRoutingTable,
     /// 定时器：重新发现所有联系人的 DHT 记录
@@ -145,6 +143,8 @@ pub enum ChatCommand {
     TimerCleanupDht,
     /// 定时器：将当前身份重新发布到 DHT
     TimerPublishIdentity,
+    /// 定时器：随机刷新路由表（随机桶查询，扩展路由表覆盖）
+    TimerRefreshRoutingTable,
 }
 
 /// 收到的消息类型：chat_core 向上层传递的结构化数据

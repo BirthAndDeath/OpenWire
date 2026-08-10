@@ -418,34 +418,6 @@ pub async fn list_pending_by_peer(
 
 /// 批量查询多个联系人的待发送消息
 /// 用于 retry_pending_for_online_peers 避免全表扫描
-#[cfg(feature = "sqlite_history_storage")]
-pub async fn list_pending_by_peers(
-    pool: &Pool<Sqlite>,
-    peer_pubkey_hexes: &[String],
-) -> StorageResult<Vec<Message>> {
-    if peer_pubkey_hexes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders: Vec<String> = (1..=peer_pubkey_hexes.len()).map(|i| format!("?{i}")).collect();
-    let sql = format!(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
-         FROM messages WHERE pending = 1 AND peer_pubkey_hex IN ({}) ORDER BY ts ASC",
-        placeholders.join(",")
-    );
-    let mut query = sqlx::query_as::<_, Message>(AssertSqlSafe(&*sql));
-    for hex in peer_pubkey_hexes {
-        query = query.bind(hex);
-    }
-    let msgs = query.fetch_all(pool).await?;
-    Ok(msgs)
-}
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn list_pending_by_peers(
-    _pool: &Pool<Sqlite>,
-    _peer_pubkey_hexes: &[String],
-) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
 #[cfg(feature = "sqlite_history_storage")]
 pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
@@ -549,3 +521,5 @@ pub async fn update_message_hash(pool: &Pool<Sqlite>, id: i64, hash: &str) -> St
 pub async fn update_message_hash(_pool: &Pool<Sqlite>, _id: i64, _hash: &str) -> StorageResult<()> {
     feature_err()
 }
+
+

@@ -3,6 +3,7 @@
 //! 封装对 libp2p Swarm 的常用操作，供 P2pActor 使用。
 //! 包括：发送消息、发送 NetEvent、DHT 操作、连接管理等。
 
+use libp2p::request_response::OutboundRequestId;
 use libp2p::{PeerId, Swarm};
 
 use crate::log::truncate_str;
@@ -14,9 +15,13 @@ use crate::{ChatMessage, ChatResponse};
 // 消息发送
 // ============================================================================
 
-/// 通过 rr_msg 协议发送消息
-pub fn send_message(swarm: &mut Swarm<MyBehaviour>, peer_id: &PeerId, message: ChatMessage) {
-    swarm.behaviour_mut().rr_msg.send_request(peer_id, message);
+/// 通过 rr_msg 协议发送消息，返回 OutboundRequestId 供追踪结果
+pub fn send_message(
+    swarm: &mut Swarm<MyBehaviour>,
+    peer_id: &PeerId,
+    message: ChatMessage,
+) -> OutboundRequestId {
+    swarm.behaviour_mut().rr_msg.send_request(peer_id, message)
 }
 
 /// 通过 rr_netevent 协议发送 NetEvent 请求
@@ -98,6 +103,33 @@ pub fn publish_identity_to_dht(swarm: &mut Swarm<MyBehaviour>, mldsa_pubkey_hex:
 pub fn get_providers(swarm: &mut Swarm<MyBehaviour>, key: &str) {
     let record_key = libp2p::kad::RecordKey::new(&key);
     let _query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+}
+
+/// 停止在 DHT 提供身份（删除 identity 时调用，撤销 DHT 上的提供记录）
+pub fn stop_providing_to_dht(swarm: &mut Swarm<MyBehaviour>, mldsa_pubkey_hex: &str) {
+    let key = libp2p::kad::RecordKey::new(&dht_key(mldsa_pubkey_hex));
+    swarm.behaviour_mut().kademlia.stop_providing(&key);
+    tracing::debug!(
+        "Stopped providing PeerID for ML-DSA {}",
+        truncate_str(mldsa_pubkey_hex, 16),
+    );
+}
+
+/// 随机刷新路由表：选取一个随机桶范围，发起 get_closest_peers 查询
+///
+/// 通过随机生成 PeerID 发起 Kademlia 查询，扩展路由表覆盖范围。
+/// 每 30 分钟触发一次，查询结果自动填充路由表。
+pub fn refresh_routing_table(swarm: &mut Swarm<MyBehaviour>) {
+    let random_kp = libp2p::identity::Keypair::generate_ed25519();
+    let random_peer_id = random_kp.public().to_peer_id();
+    swarm
+        .behaviour_mut()
+        .kademlia
+        .get_closest_peers(random_peer_id);
+    tracing::debug!(
+        "Routing table refresh: querying random peer {}",
+        random_peer_id
+    );
 }
 
 /// 添加地址到 Kademlia 路由表

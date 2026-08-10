@@ -9,9 +9,14 @@
     setSetting,
     initSettingsStore,
     screenshotProtectionStore,
+    chatBackgroundStore,
+    chatBackgroundVersion,
+    fontSizeScale,
   } from "../../lib/settings";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { join, appDataDir } from "@tauri-apps/api/path";
 
   // 语言选项
   const languages = [
@@ -34,6 +39,17 @@
 
   // 截屏保护
   let screenshotProtection = $state(false);
+
+  // 聊天背景图
+  let chatBackgroundPath = $state("");
+  let chatBackgroundUrl = $derived(
+    chatBackgroundPath
+      ? `${convertFileSrc(chatBackgroundPath)}?v=${$chatBackgroundVersion}`
+      : ""
+  );
+
+  // 字号缩放
+  let fontSize = $state(1.0);
 
   // Keyring 可用性（隔离层检查）
   let keyringAvailable = $state(false);
@@ -101,6 +117,28 @@
         }
       } catch (e) {
         console.error("获取截屏保护设置失败:", e);
+      }
+
+      // 获取聊天背景图设置
+      try {
+        const saved = await getSetting<string>("chat_background");
+        if (saved) {
+          chatBackgroundPath = saved;
+          chatBackgroundStore.set(saved);
+        }
+      } catch (e) {
+        console.error("获取聊天背景设置失败:", e);
+      }
+
+      // 获取字号缩放设置
+      try {
+        const saved = await getSetting<number>("font_size");
+        if (saved !== undefined && saved >= 0.5 && saved <= 2.0) {
+          fontSize = saved;
+          fontSizeScale.set(saved);
+        }
+      } catch (e) {
+        console.error("获取字号设置失败:", e);
       }
 
       // 加载节点配置
@@ -230,6 +268,59 @@
     await setLanguage(lang);
   }
 
+  // 选择聊天背景图
+  async function pickBackground() {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [
+          {
+            name: "图片",
+            extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"],
+          },
+        ],
+      });
+      if (selected) {
+        const appData = await appDataDir();
+        const srcName = selected.split(/[/\\]/).pop()!;
+        const ext = srcName.lastIndexOf(".") >= 0 ? srcName.slice(srcName.lastIndexOf(".")) : "";
+        // 唯一文件名（时间戳）：目标路径每次变化，确保 WebView 不因同路径缓存显示旧图
+        const dest = await join(appData, "backgrounds", `background-${Date.now()}${ext}`);
+        try {
+          await invoke("copy_file", { src: selected, dst: dest });
+          chatBackgroundPath = dest;
+          chatBackgroundStore.set(dest);
+          chatBackgroundVersion.update((v) => v + 1);
+          await setSetting("chat_background", dest);
+        } catch (e) {
+          console.error("背景图复制失败:", e);
+          chatBackgroundPath = "";
+          chatBackgroundStore.set("");
+          chatBackgroundVersion.update((v) => v + 1);
+          await setSetting("chat_background", "");
+        }
+      }
+    } catch (e) {
+      console.error("选择背景图失败:", e);
+    }
+  }
+
+  // 移除聊天背景图
+  async function removeBackground() {
+    chatBackgroundPath = "";
+    chatBackgroundStore.set("");
+    chatBackgroundVersion.update((v) => v + 1);
+    await setSetting("chat_background", "");
+  }
+
+  // 改变字号
+  async function changeFontSize(e: Event) {
+    const val = parseFloat((e.target as HTMLInputElement).value);
+    fontSize = val;
+    fontSizeScale.set(val);
+    await setSetting("font_size", val);
+  }
+
   // 返回首页
   function goBack() {
     goto("/");
@@ -298,6 +389,27 @@
             {/each}
           </select>
         </div>
+
+        <div class="font-size-setting">
+          <label for="font-size-slider">
+            {$_("font_size")}: {Math.round(fontSize * 100)}%
+          </label>
+          <input
+            id="font-size-slider"
+            type="range"
+            min="0.5"
+            max="2.0"
+            step="0.1"
+            value={fontSize}
+            oninput={changeFontSize}
+            class="font-size-slider"
+          />
+          <div class="slider-labels">
+            <span>50%</span>
+            <span>100%</span>
+            <span>200%</span>
+          </div>
+        </div>
       </section>
 
       <!-- 截屏保护 -->
@@ -319,6 +431,33 @@
           >
             <span class="toggle-knob"></span>
           </button>
+        </div>
+      </section>
+
+      <!-- 聊天背景图 -->
+      <section class="settings-section">
+        <h2>{$_("chat_background")}</h2>
+        <div class="bg-setting">
+          {#if chatBackgroundUrl}
+            <div
+              class="bg-preview"
+              style="background-image: url({chatBackgroundUrl})"
+            ></div>
+          {:else}
+            <div class="bg-preview bg-preview-empty">
+              <span class="bg-preview-hint">{$_("no_background")}</span>
+            </div>
+          {/if}
+          <div class="bg-actions">
+            <button class="bg-pick-btn" onclick={pickBackground}>
+              {$_("select_background")}
+            </button>
+            {#if chatBackgroundPath}
+              <button class="bg-remove-btn" onclick={removeBackground}>
+                {$_("remove_background")}
+              </button>
+            {/if}
+          </div>
         </div>
       </section>
 
@@ -614,6 +753,63 @@
     background: var(--bg-secondary, #0a0a0a);
     color: var(--text-primary, #fafafa);
     padding: 8px;
+  }
+
+  /* 字号滑块 */
+  .font-size-setting {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .font-size-setting label {
+    font-size: 14px;
+    color: var(--text-primary, #fafafa);
+  }
+
+  .font-size-slider {
+    width: 100%;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--border-color, #2a2a2a);
+    border-radius: 3px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .font-size-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #3b82f6;
+    border: 2px solid #fff;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .font-size-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.15);
+  }
+
+  .font-size-slider::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #3b82f6;
+    border: 2px solid #fff;
+    cursor: pointer;
+  }
+
+  .slider-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-secondary, #737373);
+    padding: 0 2px;
   }
 
   /* 开关样式 */
@@ -926,5 +1122,73 @@
     background: rgba(245, 158, 11, 0.1);
     border: 1px solid rgba(245, 158, 11, 0.2);
     color: #f59e0b;
+  }
+
+  /* 背景图设置 */
+  .bg-setting {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .bg-preview {
+    width: 100%;
+    height: 120px;
+    border-radius: 8px;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    border: 1px solid var(--border-color, #2a2a2a);
+    overflow: hidden;
+  }
+
+  .bg-preview-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-secondary, #0a0a0a);
+  }
+
+  .bg-preview-hint {
+    font-size: 13px;
+    color: var(--text-secondary, #737373);
+    opacity: 0.5;
+  }
+
+  .bg-actions {
+    display: flex;
+    gap: 10px;
+  }
+
+  .bg-pick-btn {
+    flex: 1;
+    background: #3b82f6;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 20px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+  }
+
+  .bg-pick-btn:hover {
+    background: #2563eb;
+  }
+
+  .bg-remove-btn {
+    background: transparent;
+    border: 1px solid #ef4444;
+    border-radius: 6px;
+    padding: 10px 20px;
+    color: #ef4444;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+  }
+
+  .bg-remove-btn:hover {
+    background: rgba(239, 68, 68, 0.15);
   }
 </style>
