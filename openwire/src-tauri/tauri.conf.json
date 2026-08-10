@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenWire",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "com.openwire.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -49,7 +49,10 @@
       },
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPDATA/**", "$RESOURCE/**"]
+        "scope": [
+          "$APPDATA/**",
+          "$RESOURCE/**"
+        ]
       }
     }
   },
