@@ -44,6 +44,11 @@ pub struct MyBehaviour {
     pub identify: identify::Behaviour,
     /// Relay 协议（NAT 穿透，Client 模式）
     pub relay_client: relay::client::Behaviour,
+    /// Relay 协议（Server 模式，公网节点对外提供电路中继）
+    /// 注意：relay::Behaviour (server) 始终接受入站中继连接请求，无内部开关。
+    /// `relay_role` 与 `disable_relay_server()` 仅控制 DHT 注册（start_providing），
+    /// 不阻止已知地址的节点发起 reservation。如需完全禁用中继服务，需移除该 behaviour。
+    pub relay_server: relay::Behaviour,
     /// DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,
 

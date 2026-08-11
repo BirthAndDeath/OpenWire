@@ -199,6 +199,7 @@ impl ChatCore {
             .dht_cache(dht_cache.clone())
             .data_dir(cfg.data_dir.clone())
             .relay_nodes(cfg.relay_nodes.clone())
+            .bootstrap_nodes(cfg.bootstrap_nodes.clone())
             .channel_size(CHANNEL_CAPACITY)
             .cancellation_token(shutdown_token.clone())
             .start();

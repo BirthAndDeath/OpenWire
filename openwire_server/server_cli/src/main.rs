@@ -12,5 +12,15 @@ fn main() -> anyhow::Result<()> {
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(44909);
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(openwire_server_common::relay(dir.as_deref(), port))
+    let result = rt.block_on(async {
+        tokio::select! {
+            r = openwire_server_common::relay(dir.as_deref(), port) => r,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("收到 SIGINT，正在关闭中继服务器...");
+                Ok(())
+            }
+        }
+    });
+    tracing::info!("中继服务器已关闭");
+    result
 }

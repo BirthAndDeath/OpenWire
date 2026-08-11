@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-openwire_core = { workspace = true }
+openwire_core = { workspace = true, features = ["redb_dht"] }
 libp2p = { workspace = true }
 tracing = { workspace = true }
+redb = { version = "4.1.0" }
 anyhow = "1.0.104"

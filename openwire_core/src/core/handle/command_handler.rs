@@ -83,15 +83,24 @@ impl ChatCore {
                     "Shutdown command reached handle_command (should be handled in run_inner)"
                 );
             }
-            ChatCommand::SetRelayServerAllowed(allowed) => {
+            ChatCommand::SetPaidNetworkMode(mode) => {
                 if let Err(e) = self
                     .p2p_handle
                     .tx
                     .try_send(
-                        P2pCommand::RelayServerConfig { allowed },
+                        P2pCommand::SetPaidNetworkMode { mode },
                     )
                 {
-                    tracing::warn!("Failed to send RelayServerConfig: {e:?}");
+                    tracing::warn!("Failed to send SetPaidNetworkMode: {e:?}");
+                }
+            }
+            ChatCommand::SetRelayRole(role) => {
+                if let Err(e) = self
+                    .p2p_handle
+                    .tx
+                    .try_send(P2pCommand::SetRelayRole { role })
+                {
+                    tracing::warn!("Failed to send SetRelayRole: {e:?}");
                 }
             }
             // ===== 定时器事件处理 =====
@@ -124,6 +133,48 @@ impl ChatCore {
                     )
                 {
                     tracing::warn!("Failed to send RefreshRoutingTable: {e:?}");
+                }
+            }
+            ChatCommand::GetNetworkStatus { resp } => {
+                let (p2p_tx, p2p_rx) = tokio::sync::oneshot::channel();
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::GetNetworkStatus { resp: p2p_tx }) {
+                    tracing::warn!("Failed to send GetNetworkStatus to P2pActor: {e:?}");
+                    let _ = resp.send(
+                        crate::command::NetworkStatusData::error_json("p2p_channel_closed", &format!("P2pActor command channel full/closed: {}", e))
+                    );
+                    return;
+                }
+                match p2p_rx.await {
+                    Ok(json) => { let _ = resp.send(json); }
+                    Err(_) => {
+                        let _ = resp.send(
+                            crate::command::NetworkStatusData::error_json("p2p_no_response", "P2pActor did not respond to status query")
+                        );
+                    }
+                }
+            }
+            ChatCommand::ExportRoutingTable { resp } => {
+                let (p2p_tx, p2p_rx) = tokio::sync::oneshot::channel();
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::ExportRoutingTable { resp: p2p_tx }) {
+                    tracing::warn!("Failed to send ExportRoutingTable to P2pActor: {e:?}");
+                    let _ = resp.send(serde_json::json!({ "version": 0, "peers": [], "error": e.to_string() }).to_string());
+                    return;
+                }
+                match p2p_rx.await {
+                    Ok(json) => { let _ = resp.send(json); }
+                    Err(_) => { let _ = resp.send(serde_json::json!({ "version": 0, "peers": [], "error": "P2pActor did not respond" }).to_string()); }
+                }
+            }
+            ChatCommand::ImportRoutingTable { data, resp } => {
+                let (p2p_tx, p2p_rx) = tokio::sync::oneshot::channel();
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::ImportRoutingTable { data, resp: p2p_tx }) {
+                    tracing::warn!("Failed to send ImportRoutingTable to P2pActor: {e:?}");
+                    let _ = resp.send(serde_json::json!({ "imported": 0, "error": e.to_string() }).to_string());
+                    return;
+                }
+                match p2p_rx.await {
+                    Ok(json) => { let _ = resp.send(json); }
+                    Err(_) => { let _ = resp.send(serde_json::json!({ "imported": 0, "error": "P2pActor did not respond" }).to_string()); }
                 }
             }
         }

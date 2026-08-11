@@ -17,6 +17,7 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { join, appDataDir } from "@tauri-apps/api/path";
+import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
 
   // 语言选项
   const languages = [
@@ -459,6 +460,11 @@ import { join, appDataDir } from "@tauri-apps/api/path";
             {/if}
           </div>
         </div>
+      </section>
+
+      <!-- 网络状态监控 -->
+      <section class="settings-section">
+        <NetworkMonitor />
       </section>
 
       <!-- ============================================================ -->

@@ -151,11 +151,6 @@ impl CoreHandle {
         let _ = self.try_send_cmd(ChatCommand::Shutdown);
     }
 
-    /// 设置是否允许启用中继服务（计费网络检测）
-    pub fn set_relay_server_allowed(&self, allowed: bool) {
-        self.try_send_cmd(ChatCommand::SetRelayServerAllowed(allowed));
-    }
-
     /// 发送文件（计算文件 hash、注册文件路径、发送 FileHash 消息）
     pub async fn send_file(&self, mldsa_pubkey_hex: &str, file_path: &std::path::Path) -> bool {
         let file_hash = match crate::transfer::compute_file_hash(file_path).await {

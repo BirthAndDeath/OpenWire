@@ -92,6 +92,7 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::HOURLY) // 按小时轮转
         .filename_prefix("chat") // 文件名前缀
+        .filename_suffix("log") // 文件后缀名
         .max_log_files(MAX_LOG_FILES)
         .build(&safe_path)
         .map_err(|e| crate::error::LogError::CreateRollingFileAppenderFailed(e.into()))?;

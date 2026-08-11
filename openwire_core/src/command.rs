@@ -131,8 +131,30 @@ pub enum ChatCommand {
     /// 优雅关闭核心
     Shutdown,
 
-    /// 设置是否允许启用中继服务（前端计费网络检测后调用）
-    SetRelayServerAllowed(bool),
+    /// 设置计费网络检测模式：free（非计费）/ paid（计费）/ disabled（禁用）
+    /// 禁用时中继始终关闭，优先于 API 自动检测与用户手动选择
+    SetPaidNetworkMode(String),
+    /// 设置中继角色："server" / "client" / "off"（互斥，server 与 client 不能同时启用）
+    SetRelayRole(String),
+
+    /// 查询网络状态（用于前端网络监控组件）
+    GetNetworkStatus {
+        /// 响应通道：返回 JSON 序列化的 NetworkStatusData
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
+
+    /// 导出当前路由表（用于分享给其他节点）
+    ExportRoutingTable {
+        /// 响应通道：返回 JSON 序列化的 RoutingTableExport
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
+    /// 导入路由表（将其他节点导出的 peers 加入本地路由表）
+    ImportRoutingTable {
+        /// 导出的路由表 JSON 字符串
+        data: String,
+        /// 响应通道：返回 JSON 序列化的导入结果 { imported, error }
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
 
     // ===== 定时器事件（由 timers.rs 触发，不对外暴露） =====
     /// 定时器：保存路由表到磁盘
@@ -233,3 +255,129 @@ pub enum MessageEvent {
 
 /// 通道消息结构：核心向外部（UI）发送的事件包装
 pub type ChatcoreEvent = MessageEvent;
+
+// ============================================================================
+// 路由表导出/导入
+// ============================================================================
+
+/// 导出文件中的单个节点信息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingTableExportPeer {
+    pub peer_id: String,
+    pub addresses: Vec<String>,
+    pub is_bootstrap: bool,
+    pub is_relay: bool,
+}
+
+/// 路由表导出文件格式（JSON）
+/// 注意：此文件不含任何密钥，仅含公网可发现的 PeerID 和 Multiaddr。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingTableExport {
+    pub version: u32,
+    pub exported_at: i64,
+    pub self_peer_id: String,
+    pub self_addresses: Vec<String>,
+    pub peers: Vec<RoutingTableExportPeer>,
+}
+
+impl RoutingTableExport {
+    pub const CURRENT_VERSION: u32 = 1;
+}
+
+// ============================================================================
+// 网络状态查询
+// ============================================================================
+
+/// 单个节点的网络信息（用于拓扑图展示）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfoDto {
+    pub peer_id: String,
+    /// 是否在线（当前有连接）
+    pub connected: bool,
+    /// 是否为中继节点
+    pub is_relay: bool,
+    /// 是否为 bootstrap 节点
+    pub is_bootstrap: bool,
+    /// 是否为本节点自身
+    pub is_self: bool,
+}
+
+/// 网络状态汇总（前端网络监控组件使用）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NetworkStatusData {
+    /// 错误码（OK 表示无错误）。取值见前端展示文档
+    pub error_code: String,
+    /// 错误人类可读原因（error_code 非 OK 时非空）
+    pub error_message: Option<String>,
+    /// 是否已连接到网络（至少有一个连接）
+    pub online: bool,
+    /// 是否为计费网络（如移动热点）
+    pub is_paid_network: bool,
+    /// 计费网络检测模式："free" / "paid" / "disabled"
+    pub paid_network_mode: String,
+    /// 中继服务是否已启用
+    pub relay_enabled: bool,
+    /// 中继角色："server" / "client" / "off"（互斥）
+    pub relay_role: String,
+    /// NAT 状态："Public", "Private", "Unknown"
+    pub nat_status: String,
+    /// UPnP 状态："Enabled", "Disabled", "Unknown"
+    pub upnp_status: String,
+    /// IPv4 地址列表
+    pub ipv4: Vec<String>,
+    /// IPv6 地址列表
+    pub ipv6: Vec<String>,
+    /// 公网 IP（如果有）
+    pub public_ip: Option<String>,
+    /// 已知节点列表（含本节点）
+    pub known_peers: Vec<PeerInfoDto>,
+    /// 是否已连接了中继
+    pub relay_connected: bool,
+    /// 是否 bootstrap 已完成
+    pub bootstrap_ready: bool,
+    /// 已连接的中继节点 PeerID
+    pub connected_relay_peer: Option<String>,
+    /// 外部地址列表
+    pub external_addresses: Vec<String>,
+    /// 本节点 PeerID
+    pub local_peer_id: String,
+    /// 已连接节点数
+    pub connected_peer_count: u64,
+}
+
+impl NetworkStatusData {
+    /// 错误码常量
+    pub const OK: &'static str = "OK";
+    pub const ERR_NOT_READY: &'static str = "not_ready";
+    pub const ERR_DEGRADED_NO_PEERS: &'static str = "degraded_no_peers";
+    pub const ERR_CORE_NOT_INITIALIZED: &'static str = "core_not_initialized";
+    pub const ERR_CORE_CHANNEL_CLOSED: &'static str = "core_channel_closed";
+    pub const ERR_CORE_NO_RESPONSE: &'static str = "core_no_response";
+    pub const ERR_P2P_CHANNEL_CLOSED: &'static str = "p2p_channel_closed";
+    pub const ERR_P2P_NO_RESPONSE: &'static str = "p2p_no_response";
+
+    /// 生成包含最小完整字段集的错误 JSON（保证与 schema 一致）
+    pub fn error_json(code: &str, msg: &str) -> String {
+        serde_json::json!({
+            "error_code": code,
+            "error_message": msg,
+            "online": false,
+            "is_paid_network": false,
+            "paid_network_mode": "paid",
+            "relay_enabled": false,
+            "relay_role": "client",
+            "nat_status": "Unknown",
+            "upnp_status": "Unknown",
+            "ipv4": [],
+            "ipv6": [],
+            "public_ip": null,
+            "known_peers": [],
+            "relay_connected": false,
+            "bootstrap_ready": false,
+            "connected_relay_peer": null,
+            "external_addresses": [],
+            "local_peer_id": "",
+            "connected_peer_count": 0u64,
+        }).to_string()
+    }
+}

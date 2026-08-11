@@ -9,6 +9,9 @@ const ALLOWED_COMMANDS = new Set([
     'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'list_sent_files', 'delete_sent_file',
     'copy_file',
+    'get_network_status',
+    'export_routing_table', 'import_routing_table', 'read_text_file', 'set_paid_network',
+    'set_relay_role',
     'plugin:window|set_content_protected'
 ]);
 
@@ -41,6 +44,12 @@ const RATE_LIMITS = {
     list_sent_files: { maxCalls: 60, windowMs: 60000 },
     delete_sent_file: { maxCalls: 10, windowMs: 60000 },
     copy_file: { maxCalls: 10, windowMs: 60000 },
+    get_network_status: { maxCalls: 60, windowMs: 60000 },
+    export_routing_table: { maxCalls: 10, windowMs: 60000 },
+    import_routing_table: { maxCalls: 10, windowMs: 60000 },
+    read_text_file: { maxCalls: 30, windowMs: 60000 },
+    set_paid_network: { maxCalls: 30, windowMs: 60000 },
+    set_relay_role: { maxCalls: 30, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -220,6 +229,32 @@ const VALIDATORS = {
         }
         if (p.relayNodes.length > 50) return 'Too many relay nodes (max 50)';
         if (p.bootstrapNodes.length > 50) return 'Too many bootstrap nodes (max 50)';
+        return null;
+    },
+    get_network_status: () => null,
+    export_routing_table: (p) => {
+        if (typeof p.savePath !== 'string' || p.savePath.length === 0) return 'savePath required';
+        if (p.savePath.length > 4096) return 'savePath too long';
+        if (/\.\./.test(p.savePath)) return 'path traversal not allowed';
+        return null;
+    },
+    import_routing_table: (p) => {
+        if (typeof p.data !== 'string' || p.data.length === 0) return 'data required';
+        if (p.data.length > 10485760) return 'data exceeds 10MB limit';
+        return null;
+    },
+    read_text_file: (p) => {
+        if (typeof p.path !== 'string' || p.path.length === 0) return 'path required';
+        if (p.path.length > 4096) return 'path too long';
+        if (/\.\./.test(p.path)) return 'path traversal not allowed';
+        return null;
+    },
+    set_paid_network: (p) => {
+        if (!['free', 'paid', 'disabled'].includes(p.mode)) return 'mode must be free/paid/disabled';
+        return null;
+    },
+    set_relay_role: (p) => {
+        if (!['server', 'client', 'off'].includes(p.role)) return 'role must be server/client/off';
         return null;
     },
 };

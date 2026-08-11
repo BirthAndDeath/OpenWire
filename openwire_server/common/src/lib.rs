@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libp2p::futures::StreamExt;
-use libp2p::kad::{self, Config as KadConfig, store::MemoryStore};
+use libp2p::kad::{self, Config as KadConfig};
 use libp2p::request_response::{Config as RrConfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::multiaddr::Protocol;
@@ -15,7 +16,8 @@ use libp2p::{
 };
 
 use openwire_core::p2p::dht_cache::DhtCache;
-use openwire_core::p2p::netevent::{NetEventRequest, NetEventResponse};
+use openwire_core::p2p::netevent::{NackReason, NetEventRequest, NetEventResponse};
+use openwire_core::server_redb_store::RedbRecordStore;
 
 const DHT_RELAY_INDEX_KEY: &str = "relay_nodes_public";
 const PROTOCOL_KAD: StreamProtocol = StreamProtocol::new("/chat/kad/0.0.1");
@@ -24,7 +26,7 @@ const PROTOCOL_NETEVENT: StreamProtocol = StreamProtocol::new("/chat/rr_netevent
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
     relay: relay::Behaviour,
-    kademlia: kad::Behaviour<MemoryStore>,
+    kademlia: kad::Behaviour<RedbRecordStore>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     rr_netevent: cbor::Behaviour<NetEventRequest, NetEventResponse>,
@@ -77,6 +79,25 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
 
     let dht_cache = DhtCache::new();
 
+    // 打开持久化 Kademlia 存储，服务器重启后路由表不丢失
+    // 先以 0600 权限创建文件，再交由 redb 打开，避免路由表文件对其他用户可读
+    let db_path = dir.join("dht.redb");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&db_path)
+            .map_err(|e| anyhow::anyhow!("创建 DHT 数据库失败 {}: {e}", db_path.display()))?;
+        drop(file);
+    }
+    let db = Arc::new(
+        redb::Database::create(&db_path)
+            .map_err(|e| anyhow::anyhow!("创建 DHT 数据库失败 {}: {e}", db_path.display()))?,
+    );
     let mut swarm = SwarmBuilder::with_existing_identity(kp)
         .with_tokio()
         .with_tcp(
@@ -102,8 +123,11 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             let relay = relay::Behaviour::new(key.public().to_peer_id(), relay_cfg);
 
             let pid = key.public().to_peer_id();
-            let mut kademlia =
-                kad::Behaviour::with_config(pid, MemoryStore::new(pid), kad_config.clone());
+            let mut kademlia = kad::Behaviour::with_config(
+                pid,
+                RedbRecordStore::new(db.clone()),
+                kad_config.clone(),
+            );
 
             // 向 bootstrap 节点注册，但排除自身（避免自引用）
             // 如果所有 bootstrap 节点都是自身，则跳过 bootstrap 注册，
@@ -143,6 +167,8 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
 
             let limits = connection_limits::Behaviour::new(
                 connection_limits::ConnectionLimits::default()
+                    .with_max_pending_incoming(Some(100))
+                    .with_max_pending_outgoing(Some(50))
                     .with_max_established_incoming(Some(500))
                     .with_max_established_outgoing(Some(50)),
             );
@@ -189,6 +215,7 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
 
     let mut friend_online_rate: HashMap<PeerId, Instant> = HashMap::new();
     const FRIEND_ONLINE_COOLDOWN: Duration = Duration::from_secs(5);
+    const FRIEND_ONLINE_RATE_MAX: usize = 10_000;
 
     loop {
         match swarm.select_next_some().await {
@@ -220,12 +247,17 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                         signature,
                         ..
                     } => {
+                        // 校验 PeerID 与签名：无效请求返回 Nack，不缓存
+                        let mut response = NetEventResponse::Ack;
                         if *peer_id != peer.to_string() {
                             tracing::warn!(
                                 "relay FriendOnline PeerID mismatch: claimed={}, actual={}",
                                 peer_id,
                                 peer
                             );
+                            response = NetEventResponse::Nack {
+                                reason: NackReason::PeerIdMismatch,
+                            };
                         } else if let Some(sig) = signature {
                             if !openwire_core::p2p::netevent::verify_friend_online_signature(
                                 mldsa_pubkey_hex,
@@ -238,11 +270,35 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                                     "relay FriendOnline signature verification failed for {}..",
                                     &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
                                 );
-                            } else if friend_online_rate
+                                response = NetEventResponse::Nack {
+                                    reason: NackReason::SignatureVerificationFailed,
+                                };
+                            }
+                        } else {
+                            // 开发版本不做旧版本兼容：无签名请求直接拒绝，防止伪造 pubkey 毒化缓存
+                            tracing::warn!(
+                                "relay FriendOnline without signature rejected for {}..",
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
+                            );
+                            response = NetEventResponse::Nack {
+                                reason: NackReason::SignatureVerificationFailed,
+                            };
+                        }
+                        // 请求有效且通过校验后，受 5s 限流保护地写入缓存
+                        if matches!(response, NetEventResponse::Ack) {
+                            if friend_online_rate
                                 .get(&peer)
                                 .map_or(true, |last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
                             {
                                 let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                                // 限流 map 达到上限时淘汰任意条目，防止恶意 PeerID 无限占满内存
+                                if friend_online_rate.len() >= FRIEND_ONLINE_RATE_MAX
+                                    && !friend_online_rate.contains_key(&peer)
+                                    && let Some(evict) = friend_online_rate.keys().next().copied()
+                                {
+                                    friend_online_rate.remove(&evict);
+                                    tracing::debug!("FriendOnline rate map at capacity, evicted {evict}");
+                                }
                                 friend_online_rate.insert(peer, Instant::now());
                                 tracing::info!(
                                     "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
@@ -252,24 +308,11 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                             } else {
                                 tracing::debug!("FriendOnline rate limited for {}", peer);
                             }
-                        } else if friend_online_rate
-                            .get(&peer)
-                            .map_or(true, |last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
-                        {
-                            let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
-                            friend_online_rate.insert(peer, Instant::now());
-                            tracing::info!(
-                                "=== RELAY CACHED FriendOnline (unsigned): {}.. -> {} ===",
-                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
-                                peer
-                            );
-                        } else {
-                            tracing::debug!("FriendOnline rate limited for {}", peer);
                         }
                         let _ = swarm
                             .behaviour_mut()
                             .rr_netevent
-                            .send_response(channel, NetEventResponse::Ack);
+                            .send_response(channel, response);
                     }
                     NetEventRequest::DiscoverPeer { mldsa_pubkey_hex } => {
                         let peer_id = dht_cache

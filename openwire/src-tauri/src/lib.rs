@@ -740,6 +740,100 @@ async fn is_keyring_available() -> Result<bool, String> {
     Ok(available)
 }
 
+/// 查询网络状态（用于前端网络监控组件）
+#[tauri::command]
+async fn get_network_status(state: tauri::State<'_, AppData>) -> Result<String, String> {
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+    let Some(cmd_tx) = cmd_tx else {
+        return Ok(openwire_core::NetworkStatusData::error_json(
+            openwire_core::NetworkStatusData::ERR_CORE_NOT_INITIALIZED,
+            "OpenWire core is not initialized yet",
+        ));
+    };
+
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = cmd_tx
+        .try_send(openwire_core::ChatCommand::GetNetworkStatus { resp: resp_tx })
+    {
+        return Ok(openwire_core::NetworkStatusData::error_json(
+            openwire_core::NetworkStatusData::ERR_CORE_CHANNEL_CLOSED,
+            &format!("Core command channel closed: {}", e),
+        ));
+    }
+
+    match resp_rx.await {
+        Ok(json) => Ok(json),
+        Err(e) => Ok(openwire_core::NetworkStatusData::error_json(
+            openwire_core::NetworkStatusData::ERR_CORE_NO_RESPONSE,
+            &format!("Core did not respond to status query: {}", e),
+        )),
+    }
+}
+
+/// 导出路由表到指定文件（仅含 PeerID 和 Multiaddr，不含任何密钥）
+#[tauri::command]
+async fn export_routing_table(
+    state: tauri::State<'_, AppData>,
+    save_path: String,
+) -> Result<String, String> {
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+
+    let raw_path = std::path::PathBuf::from(&save_path);
+    // 先创建父目录，确保 canonicalize 能成功
+    if let Some(parent) = raw_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        }
+    }
+    let resolved = reject_sensitive_path(&raw_path)?;
+
+    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .try_send(openwire_core::ChatCommand::ExportRoutingTable { resp: resp_tx })
+        .map_err(|e| format!("发送导出命令失败: {}", e))?;
+
+    let json = resp_rx
+        .await
+        .map_err(|_| "核心未响应导出请求".to_string())?;
+
+    std::fs::write(&resolved, &json).map_err(|e| format!("写入导出文件失败: {}", e))?;
+    tracing::info!("路由表已导出到 {:?} ({} bytes)", resolved, json.len());
+    Ok(json)
+}
+
+/// 导入路由表（将导出的 peers 加入本地路由表，不覆盖本地密钥/配置）
+#[tauri::command]
+async fn import_routing_table(
+    state: tauri::State<'_, AppData>,
+    data: String,
+) -> Result<String, String> {
+    if data.len() > 10 * 1024 * 1024 {
+        return Err("路由表文件过大".to_string());
+    }
+
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .try_send(openwire_core::ChatCommand::ImportRoutingTable { data, resp: resp_tx })
+        .map_err(|e| format!("发送导入命令失败: {}", e))?;
+
+    resp_rx
+        .await
+        .map_err(|_| "核心未响应导入请求".to_string())
+}
+
 pub struct AppData {
     pub inner: Arc<RwLock<AppDataInner>>,
 }
@@ -926,6 +1020,93 @@ fn cleanup_old_backgrounds(dir: &std::path::Path, keep: &std::path::Path) {
     }
 }
 
+/// 校验路径不指向系统敏感目录（服务端防线，防止绕过对话框/dir-isolation 直接读写系统文件）。
+/// 返回规范化的路径（用于后续写入，避免 TOCTOU）。
+/// 若路径不存在，尝试规范化最近存在的父目录；若完全不可解析，则回退到原始路径。
+fn reject_sensitive_path(p: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let canon = p
+        .canonicalize()
+        .or_else(|_| -> Result<std::path::PathBuf, String> {
+            // 文件不存在（如导出新建文件），尝试规范化父目录
+            let parent = p.parent().ok_or_else(|| format!("无法解析路径: {}", p.display()))?;
+            let canon_parent = parent
+                .canonicalize()
+                .map_err(|_| format!("无法解析路径: {}", p.display()))?;
+            Ok(canon_parent.join(p.file_name().unwrap_or_default()))
+        })?;
+    let s = canon.to_string_lossy().to_lowercase();
+    #[cfg(windows)]
+    {
+        if s.contains(":\\windows")
+            || s.contains(":\\program files")
+            || s.contains(":\\documents and settings")
+            || s.contains("\\windows\\")
+        {
+            return Err("不允许访问系统敏感路径".to_string());
+        }
+        if s.contains("\\users\\") && s.contains("\\.ssh") {
+            return Err("不允许访问用户私钥目录".to_string());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if s.starts_with("/etc/")
+            || s.starts_with("/usr/")
+            || s.starts_with("/var/")
+            || s.starts_with("/root/")
+            || s.starts_with("/bin/")
+            || s.starts_with("/sbin/")
+        {
+            return Err("不允许访问系统敏感路径".to_string());
+        }
+        if s.contains("/.ssh/") || s.contains("/.gnupg/") || s.contains("/.aws/") {
+            return Err("不允许访问用户凭据目录".to_string());
+        }
+    }
+    Ok(canon)
+}
+
+/// 读取文本文件（用户通过对话框选择的导入文件）
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    let resolved = reject_sensitive_path(std::path::Path::new(&path))?;
+    std::fs::read_to_string(&resolved).map_err(|e| format!("read file failed: {}", e))
+}
+
+/// 设置计费网络检测模式（free / paid / disabled）
+#[tauri::command]
+async fn set_paid_network(state: tauri::State<'_, AppData>, mode: String) -> Result<(), String> {
+    if !["free", "paid", "disabled"].contains(&mode.as_str()) {
+        return Err(format!("未知的计费网络模式: {mode}"));
+    }
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    cmd_tx
+        .try_send(openwire_core::ChatCommand::SetPaidNetworkMode(mode))
+        .map_err(|e| format!("发送命令失败: {}", e))?;
+    Ok(())
+}
+
+/// 设置中继角色（server / client / off，互斥）
+#[tauri::command]
+async fn set_relay_role(state: tauri::State<'_, AppData>, role: String) -> Result<(), String> {
+    if !["server", "client", "off"].contains(&role.as_str()) {
+        return Err(format!("未知的中继角色: {role}"));
+    }
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    cmd_tx
+        .try_send(openwire_core::ChatCommand::SetRelayRole(role))
+        .map_err(|e| format!("发送命令失败: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn get_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1019,7 +1200,13 @@ pub fn run() {
             list_sent_files,
             delete_sent_file,
 copy_file,
-            get_version
+            get_version,
+            get_network_status,
+            export_routing_table,
+            import_routing_table,
+read_text_file,
+            set_paid_network,
+            set_relay_role
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

@@ -4,7 +4,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{Config as rrconfig, ProtocolSupport, cbor, cbor::codec::Codec};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, autonat, connection_limits, dcutr, identify, mdns,
-    memory_connection_limits, noise, ping, tcp, yamux,
+    memory_connection_limits, noise, ping, relay, tcp, yamux,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -153,6 +153,19 @@ pub fn swarm_init(
                 let identify = identify::Behaviour::new(identify_config);
                 let ping = ping::Behaviour::new(ping::Config::new());
                 let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+                let relay_server = relay::Behaviour::new(
+                    key.public().to_peer_id(),
+                    relay::Config {
+                        max_circuits: 20,
+                        max_circuits_per_peer: 3,
+                        max_reservations: 30,
+                        max_reservations_per_peer: 2,
+                        reservation_duration: Duration::from_secs(3600),
+                        max_circuit_duration: Duration::from_secs(1800),
+                        max_circuit_bytes: 50 << 20, // 50 MiB
+                        ..Default::default()
+                    },
+                );
                 let limits = connection_limits::Behaviour::new(
                     connection_limits::ConnectionLimits::default()
                         .with_max_pending_incoming(Some(50))
@@ -176,6 +189,7 @@ pub fn swarm_init(
                     ping,
                     identify,
                     relay_client: relay_behaviour,
+                    relay_server,
                     dcutr,
                     limits,
                     memory_limits,

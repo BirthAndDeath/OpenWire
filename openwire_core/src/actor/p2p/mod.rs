@@ -40,6 +40,7 @@ use crate::p2p::dht_cache::DhtCache;
 use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
 use crate::p2p::{self, DHT_PROVIDER_CALLBACKS};
 use crate::{ChatMessage, ChatResponse};
+use crate::command::NetworkStatusData;
 
 use self::swarm_ops as p2p_swarm_ops;
 
@@ -123,10 +124,33 @@ pub enum P2pCommand {
     },
     /// 关闭
     Shutdown,
-    /// 配置中继服务（前端计费网络检测后调用）
-    RelayServerConfig {
-        /// 是否允许启用中继服务
-        allowed: bool,
+    /// 设置计费网络检测模式："free" / "paid" / "disabled"
+    /// 禁用时中继始终关闭，优先于 API 自动检测与用户手动选择
+    SetPaidNetworkMode {
+        /// 检测模式
+        mode: String,
+    },
+    /// 查询网络状态（用于前端网络监控组件）
+    GetNetworkStatus {
+        /// 响应通道：返回 JSON 序列化的 NetworkStatusData
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
+    /// 导出当前路由表（用于分享给其他节点）
+    ExportRoutingTable {
+        /// 响应通道：返回 JSON 序列化的 RoutingTableExport
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
+    /// 导入路由表（将其他节点导出的 peers 加入本地路由表）
+    ImportRoutingTable {
+        /// 导出的路由表 JSON 字符串
+        data: String,
+        /// 响应通道：返回 JSON 序列化的导入结果 { imported, error }
+        resp: tokio::sync::oneshot::Sender<String>,
+    },
+    /// 设置中继角色："server" / "client" / "off"（互斥，server 与 client 不能同时启用）
+    SetRelayRole {
+        /// 角色
+        role: String,
     },
 }
 
@@ -285,12 +309,14 @@ pub struct P2pActor {
     nat_status: autonat::NatStatus,
     /// 本节点所有监听地址（含直连地址和 /p2p-circuit 中继地址）
     listen_addrs: HashSet<libp2p::Multiaddr>,
-    /// Relay 节点配置 [(PeerId, Multiaddr)]
-    relay_nodes: Vec<(String, String)>,
+    /// Relay 节点配置 [(PeerId, Multiaddr)] —— 地址已归一化为纯传输地址（无 P2p 组件）
+    relay_nodes: Vec<(PeerId, Multiaddr)>,
+    /// Bootstrap 节点配置 [(PeerId, Multiaddr)]
+    bootstrap_nodes: Vec<(PeerId, Multiaddr)>,
     /// 当前所有已连接的 peer（含 relay 和直连），每个 peer 的引用计数
     connected_peers: HashMap<PeerId, usize>,
-    /// 通过 Identify 自动发现的 relay 候选节点 (PeerId, first_known_addr)
-    relay_candidates: Vec<(PeerId, libp2p::Multiaddr)>,
+    /// 通过 Identify 自动发现的 relay 候选节点 (PeerId, addr, added_at)
+    relay_candidates: Vec<(PeerId, libp2p::Multiaddr, std::time::Instant)>,
     /// Relay 重连冷却时间（防止无限循环重试）
     relay_reconnect_cooldown_until: Option<std::time::Instant>,
     /// Relay 重连尝试次数（指数退避）
@@ -299,8 +325,17 @@ pub struct P2pActor {
     relay_server_enabled: bool,
     /// 是否允许启用中继服务（前端计费网络检测后设置）
     relay_server_allowed: bool,
+    /// 用户是否手动设置过中继角色（用于区分自动迁移与显式选择）
+    relay_role_user_configured: bool,
+    /// 当前网络是否为计费（付费/移动热点）网络
+    /// 为 true 时禁止启用中继服务，避免产生额外流量费用
+    paid_network: bool,
+    /// 计费网络检测模式："free" / "paid" / "disabled"
+    paid_network_mode: String,
     /// 已发起 reservation 请求的 relay（防重复）
     reservation_attempted: HashSet<PeerId>,
+    /// Relay DHT 查询冷却时间（防止频繁 get_providers）
+    relay_dht_query_cooldown_until: Option<std::time::Instant>,
 
     // ====== PathRanker 协议状态 ======
     // 注意：当前仅处理入站评分查询（ScoreRequest），无出站查询。
@@ -317,6 +352,11 @@ pub struct P2pActor {
 
     /// 追踪待发送请求的 request_id → message_hash 映射
     pending_requests: HashMap<OutboundRequestId, String>,
+
+    /// UPnP 检测结果状态
+    upnp_state: String,
+    /// 中继角色："server" / "client" / "off"（互斥）
+    relay_role: String,
 }
 
 impl P2pActor {
@@ -326,7 +366,8 @@ impl P2pActor {
         dht_cache: Arc<DhtCache>,
         data_dir: std::path::PathBuf,
         event_tx: mpsc::Sender<P2pEvent>,
-        relay_nodes: Vec<(String, String)>,
+        relay_nodes: Vec<(PeerId, Multiaddr)>,
+        bootstrap_nodes: Vec<(PeerId, Multiaddr)>,
     ) -> Self {
         Self {
             swarm,
@@ -341,15 +382,22 @@ impl P2pActor {
             nat_status: autonat::NatStatus::Unknown,
             listen_addrs: HashSet::new(),
             relay_nodes,
+            bootstrap_nodes,
             relay_candidates: Vec::new(),
             relay_reconnect_cooldown_until: None,
             relay_reconnect_attempt: 0,
             relay_server_enabled: false,
             relay_server_allowed: false,
+            relay_role_user_configured: false,
+            paid_network: true,
+            paid_network_mode: "paid".to_string(),
             reservation_attempted: HashSet::new(),
+            relay_dht_query_cooldown_until: None,
             dht_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DHT_QUERIES)),
             bootstrap_ready_sent: false,
             pending_requests: HashMap::new(),
+            upnp_state: "Unknown".to_string(),
+            relay_role: "client".to_string(),
         }
     }
 
@@ -405,6 +453,13 @@ impl P2pActor {
                             );
                             // 不再是公网节点，关闭中继服务
                             self.disable_relay_server();
+                            // 重置授权标志，使下次 Public 时能重新进入自动迁移块
+                            self.relay_server_allowed = false;
+                            // 如果中继角色是自动迁移的（非用户手动设置），回退到 client
+                            if !self.relay_role_user_configured && self.relay_role == "server" {
+                                self.relay_role = "client".to_string();
+                                tracing::info!("AutoNAT: relay role reverted to 'client' (was auto-migrated)");
+                            }
                             tracing::info!("AutoNAT: switching Kademlia to Client mode (NATed)");
                             self.swarm
                                 .behaviour_mut()
@@ -557,6 +612,32 @@ impl P2pActor {
                     _ => {}
                 }
             }
+            SwarmEvent::Behaviour(MyBehaviourEvent::RelayServer(event)) => {
+                match event {
+                    relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                        tracing::info!("Relay server: reservation from {}", src_peer_id);
+                    }
+                    relay::Event::ReservationReqDenied { src_peer_id, .. } => {
+                        tracing::warn!("Relay server: reservation denied for {}", src_peer_id);
+                    }
+                    relay::Event::ReservationClosed { src_peer_id } => {
+                        tracing::info!("Relay server: reservation closed for {}", src_peer_id);
+                    }
+                    relay::Event::ReservationTimedOut { src_peer_id } => {
+                        tracing::warn!("Relay server: reservation timed out for {}", src_peer_id);
+                    }
+                    relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. } => {
+                        tracing::debug!("Relay server: circuit {} -> {}", src_peer_id, dst_peer_id);
+                    }
+                    relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, .. } => {
+                        tracing::warn!("Relay server: circuit denied {} -> {}", src_peer_id, dst_peer_id);
+                    }
+                    relay::Event::CircuitClosed { src_peer_id, dst_peer_id, .. } => {
+                        tracing::debug!("Relay server: circuit closed {} -> {}", src_peer_id, dst_peer_id);
+                    }
+                    _ => {}
+                }
+            }
 
             // --- rr_netevent: 出站失败 ---
             SwarmEvent::Behaviour(MyBehaviourEvent::RrNetevent(
@@ -627,7 +708,7 @@ impl P2pActor {
                 // AutoRelay: 检测 peer 是否支持中继 hop 协议
                 if info.protocols.contains(&RELAY_HOP_PROTOCOL) {
                     let already_known =
-                        self.relay_candidates.iter().any(|(pid, _)| *pid == peer_id);
+                        self.relay_candidates.iter().any(|(pid, _, _)| *pid == peer_id);
                     if !already_known && self.relay_candidates.len() < MAX_RELAY_CANDIDATES {
                         // 选择第一个非 loopback / 非 circuit 地址，避免拨号到不可达地址
                         let first_usable = info.listen_addrs.iter().find(|a| {
@@ -643,7 +724,9 @@ impl P2pActor {
                             );
                             return;
                         };
-                        self.relay_candidates.push((peer_id, selected_addr.clone()));
+                        // 归一化为纯传输地址（剥离 P2p 组件），保证存储不变量
+                        let selected_addr = relay_handler::strip_p2p(&selected_addr);
+                        self.relay_candidates.push((peer_id, selected_addr.clone(), std::time::Instant::now()));
                             tracing::debug!(
                                 "Discovered relay-capable candidate: {} at {}",
                                 peer_id,
@@ -659,8 +742,10 @@ impl P2pActor {
                     }
                     // Identify 完成后，对所有 relay 节点请求 circuit reservation
                     // 与官方 DCUtR 示例一致：dial → Identify → listen_on(relay_addr.with(P2pCircuit))
-                    if self.reservation_attempted.insert(peer_id) {
-                        self.on_relay_connected(&peer_id);
+                    if !self.reservation_attempted.contains(&peer_id) {
+                        if self.on_relay_connected(&peer_id) {
+                            self.reservation_attempted.insert(peer_id);
+                        }
                     }
                 }
                 self.send_event(P2pEvent::IdentifyReceived {
@@ -832,15 +917,21 @@ impl P2pActor {
             SwarmEvent::Behaviour(MyBehaviourEvent::Upnp(event)) => {
                 match event {
                     libp2p::upnp::Event::NewExternalAddr(addr) => {
+                        self.upnp_state = "Enabled".to_string();
                         tracing::info!("UPnP: mapped external address {addr}");
                     }
                     libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
+                        if matches!(self.upnp_state.as_str(), "Enabled" | "Unknown") {
+                            self.upnp_state = "Disabled".to_string();
+                        }
                         tracing::warn!("UPnP: port mapping expired for {addr}");
                     }
                     libp2p::upnp::Event::GatewayNotFound => {
+                        self.upnp_state = "NotSupported".to_string();
                         tracing::warn!("UPnP: no IGD gateway found on this network");
                     }
                     libp2p::upnp::Event::NonRoutableGateway => {
+                        self.upnp_state = "Disabled".to_string();
                         tracing::warn!("UPnP: gateway does not support port mapping");
                     }
                 }
@@ -985,13 +1076,12 @@ impl P2pActor {
                                 if !self.relay_connections.contains(provider) {
                                     // 将 DHT 发现的 relay 加入候选列表，由 dial_relay_nodes 统一管理
                                     let already_candidate = self.relay_candidates.iter()
-                                        .any(|(pid, _)| pid == provider);
+                                        .any(|(pid, _, _)| pid == provider);
                                     if !already_candidate && self.relay_candidates.len() < MAX_RELAY_CANDIDATES {
-                                        // 使用仅含 peer ID 的地址，由 Kademlia 路由表解析实际传输地址
+                                        // 仅记录 PeerId，传输地址待 Kademlia 路由表解析；
+                                        // strip_p2p 后为空地址，dial_relay_nodes 的传输层检查会跳过它
                                         // 不能使用 /p2p-circuit 占位，否则会形成 "通过中继拨号到中继" 的循环依赖
-                                        let p2p_addr = Multiaddr::empty()
-                                            .with(Protocol::P2p(*provider));
-                                        self.relay_candidates.push((*provider, p2p_addr));
+                                        self.relay_candidates.push((*provider, Multiaddr::empty(), std::time::Instant::now()));
                                         tracing::debug!("DHT relay {} added to candidates", provider);
                                     }
                                 }
@@ -1037,6 +1127,11 @@ impl P2pActor {
                     self.bootstrap_ready_sent = true;
                     tracing::info!("=== BOOTSTRAP OK: DHT bootstrap completed ===");
                     let _ = self.event_tx.try_send(P2pEvent::BootstrapReady);
+                }
+                // DHT 就绪后重试 start_providing（可能在 bootstrap 前因路由表为空而失败）
+                if self.relay_server_allowed && !self.relay_server_enabled {
+                    tracing::debug!("DHT bootstrap completed, retrying relay server start_providing");
+                    self.try_enable_relay_server();
                 }
             }
 
@@ -1114,21 +1209,16 @@ impl P2pActor {
                     // 先通过已连接的 relay 逐个尝试 circuit 拨号
                     let mut circuit_dialed = false;
                     for relay_pid in &self.relay_connections {
-                        // 从候选节点或配置节点中查找 relay 的传输地址
+                        // 从候选节点或配置节点中查找 relay 的传输地址（均已归一化为纯传输地址）
                         let relay_addr = self.relay_candidates.iter()
-                            .find(|(pid, _)| pid == relay_pid)
-                            .map(|(_, addr)| addr.clone())
+                            .find(|(pid, _, _)| pid == relay_pid)
+                            .map(|(_, addr, _)| addr.clone())
                             .or_else(|| {
-                                self.relay_nodes.iter().find_map(|(pid_str, addr_str)| {
-                                    let pid = pid_str.parse::<PeerId>().ok()?;
-                                    if pid == *relay_pid {
-                                        addr_str.parse::<Multiaddr>().ok()
-                                    } else {
-                                        None
-                                    }
-                                })
+                                self.relay_nodes.iter()
+                                    .find_map(|(pid, addr)| (*pid == *relay_pid).then(|| addr.clone()))
                             });
                         if let Some(addr) = relay_addr {
+                            // addr 已归一化（无 P2p 组件），安全追加 P2p + P2pCircuit + 目标 P2p
                             let circuit_addr = addr
                                 .with(Protocol::P2p(*relay_pid))
                                 .with(Protocol::P2pCircuit)
@@ -1167,9 +1257,7 @@ impl P2pActor {
                 // 向所有已连接的中继节点发送 DiscoverPeer 查询
                 let relay_peers: Vec<PeerId> = self.relay_nodes
                     .iter()
-                    .filter_map(|(pid_str, _)| {
-                        pid_str.parse::<PeerId>().ok()
-                    })
+                    .map(|(pid, _)| *pid)
                     .filter(|pid| self.swarm.is_connected(pid))
                     .collect();
                 if relay_peers.is_empty() {
@@ -1187,24 +1275,351 @@ impl P2pActor {
                 tracing::info!("P2pActor shutting down...");
                 self.disable_relay_server();
             }
-            P2pCommand::RelayServerConfig { allowed } => {
-                self.relay_server_allowed = allowed;
-                if allowed {
-                    // 如果当前是公网状态，尝试重新启用中继
-                    if matches!(self.nat_status, autonat::NatStatus::Public(_)) {
-                        self.try_enable_relay_server();
-                    }
-                } else {
+            P2pCommand::SetPaidNetworkMode { mode } => {
+                let paid = match mode.as_str() {
+                    "free" => false,
+                    "paid" | "disabled" => true,
+                    _ => { tracing::warn!("unknown paid_network_mode: {mode}"); return; }
+                };
+                self.paid_network_mode = mode;
+                self.paid_network = paid;
+                if paid {
+                    tracing::info!("Paid/disabled network: turning off relay server");
                     self.disable_relay_server();
+                } else {
+                    tracing::info!("Free network: re-evaluating relay server");
+                    self.try_enable_relay_server();
                 }
+            }
+            P2pCommand::SetRelayRole { role } => {
+                self.set_relay_role(&role);
+            }
+            P2pCommand::GetNetworkStatus { resp } => {
+                let status = self.build_network_status();
+                let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+                let _ = resp.send(json);
+            }
+            P2pCommand::ExportRoutingTable { resp } => {
+                let export = self.build_routing_table_export();
+                let json = serde_json::to_string(&export).unwrap_or_else(|_| "{}".to_string());
+                let _ = resp.send(json);
+            }
+            P2pCommand::ImportRoutingTable { data, resp } => {
+                let result = self.import_routing_table(&data);
+                let _ = resp.send(result);
             }
         }
     }
-}
 
-// ============================================================================
-// P2pActor 构建器
-// ============================================================================
+    /// 构建网络状态数据（用于前端网络监控组件）
+    fn build_network_status(&mut self) -> crate::command::NetworkStatusData {
+        let local_peer_id = self.swarm.local_peer_id().to_base58();
+        let online = !self.connected_peers.is_empty();
+        let nat_status_str = match &self.nat_status {
+            autonat::NatStatus::Public(_) => "Public".to_string(),
+            autonat::NatStatus::Private => "Private".to_string(),
+            autonat::NatStatus::Unknown => "Unknown".to_string(),
+        };
+
+        let (error_code, error_message) = if online {
+            ("OK".to_string(), None)
+        } else if self.bootstrap_ready_sent {
+            (crate::command::NetworkStatusData::ERR_DEGRADED_NO_PEERS.to_string(), Some("Network is up but no peers are connected".to_string()))
+        } else {
+            (crate::command::NetworkStatusData::ERR_NOT_READY.to_string(), Some("Core is initializing, no network connections yet".to_string()))
+        };
+
+        let public_ip = match &self.nat_status {
+            autonat::NatStatus::Public(addr) => Some(addr.to_string()),
+            _ => None,
+        };
+
+        let mut ipv4: Vec<String> = Vec::new();
+        let mut ipv6: Vec<String> = Vec::new();
+        for addr in &self.listen_addrs {
+            let s = addr.to_string();
+            if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip4(_))) {
+                if !ipv4.contains(&s) { ipv4.push(s.clone()); }
+            }
+            if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::Ip6(_))) {
+                if !ipv6.contains(&s) { ipv6.push(s); }
+            }
+        }
+
+        let relay_connected = !self.relay_connections.is_empty();
+        let connected_relay_peer = self.relay_connections.iter().next().map(|p| p.to_base58());
+
+        let external_addresses: Vec<String> = self.swarm.external_addresses().map(|a| a.to_string()).collect();
+
+        // UPnP 状态来自行为事件跟踪（Enabled/Disabled/NotSupported），
+        // 仅在从未收到任何 UPnP 事件时回退到外部地址启发式判断
+        let upnp_status = if self.upnp_state != "Unknown" {
+            self.upnp_state.clone()
+        } else if external_addresses.iter().any(|a| a.contains("/ip4/")) {
+            "Enabled".to_string()
+        } else {
+            "Unknown".to_string()
+        };
+
+        let bootstrap_node_set: std::collections::HashSet<PeerId> =
+            self.bootstrap_nodes.iter().map(|(pid, _)| *pid).collect();
+
+        let local_pid = *self.swarm.local_peer_id();
+
+        let mut known_peers: Vec<crate::command::PeerInfoDto> = Vec::new();
+
+        known_peers.push(crate::command::PeerInfoDto {
+            peer_id: local_peer_id.clone(),
+            connected: true,
+            is_relay: false,
+            is_bootstrap: false,
+            is_self: true,
+        });
+
+        for (peer_id, _count) in &self.connected_peers {
+            if *peer_id == local_pid {
+                continue;
+            }
+            let is_relay = self.relay_connections.contains(peer_id)
+                || self.relay_nodes.iter().any(|(pid, _)| pid == peer_id);
+            let is_bootstrap = bootstrap_node_set.contains(peer_id);
+            known_peers.push(crate::command::PeerInfoDto {
+                peer_id: peer_id.to_base58(),
+                connected: true,
+                is_relay,
+                is_bootstrap,
+                is_self: false,
+            });
+        }
+
+        // A2: 补充路由表已知但未连接的节点（kademlia kbuckets）
+        {
+            let kademlia = &mut self.swarm.behaviour_mut().kademlia;
+            for bucket in kademlia.kbuckets() {
+                for entry in bucket.iter() {
+                    let pid = entry.node.key.preimage();
+                    if *pid == local_pid || self.connected_peers.contains_key(pid) {
+                        continue;
+                    }
+                    known_peers.push(crate::command::PeerInfoDto {
+                        peer_id: pid.to_base58(),
+                        connected: false,
+                        is_relay: self.relay_nodes.iter().any(|(rp, _)| rp == pid),
+                        is_bootstrap: bootstrap_node_set.contains(pid),
+                        is_self: false,
+                    });
+                }
+            }
+        }
+
+        let relay_enabled = self.relay_server_enabled;
+        let bootstrap_ready = self.bootstrap_ready_sent;
+
+        crate::command::NetworkStatusData {
+            error_code,
+            error_message,
+            online,
+            is_paid_network: self.paid_network,
+            paid_network_mode: self.paid_network_mode.clone(),
+            relay_enabled,
+            relay_role: self.relay_role.clone(),
+            nat_status: nat_status_str,
+            upnp_status,
+            ipv4,
+            ipv6,
+            public_ip,
+            known_peers,
+            relay_connected,
+            bootstrap_ready,
+            connected_relay_peer,
+            external_addresses,
+            local_peer_id,
+            connected_peer_count: self.connected_peers.len() as u64,
+        }
+    }
+
+    /// 构建路由表导出数据（含本节点 + 路由表已知节点 + bootstrap/relay 节点）
+    fn build_routing_table_export(&mut self) -> crate::command::RoutingTableExport {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let local_pid = *self.swarm.local_peer_id();
+
+        let mut self_addresses: Vec<String> = self.listen_addrs.iter().map(|a| a.to_string()).collect();
+        for a in self.swarm.external_addresses() {
+            let s = a.to_string();
+            if !self_addresses.contains(&s) {
+                self_addresses.push(s);
+            }
+        }
+
+        let bootstrap_set: std::collections::HashSet<PeerId> =
+            self.bootstrap_nodes.iter().map(|(pid, _)| *pid).collect();
+        let relay_set: std::collections::HashSet<PeerId> =
+            self.relay_nodes.iter().map(|(pid, _)| *pid).collect();
+
+        let mut seen: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+        let mut peers: Vec<crate::command::RoutingTableExportPeer> = Vec::new();
+
+        // 1. 活跃连接节点（含 bootstrap/relay 标记）
+        for (pid, _) in &self.connected_peers {
+            if *pid == local_pid || seen.contains(pid) {
+                continue;
+            }
+            seen.insert(*pid);
+            let addrs = self.dht_cache.get_multiaddrs(pid).unwrap_or_default();
+            peers.push(crate::command::RoutingTableExportPeer {
+                peer_id: pid.to_base58(),
+                addresses: addrs.iter().map(|a| a.to_string()).collect(),
+                is_bootstrap: bootstrap_set.contains(pid),
+                is_relay: relay_set.contains(pid) || self.relay_connections.contains(pid),
+            });
+        }
+
+        // 2. 路由表已知节点（kbuckets）
+        let kademlia = &mut self.swarm.behaviour_mut().kademlia;
+        for bucket in kademlia.kbuckets() {
+            for entry in bucket.iter() {
+                let pid = entry.node.key.preimage();
+                if *pid == local_pid || seen.contains(pid) {
+                    continue;
+                }
+                seen.insert(*pid);
+                let addrs: Vec<String> = entry.node.value.iter().map(|a| a.to_string()).collect();
+                if !addrs.is_empty() {
+                    peers.push(crate::command::RoutingTableExportPeer {
+                        peer_id: pid.to_base58(),
+                        addresses: addrs,
+                        is_bootstrap: bootstrap_set.contains(pid),
+                        is_relay: relay_set.contains(pid),
+                    });
+                }
+            }
+        }
+
+        // 3. 未在线且不在路由表但已配置的 bootstrap/relay 节点（公网节点）
+        for (pid, addr) in self.bootstrap_nodes.iter().chain(self.relay_nodes.iter()) {
+            if *pid == local_pid || seen.contains(pid) {
+                continue;
+            }
+            seen.insert(*pid);
+            peers.push(crate::command::RoutingTableExportPeer {
+                peer_id: pid.to_base58(),
+                addresses: vec![addr.to_string()],
+                is_bootstrap: bootstrap_set.contains(pid),
+                is_relay: relay_set.contains(pid),
+            });
+        }
+
+        crate::command::RoutingTableExport {
+            version: crate::command::RoutingTableExport::CURRENT_VERSION,
+            exported_at: now,
+            self_peer_id: local_pid.to_base58(),
+            self_addresses,
+            peers,
+        }
+    }
+
+    /// 导入路由表：将导出的 peers 加入 kademlia 路由表
+    fn import_routing_table(&mut self, json: &str) -> String {
+        let export: crate::command::RoutingTableExport = match serde_json::from_str(json) {
+            Ok(e) => e,
+            Err(e) => {
+                return serde_json::json!({
+                    "imported": 0,
+                    "error": format!("invalid export file: {}", e)
+                }).to_string();
+            }
+        };
+
+        if export.version == 0 || export.version > crate::command::RoutingTableExport::CURRENT_VERSION {
+            return serde_json::json!({
+                "imported": 0,
+                "error": format!("unsupported version: {}", export.version)
+            }).to_string();
+        }
+
+        let mut imported = 0u32;
+        let mut errors: Vec<String> = Vec::new();
+        const MAX_IMPORT_ADDRESSES: u32 = 10_000;
+
+        fn is_valid_routing_addr(addr: &Multiaddr) -> bool {
+        // 必须有传输层协议（Tcp / QuicV1），拒绝 /p2p-circuit 等无传输地址
+        if !addr.iter().any(|p| matches!(p, Protocol::Tcp(_) | Protocol::QuicV1)) {
+            return false;
+        }
+        // 拒绝 DNS 协议（拨号时解析可指向内部地址，绕过 IP 校验）
+        if addr.iter().any(|p| matches!(p, Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_))) {
+            return false;
+        }
+        // 拒绝 loopback、私有、link-local、unspecified 地址
+        for p in addr.iter() {
+            match p {
+                Protocol::Ip4(ip) => {
+                    if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() {
+                        return false;
+                    }
+                }
+                Protocol::Ip6(ip) => {
+                    // 手动判断私有/链路本地（该 Rust 版本无 is_private/is_link_local 方法）
+                    let oct = ip.octets();
+                    let is_private_v6 = (oct[0] & 0xfe) == 0xfc; // fc00::/7 (ULA)
+                    let is_link_local_v6 = oct[0] == 0xfe && (oct[1] & 0xc0) == 0x80; // fe80::/10
+                    if ip.is_loopback() || ip.is_unspecified() || is_private_v6 || is_link_local_v6 {
+                        return false;
+                    }
+                    // IPv4-mapped IPv6 地址（::ffff:127.0.0.1 等），递归检查底层 IPv4
+                    if let Some(v4) = ip.to_ipv4_mapped() {
+                        if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified() {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    for peer in &export.peers {
+            let pid: PeerId = match peer.peer_id.parse() {
+                Ok(p) => p,
+                Err(e) => {
+                    errors.push(format!("invalid peer_id '{}': {}", &peer.peer_id[..16.min(peer.peer_id.len())], e));
+                    continue;
+                }
+            };
+            if imported >= MAX_IMPORT_ADDRESSES {
+                    errors.push("import limit reached (max 10,000 addresses)".to_string());
+                    break;
+                }
+            for addr_str in &peer.addresses {
+                let addr: Multiaddr = match addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        errors.push(format!("invalid addr for {}: {}", &peer.peer_id[..16.min(peer.peer_id.len())], e));
+                        continue;
+                    }
+                };
+                // 地址语义校验：拒绝不可路由或内部地址
+                if !is_valid_routing_addr(&addr) {
+                    errors.push(format!("unroutable addr for {}: {}", &peer.peer_id[..16.min(peer.peer_id.len())], addr));
+                    continue;
+                }
+                self.swarm.behaviour_mut().kademlia.add_address(&pid, addr.clone());
+                let _ = self.dht_cache.add_multiaddr(&pid, &addr);
+                imported += 1;
+            }
+        }
+
+        serde_json::json!({
+            "imported": imported,
+            "error": if errors.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(errors.join("; ")) }
+        }).to_string()
+    }
+}
 
 /// P2pActor 的句柄，用于向 P2pActor 发送命令和控制生命周期
 pub struct P2pActorHandle {
@@ -1261,6 +1676,7 @@ pub struct P2pActorBuilder {
     dht_cache: Option<Arc<DhtCache>>,
     data_dir: Option<std::path::PathBuf>,
     relay_nodes: Vec<(String, String)>,
+    bootstrap_nodes: Vec<(String, String)>,
     channel_size: usize,
     cancellation_token: Option<CancellationToken>,
 }
@@ -1273,6 +1689,7 @@ impl P2pActorBuilder {
             dht_cache: None,
             data_dir: None,
             relay_nodes: Vec::new(),
+            bootstrap_nodes: Vec::new(),
             channel_size: DEFAULT_CHANNEL_SIZE,
             cancellation_token: None,
         }
@@ -1302,6 +1719,12 @@ impl P2pActorBuilder {
         self
     }
 
+    /// 可选：Bootstrap 节点列表 [(PeerId, Multiaddr)]
+    pub fn bootstrap_nodes(mut self, nodes: Vec<(String, String)>) -> Self {
+        self.bootstrap_nodes = nodes;
+        self
+    }
+
     /// 可选：命令通道容量（默认 64）
     pub fn channel_size(mut self, size: usize) -> Self {
         self.channel_size = size;
@@ -1317,12 +1740,16 @@ impl P2pActorBuilder {
     /// 构建并启动 P2pActor，返回 (句柄, 事件接收器)
     pub fn start(self) -> (P2pActorHandle, mpsc::Receiver<P2pEvent>) {
         let (p2p_event_tx, p2p_event_rx) = mpsc::channel(self.channel_size);
+        // 在边界处一次性解析并归一化中继节点（丢弃无效/重复条目）
+        let relay_nodes = relay_handler::parse_relay_nodes(self.relay_nodes, "relay");
+        let bootstrap_nodes = relay_handler::parse_relay_nodes(self.bootstrap_nodes, "bootstrap");
         let actor = P2pActor::new(
             self.swarm.expect("P2pActorBuilder: swarm is required"),
             self.dht_cache.expect("P2pActorBuilder: dht_cache is required"),
             self.data_dir.expect("P2pActorBuilder: data_dir is required"),
             p2p_event_tx,
-            self.relay_nodes,
+            relay_nodes,
+            bootstrap_nodes,
         );
         let token = self.cancellation_token.unwrap_or_default();
         let handle = Self::spawn(actor, self.channel_size, token);

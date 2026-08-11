@@ -3,11 +3,9 @@
 #![warn(missing_docs)]
 
 // ============================================================
-// DHT 存储特性互斥检查：mem_dht 和 redb_dht 必须且只能选一个
+// DHT 存储特性检查：至少启用 mem_dht 或 redb_dht 之一
+// mem_dht 与 redb_dht 可共存（mem_dht 控制 DhtCache 实现，redb_dht 控制 RedbRecordStore）
 // ============================================================
-#[cfg(all(feature = "mem_dht", feature = "redb_dht"))]
-compile_error!("特性 mem_dht 和 redb_dht 是互斥的，不能同时启用（请在 Cargo.toml 的 features 中选择其中一个）");
-
 #[cfg(not(any(feature = "mem_dht", feature = "redb_dht")))]
 compile_error!("必须启用 mem_dht 或 redb_dht 特性之一（请在 Cargo.toml 的 features 中添加 mem_dht 或 redb_dht）");
 // ============================================================
@@ -52,7 +50,7 @@ pub mod storage;
 pub mod transfer;
 pub use actor::p2p::{P2pActor, P2pActorBuilder, P2pActorHandle, P2pCommand, P2pEvent};
 pub use actor::RUNTIME;
-pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, TransferProgressStatus};
+pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, NetworkStatusData, PeerInfoDto, TransferProgressStatus};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{
