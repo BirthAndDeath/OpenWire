@@ -209,4 +209,5 @@ and respond to discovery queries from their DHT cache.
 OpenWire is designed as truly P2P. Relay nodes are optional intermediaries
 for NAT traversal, not central servers. The DiscoverPeer protocol is a
 fallback for when DHT discovery fails, not a primary routing mechanism.
-dht查询好友逻辑可以进行更改，根据好友公钥sha256进行查询，减少信息暴露和流量消耗
+
+<!-- TODO: DHT 好友查询可根据好友公钥 SHA256 进行查询，减少信息暴露和流量消耗 -->

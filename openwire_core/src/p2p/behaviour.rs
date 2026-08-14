@@ -45,9 +45,9 @@ pub struct MyBehaviour {
     /// Relay 协议（NAT 穿透，Client 模式）
     pub relay_client: relay::client::Behaviour,
     /// Relay 协议（Server 模式，公网节点对外提供电路中继）
-    /// 注意：relay::Behaviour (server) 始终接受入站中继连接请求，无内部开关。
-    /// `relay_role` 与 `disable_relay_server()` 仅控制 DHT 注册（start_providing），
-    /// 不阻止已知地址的节点发起 reservation。如需完全禁用中继服务，需移除该 behaviour。
+    /// 运行时开关由本地 libp2p-relay patch 提供：`set_server_enabled(false)`
+    /// 时不安装连接 handler，完全停止服务入站 reservation/circuit 请求。
+    /// 角色（server/client/off）与计费模式（禁用）通过该开关真正控制中继服务。
     pub relay_server: relay::Behaviour,
     /// DCUtR 协议（直连升级，配合 Relay）
     pub dcutr: dcutr::Behaviour,

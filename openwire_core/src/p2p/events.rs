@@ -260,7 +260,7 @@ async fn handle_decrypted_message(
     // 按 msgtype 分发
     match request.msgtype {
         ChatMessageType::Text => {
-            handle_text_message(core, pool, sender_mldsa_pubkey_hex, decrypted_data).await;
+            handle_text_message(core, pool, sender_mldsa_pubkey_hex, &request.hash, decrypted_data).await;
         }
         ChatMessageType::FileHash => {
             handle_file_hash_message(core, pool, sender_mldsa_pubkey_hex, decrypted_data).await;
@@ -291,18 +291,14 @@ async fn handle_text_message(
     core: &mut ChatCore,
     pool: &sqlx::Pool<sqlx::Sqlite>,
     sender_mldsa_pubkey_hex: &str,
+    request_hash: &[u8],
     data: Vec<u8>,
 ) {
     match String::from_utf8(data) {
         Ok(text) => {
-            // 使用消息内容哈希进行去重（结合发送方和内容）
-            let hash_input = format!("{}:{}", sender_mldsa_pubkey_hex, text);
-            let message_hash = {
-                let mut hasher = sha2::Sha256::new();
-                use sha2::Digest;
-                hasher.update(hash_input.as_bytes());
-                hex::encode(hasher.finalize())
-            };
+            // 使用 ChatMessage 自身 hash（= SHA256(msgtype‖ts‖nonce‖ciphertext)）作为去重键：
+            // 同一消息重传 → 同 hash → 去重；新发相同内容 → 新 hash → 不误杀
+            let message_hash = hex::encode(request_hash);
 
             // 获取当前身份的 identity_id
             let owner_identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
@@ -321,6 +317,7 @@ async fn handle_text_message(
                 false,
                 false,
                 &message_hash,
+                crate::ChatMessageType::Text as i32,
             )
             .await
             {
@@ -392,6 +389,7 @@ async fn handle_file_hash_message(
                 false,
                 false,
                 "", // 文件消息不需要去重哈希
+                crate::ChatMessageType::FileHash as i32,
             )
             .await;
 
@@ -785,14 +783,14 @@ async fn handle_delivery_receipt(
     // 回执数据格式：原始消息的 message_hash（SHA256 hex）
     match String::from_utf8(data) {
         Ok(receipt_msg_hash) => {
-            tracing::info!("收到送达回执，消息哈希: {}", &receipt_msg_hash[..16]);
+            tracing::info!("收到送达回执，消息哈希: {}", &receipt_msg_hash[..16.min(receipt_msg_hash.len())]);
 
             // 先查找 pending 消息（首次发送尚未标记已发送的情况）
             match storage::list_pending(pool).await {
                 Ok(pending_msgs) => {
                     for msg in &pending_msgs {
                         if let Some(ref hash) = msg.message_hash
-                            && hash == &receipt_msg_hash
+                            && crypto::constant_time_compare(hash.as_bytes(), receipt_msg_hash.as_bytes())
                         {
                             if let Err(e) = storage::mark_sent(pool, msg.id).await {
                                 tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
@@ -830,7 +828,7 @@ async fn handle_delivery_receipt(
             } else {
                 tracing::warn!(
                     "未找到哈希 {} 对应的消息，送达回执无法匹配",
-                    &receipt_msg_hash[..16]
+                    &receipt_msg_hash[..16.min(receipt_msg_hash.len())]
                 );
             }
         }

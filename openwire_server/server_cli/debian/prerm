@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# 移除前停止并禁用服务
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemctl stop openwire-relay.service >/dev/null 2>&1 || true
+    systemctl disable openwire-relay.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

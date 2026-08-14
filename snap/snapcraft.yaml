@@ -1,0 +1,27 @@
+name: openwire-server-cli
+base: core22
+version: "0.1.0"
+summary: OpenWire Circuit Relay v2 server for NAT traversal
+description: |
+  OpenWire relay server used for NAT traversal. Deploy on a public-IP host
+  so NATed clients can connect over Circuit Relay v2 and upgrade to direct
+  connection via DCUtR.
+
+grade: stable
+confinement: strict
+
+apps:
+  openwire-server-cli:
+    command: bin/openwire-server-cli
+    plugs: [network, network-bind]
+
+parts:
+  openwire-server-cli:
+    plugin: rust
+    source: .
+    build-packages:
+      - pkg-config
+      - libssl-dev
+    rust-channel: stable
+    rust-packages:
+      - openwire-server-cli

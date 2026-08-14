@@ -1,8 +1,8 @@
 const ALLOWED_COMMANDS = new Set([
     'send', 'send_file', 'list_contacts', 'list_identities', 'select_identity',
-    'delete_identity', 'generate_identity', 'add_contact',
+    'delete_identity', 'generate_identity', 'add_contact', 'discover_contact',
     'delete_contact', 'delete_message',
-    'request_file_download', 'set_download_dir', 'get_download_dir',
+    'request_file_download',
     'load_messages', 'get_identity_qr_data',
     'check_core_ready',
     'is_keyring_available',
@@ -11,17 +11,17 @@ const ALLOWED_COMMANDS = new Set([
     'copy_file',
     'get_network_status',
     'export_routing_table', 'import_routing_table', 'read_text_file', 'set_paid_network',
-    'set_relay_role',
+    'set_relay_role', 'dial_peer', 'get_version',
     'plugin:window|set_content_protected'
 ]);
 
-const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:opener|', 'plugin:dialog|', 'plugin:event|', 'plugin:path|'];
+const ALLOWED_PLUGIN_PREFIXES = ['plugin:store|', 'plugin:dialog|', 'plugin:event|', 'plugin:path|'];
 
 const SENSITIVE_COMMANDS = new Set([
     'send', 'send_file', 'delete_identity', 'select_identity',
-    'generate_identity', 'add_contact', 'delete_contact',
+    'generate_identity', 'add_contact', 'delete_contact', 'delete_message',
     'request_file_download', 'delete_sent_file',
-    'set_download_dir', 'copy_file',
+    'copy_file',
     'save_nodes_config', 'reset_nodes_config'
 ]);
 
@@ -34,10 +34,8 @@ const RATE_LIMITS = {
     delete_identity: { maxCalls: 5, windowMs: 60000 },
     select_identity: { maxCalls: 30, windowMs: 60000 },
     request_file_download: { maxCalls: 20, windowMs: 60000 },
-    set_download_dir: { maxCalls: 5, windowMs: 60000 },
     list_contacts: { maxCalls: 60, windowMs: 60000 },
     list_identities: { maxCalls: 60, windowMs: 60000 },
-    get_download_dir: { maxCalls: 60, windowMs: 60000 },
     load_messages: { maxCalls: 60, windowMs: 60000 },
     get_identity_qr_data: { maxCalls: 30, windowMs: 60000 },
     check_core_ready: { maxCalls: 300, windowMs: 60000 },
@@ -50,6 +48,7 @@ const RATE_LIMITS = {
     read_text_file: { maxCalls: 30, windowMs: 60000 },
     set_paid_network: { maxCalls: 30, windowMs: 60000 },
     set_relay_role: { maxCalls: 30, windowMs: 60000 },
+    dial_peer: { maxCalls: 10, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -90,10 +89,14 @@ function sanitize(payload) {
     const result = {};
     for (const [key, val] of Object.entries(payload)) {
         if (typeof val === 'string') {
-            if ((key === 'pubkeyHex' || key === 'identityId') && val.length > 16) {
+            if ((key === 'pubkeyHex' || key === 'identityId' || key === 'mldsaPubkeyHex') && val.length > 16) {
                 result[key] = val.slice(0, 8) + '***' + val.slice(-4);
             } else if (key === 'message' && val.length > 50) {
                 result[key] = val.slice(0, 50) + '...';
+            } else if (['filePath', 'savePath', 'src', 'dst', 'path', 'addr', 'fileHashHex'].includes(key) && val.length > 80) {
+                result[key] = val.slice(0, 80) + '...';
+            } else if (key === 'data' && val.length > 200) {
+                result[key] = val.slice(0, 200) + '...';
             } else {
                 result[key] = val;
             }
@@ -127,7 +130,9 @@ const VALIDATORS = {
         let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
         if (err) return err;
         if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
-        return requiredString(p.message, 'message', 65536);
+        if (typeof p.message !== 'string' || p.message.length === 0) return 'message required';
+        if (new TextEncoder().encode(p.message).length > 65536) return 'message exceeds limit (65536 bytes)';
+        return null;
     },
     send_file: (p) => {
         let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
@@ -173,20 +178,15 @@ const VALIDATORS = {
         if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
         return null;
     },
-    set_download_dir: (p) => {
-        let err = requiredString(p.path, 'path', 4096);
-        if (err) return err;
-        if (/\.\./.test(p.path)) return 'path traversal not allowed';
-        return null;
-    },
     list_contacts: () => null,
     list_identities: () => null,
     generate_identity: () => null,
-    get_download_dir: () => null,
     load_messages: (p) => {
         let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
         if (err) return err;
         if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
+        // 与 Rust 端 openwire_core::storage::message::MAX_MESSAGE_PAGE_SIZE (200) 保持一致
+if (p.limit !== undefined && (typeof p.limit !== 'number' || p.limit < 0 || p.limit > 200)) return 'limit must be between 0 and 200';
         return null;
     },
     get_identity_qr_data: () => null,
@@ -257,6 +257,21 @@ const VALIDATORS = {
         if (!['server', 'client', 'off'].includes(p.role)) return 'role must be server/client/off';
         return null;
     },
+    dial_peer: (p) => {
+        let err = requiredString(p.peerId, 'peerId', 128);
+        if (err) return err;
+        err = requiredString(p.addr, 'addr', 1024);
+        if (err) return err;
+        if (/\.\./.test(p.addr)) return 'invalid addr';
+        return null;
+    },
+    discover_contact: (p) => {
+        let err = requiredString(p.mldsaPubkeyHex, 'mldsaPubkeyHex');
+        if (err) return err;
+        if (!isHex(p.mldsaPubkeyHex)) return 'mldsaPubkeyHex must be hex';
+        return null;
+    },
+    get_version: () => null,
 };
 
 window.__TAURI_ISOLATION_HOOK__ = (payload) => {

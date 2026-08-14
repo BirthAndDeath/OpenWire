@@ -83,11 +83,16 @@ async fn send(
         .ok_or_else(|| "核心尚未初始化".to_string())?;
     drop(inner);
 
+    let data = message.as_bytes();
+    if data.len() > 65536 {
+        return Err("消息内容过长（最大 65536 字节）".to_string());
+    }
+
     let result = cmd_tx
         .send(ChatCommand::SendMessage {
             mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
             msgtype: ChatMessageType::Text,
-            data: message.to_string().into_bytes(),
+            data: data.to_vec(),
         })
         .await;
 
@@ -244,7 +249,7 @@ async fn load_messages(
         before_id,
         after,
         after_id,
-        limit.unwrap_or(50),
+        limit.map(|l| l.clamp(0, openwire_core::storage::MAX_MESSAGE_PAGE_SIZE)).unwrap_or(50),
     )
     .await
     .map_err(|e| format!("加载消息失败: {}", e))?
@@ -498,13 +503,13 @@ async fn delete_contact(
     tracing::info!(
         "已删除 {} 条与 {} 的聊天记录",
         deleted_msgs,
-        &mldsa_pubkey_hex[..16]
+        &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
     );
 
     match storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex).await {
         Ok(affected) => {
             if affected > 0 {
-                tracing::info!("已删除联系人 {}", &mldsa_pubkey_hex[..16]);
+                tracing::info!("已删除联系人 {}", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]);
                 Ok(true)
             } else {
                 Err("未找到该联系人".to_string())
@@ -1034,18 +1039,46 @@ fn reject_sensitive_path(p: &std::path::Path) -> Result<std::path::PathBuf, Stri
                 .map_err(|_| format!("无法解析路径: {}", p.display()))?;
             Ok(canon_parent.join(p.file_name().unwrap_or_default()))
         })?;
-    let s = canon.to_string_lossy().to_lowercase();
+    // 统一为正斜杠，保证 Windows 反斜杠路径与凭据目录模式匹配
+    let s = canon
+        .to_string_lossy()
+        .to_lowercase()
+        .replace('\\', "/");
+    // 通用敏感目录：用户凭据与密钥目录（各平台统一拦截）
+    for frag in [
+        "/.ssh/",
+        "/.gnupg/",
+        "/.aws/",
+        "/.config/gcloud/",
+        "/.config/gh/",
+        "/.config/github-copilot/",
+        "/.npmrc",
+        "/.pypirc",
+        "/.netrc",
+    ] {
+        if s.contains(frag) {
+            return Err("不允许访问用户凭据目录".to_string());
+        }
+    }
     #[cfg(windows)]
     {
-        if s.contains(":\\windows")
-            || s.contains(":\\program files")
-            || s.contains(":\\documents and settings")
-            || s.contains("\\windows\\")
+        if s.contains(":/windows")
+            || s.contains(":/program files")
+            || s.contains(":/programdata")
+            || s.contains(":/documents and settings")
+            || s.contains("/windows/")
+            || s.contains("/users/") && s.contains("/appdata/roaming/microsoft/")
         {
             return Err("不允许访问系统敏感路径".to_string());
         }
-        if s.contains("\\users\\") && s.contains("\\.ssh") {
-            return Err("不允许访问用户私钥目录".to_string());
+        // 浏览器配置文件（Cookies/历史记录等）
+        if s.contains("/user data/")
+            && (s.contains("/chrome") || s.contains("/edge") || s.contains("/brave"))
+        {
+            return Err("不允许访问浏览器配置文件".to_string());
+        }
+        if s.contains("/mozilla/firefox/") {
+            return Err("不允许访问浏览器配置文件".to_string());
         }
     }
     #[cfg(not(windows))]
@@ -1056,17 +1089,26 @@ fn reject_sensitive_path(p: &std::path::Path) -> Result<std::path::PathBuf, Stri
             || s.starts_with("/root/")
             || s.starts_with("/bin/")
             || s.starts_with("/sbin/")
+            || s.starts_with("/boot/")
+            || s.starts_with("/dev/")
+            || s.starts_with("/proc/")
+            || s.starts_with("/sys/")
         {
             return Err("不允许访问系统敏感路径".to_string());
         }
-        if s.contains("/.ssh/") || s.contains("/.gnupg/") || s.contains("/.aws/") {
-            return Err("不允许访问用户凭据目录".to_string());
+        // 浏览器配置目录（Cookies/历史记录等）
+        if s.contains("/.config/google-chrome/")
+            || s.contains("/.config/microsoft-edge/")
+            || s.contains("/.config/brave-browser/")
+            || s.contains("/.mozilla/firefox/")
+        {
+            return Err("不允许访问浏览器配置文件".to_string());
         }
     }
     Ok(canon)
 }
 
-/// 读取文本文件（用户通过对话框选择的导入文件）
+/// 读取文本文件（仅限用户通过对话框选择的导入文件，禁止系统敏感目录）
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, String> {
     let resolved = reject_sensitive_path(std::path::Path::new(&path))?;
@@ -1087,6 +1129,29 @@ async fn set_paid_network(state: tauri::State<'_, AppData>, mode: String) -> Res
     cmd_tx
         .try_send(openwire_core::ChatCommand::SetPaidNetworkMode(mode))
         .map_err(|e| format!("发送命令失败: {}", e))?;
+    Ok(())
+}
+
+/// 拨号到指定节点（手动连接，PeerID + Multiaddr）
+#[tauri::command]
+async fn dial_peer(state: tauri::State<'_, AppData>, peer_id: String, addr: String) -> Result<(), String> {
+    let peer_id: libp2p::PeerId = peer_id
+        .parse()
+        .map_err(|_| "无效的 PeerID".to_string())?;
+    let multiaddr: libp2p::Multiaddr = addr
+        .parse()
+        .map_err(|_| "无效的 Multiaddr".to_string())?;
+    let cmd_tx = {
+        let inner = state.inner.read().await;
+        inner.cmd_tx.clone()
+    };
+    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    cmd_tx
+        .try_send(openwire_core::ChatCommand::DialPeer {
+            peer_id: peer_id.to_string(),
+            addr: multiaddr.to_string(),
+        })
+        .map_err(|e| format!("发送拨号命令失败: {e}"))?;
     Ok(())
 }
 
@@ -1206,7 +1271,8 @@ copy_file,
             import_routing_table,
 read_text_file,
             set_paid_network,
-            set_relay_role
+set_relay_role,
+            dial_peer
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -1245,34 +1311,37 @@ fn cleanup(app: &AppHandle) {
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn Java_com_openwire_app_MainActivity_initNdkContext(
-    env: jni::JNIEnv,
-    _class: jni::objects::JClass,
-    context: jni::objects::JObject,
+pub extern "system" fn Java_com_openwire_app_MainActivity_initNdkContext<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _class: jni::objects::JClass<'local>,
+    context: jni::objects::JObject<'local>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use std::ffi::c_void;
-        match env.new_global_ref(context) {
-            Ok(global_ref) => match env.get_java_vm() {
-                Ok(vm) => {
-                    let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
-                    unsafe {
-                        ndk_context::initialize_android_context(
-                            vm_ptr,
-                            global_ref.as_obj().as_raw() as _,
-                        );
+        let _ = env.with_env(|env| {
+            match env.new_global_ref(context) {
+                Ok(global_ref) => match env.get_java_vm() {
+                    Ok(vm) => {
+                        let vm_ptr = vm.get_raw() as *mut c_void;
+                        let context_ptr = global_ref.into_raw() as *mut c_void;
+                        unsafe {
+                            ndk_context::initialize_android_context(vm_ptr, context_ptr);
+                        }
+                        tracing::info!("Android NDK context initialized for keyring");
+                        rootcell::identity::setup_default_keyring();
+                        Ok(())
                     }
-                    tracing::info!("Android NDK context initialized for keyring");
-                    rootcell::identity::setup_default_keyring();
-                }
+                    Err(e) => {
+                        tracing::error!("Failed to get Java VM: {e}");
+                        Err(e)
+                    }
+                },
                 Err(e) => {
-                    tracing::error!("Failed to get Java VM: {e}");
+                    tracing::error!("Failed to create global ref for Android context: {e}");
+                    Err(e)
                 }
-            },
-            Err(e) => {
-                tracing::error!("Failed to create global ref for Android context: {e}");
             }
-        }
+        });
     }));
     if let Err(e) = result {
         tracing::error!("JNI initNdkContext panicked: {e:?}");

@@ -705,17 +705,12 @@ fn diagnose_pubkey_validation(report: &mut DiagnosticReport) {
         all_passed = false;
     }
 
-    // 测试空字符串
-    // 注意：validate_mldsa_pubkey_hex("") 返回 true 是因为空字符串
-    // 的 all(|c| c.is_ascii_hexdigit()) 为 true，且 hex::decode("") 返回 Ok(vec![])
-    // 这是已知行为，诊断中标记为警告而非失败
+    // 测试空字符串（hex::decode("") 返回 Ok(vec![])，但长度校验和密码学验证拒绝）
     if !signature::validate_mldsa_pubkey_hex("") {
         details.push("  ✓ 空字符串正确拒绝".to_string());
     } else {
-        details.push(
-            "  ⚠ 空字符串验证返回 true（已知行为，hex::decode(\"\") 返回空 vec）".to_string(),
-        );
-        // 不标记为失败，因为这是 validate_mldsa_pubkey_hex 的已知行为
+        details.push("  ✗ 空字符串应该被拒绝".to_string());
+        all_passed = false;
     }
 
     report.add(DiagnosticItem {

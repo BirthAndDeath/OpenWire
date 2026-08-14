@@ -1,51 +1,29 @@
 use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use aws_lc_rs::signature::KeyPair;
 use libp2p::identity;
-use rootcell::store::EncryptedStore;
 use zeroize::Zeroizing;
 
 use crate::{coreconfig::CoreConfig, peerid_store::PeerIdConfig, storage};
 
-/// 生成临时 PeerId（ed25519 密钥对）
-///
-/// 如果提供了 `PeerIdConfig`（持久化），则恢复存储的密钥对实现 PeerID 稳定；
-/// 否则每次生成全新的密钥对（向后兼容，用于测试等场景）。
-pub fn generate_temporary_peerid() -> crate::error::IdentityResult<identity::Keypair> {
-    let keypair = identity::Keypair::generate_ed25519();
-    Ok(keypair)
-}
-
-/// 从持久化配置恢复 PeerID，或生成新的
+/// 从持久化配置恢复 PeerID，或创建新的加密存储。
+/// keyring 不可用时返回错误；配置损坏时删除并重建新 PeerID。
 pub fn load_or_create_peerid(
     data_dir: &std::path::Path,
-) -> (identity::Keypair, PeerIdConfig) {
-    let config = PeerIdConfig::load_or_create(data_dir);
-    match config.to_keypair() {
-        Ok(kp) => {
-            tracing::info!("Restored PeerID from persistent storage: {}", kp.public().to_peer_id());
-            (kp, config)
-        }
+) -> Result<(identity::Keypair, PeerIdConfig), String> {
+    let config = PeerIdConfig::load_or_create(data_dir)?;
+    let kp = match config.to_keypair() {
+        Ok(kp) => kp,
         Err(e) => {
-            tracing::warn!("Failed to restore PeerID from config, generating new: {e}");
-            // 删除加密存储中的损坏条目，避免 load_or_create 再次读取相同损坏数据
-            let data_dir_str = data_dir.to_string_lossy();
-            if let Ok(store) = EncryptedStore::open() {
-                store.delete(&data_dir_str, crate::peerid_store::STORE_IDENTIFIER);
-            }
-            // 同时清理旧的明文文件（若存在）
-            let config_path = PeerIdConfig::path(data_dir);
-            if config_path.exists() {
-                if let Err(e) = std::fs::remove_file(&config_path) {
-                    tracing::warn!("Failed to remove corrupt PeerIdConfig file: {e}");
-                }
-            }
-            let config = PeerIdConfig::load_or_create(data_dir);
-            let kp = config
+            crate::peerid_store::delete_corrupted_entry(data_dir);
+            tracing::warn!("Failed to restore PeerID from config, recreated: {e}");
+            let config = PeerIdConfig::load_or_create(data_dir)?;
+            config
                 .to_keypair()
-                .expect("Freshly created PeerIdConfig should always yield a valid keypair");
-            (kp, config)
+                .map_err(|e| format!("重新创建后 PeerID 仍无效: {e}"))?
         }
-    }
+    };
+    tracing::info!("Restored PeerID from persistent storage: {}", kp.public().to_peer_id());
+    Ok((kp, config))
 }
 
 /// 完整身份信息（ML-DSA 签名 + ML-KEM 封装密钥 + ML-DSA 私钥）
@@ -186,8 +164,8 @@ pub fn extract_public_key_from_private(
     is_mldsa: bool,
 ) -> crate::error::IdentityResult<Vec<u8>> {
     if is_mldsa {
-        use aws_lc_rs::unstable::signature::ML_DSA_65_SIGNING;
-        use aws_lc_rs::unstable::signature::PqdsaKeyPair;
+        use aws_lc_rs::signature::ML_DSA_65_SIGNING;
+        use aws_lc_rs::signature::PqdsaKeyPair;
         let key_pair = PqdsaKeyPair::from_raw_private_key(&ML_DSA_65_SIGNING, private_key_bytes)
             .map_err(crate::error::IdentityError::ParseMlDsaPrivateKeyFailed)?;
         Ok(key_pair.public_key().as_ref().to_vec())

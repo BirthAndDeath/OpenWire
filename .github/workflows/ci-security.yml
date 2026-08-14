@@ -1,0 +1,60 @@
+name: "ci-security"
+on:
+  pull_request:
+  push:
+    branches:
+      - release
+      - nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: "cargo audit"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: audit
+        run: cargo audit
+
+  cargo-clippy:
+    name: "cargo clippy (workspace)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            openwire_core
+            rootcell
+            openwire_cli
+            openwire_server
+
+      - name: clippy
+        # 排除 openwire（Tauri GUI crate，ubuntu runner 上需要 webkit2gtk 系统依赖）
+        run: cargo clippy -p openwire_core -p rootcell -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-targets -- -D warnings

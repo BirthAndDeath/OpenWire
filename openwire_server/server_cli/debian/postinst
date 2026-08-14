@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+DATA_DIR=/var/lib/openwire-relay
+
+# 数据目录
+install -d -o openwire -g openwire -m 0750 "$DATA_DIR"
+
+# 首次安装时创建默认 nodes.json（仅 bootstrap，供中继加入 DHT）
+if [ ! -f "$DATA_DIR/nodes.json" ]; then
+    cat > "$DATA_DIR/nodes.json" <<'EOF'
+{
+  "relay_nodes": [],
+  "bootstrap_nodes": []
+}
+EOF
+    chown openwire:openwire "$DATA_DIR/nodes.json"
+    chmod 0644 "$DATA_DIR/nodes.json"
+fi
+
+# 启用并启动服务
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable openwire-relay.service >/dev/null 2>&1 || true
+    systemctl start openwire-relay.service >/dev/null 2>&1 || true
+fi
+
+exit 0

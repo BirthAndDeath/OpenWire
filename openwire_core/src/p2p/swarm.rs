@@ -85,7 +85,6 @@ pub fn swarm_init(
     bootstrap_nodes: &[(String, String)],
     peerid_config: Option<&crate::peerid_store::PeerIdConfig>,
 ) -> P2pResult<Swarm<MyBehaviour>> {
-    let peerid_was_rotated = peerid_config.map_or(true, |c| c.was_rotated());
     let mut swarm = {
         let builder = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -145,7 +144,7 @@ pub fn swarm_init(
                         .map_err(|e| P2pError::SwarmInitFailed(e.into()))?;
 
                 // 创建 Kademlia 行为实例
-                let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes, peerid_was_rotated)?;
+                let kademlia = create_kademlia(peer_id, data_dir, bootstrap_nodes)?;
                 let identify_config =
                     identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
                         .with_agent_version(format!("rootcell/{}", env!("CARGO_PKG_VERSION")))
@@ -211,10 +210,13 @@ pub fn swarm_init(
     // 端口偏好：优先使用 PeerIdConfig 中存储的端口，被占用则回退到 OS 分配
     let quic_port = peerid_config.map_or(0, |p| p.preferred_quic_port());
     let tcp_port = peerid_config.map_or(0, |p| p.preferred_tcp_port());
-    let ws_port = peerid_config.map_or(0, |p| p.preferred_ws_port());
+    let _ws_port = peerid_config.map_or(0, |p| p.preferred_ws_port());
 
     use std::net::{Ipv4Addr, Ipv6Addr};
-    try_listen_or_fallback(
+
+    // 各地址族独立尝试监听，失败仅记录日志，不中断初始化。
+    // 前端网络监控通过监听地址列表展示实际可用的 IPv4/IPv6。
+    if let Err(e) = try_listen_or_fallback(
         &mut swarm,
         Multiaddr::empty()
             .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
@@ -224,8 +226,10 @@ pub fn swarm_init(
             .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
             .with(Protocol::Udp(0))
             .with(Protocol::QuicV1),
-    )?;
-    try_listen_or_fallback(
+    ) {
+        tracing::warn!("IPv4 QUIC listen failed: {e}");
+    }
+    if let Err(e) = try_listen_or_fallback(
         &mut swarm,
         Multiaddr::empty()
             .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
@@ -235,8 +239,10 @@ pub fn swarm_init(
             .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
             .with(Protocol::Udp(0))
             .with(Protocol::QuicV1),
-    )?;
-    try_listen_or_fallback(
+    ) {
+        tracing::warn!("IPv6 QUIC listen failed: {e}");
+    }
+    if let Err(e) = try_listen_or_fallback(
         &mut swarm,
         Multiaddr::empty()
             .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
@@ -244,8 +250,10 @@ pub fn swarm_init(
         Multiaddr::empty()
             .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
             .with(Protocol::Tcp(0)),
-    )?;
-    try_listen_or_fallback(
+    ) {
+        tracing::warn!("IPv4 TCP listen failed: {e}");
+    }
+    if let Err(e) = try_listen_or_fallback(
         &mut swarm,
         Multiaddr::empty()
             .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
@@ -253,31 +261,37 @@ pub fn swarm_init(
         Multiaddr::empty()
             .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
             .with(Protocol::Tcp(0)),
-    )?;
+    ) {
+        tracing::warn!("IPv6 TCP listen failed: {e}");
+    }
     #[cfg(not(target_os = "android"))]
     {
-        try_listen_or_fallback(
+        if let Err(e) = try_listen_or_fallback(
             &mut swarm,
             Multiaddr::empty()
                 .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(ws_port))
+                .with(Protocol::Tcp(_ws_port))
                 .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
             Multiaddr::empty()
                 .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
                 .with(Protocol::Tcp(0))
                 .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-        )?;
-        try_listen_or_fallback(
+        ) {
+            tracing::warn!("IPv4 WebSocket listen failed: {e}");
+        }
+        if let Err(e) = try_listen_or_fallback(
             &mut swarm,
             Multiaddr::empty()
                 .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(ws_port))
+                .with(Protocol::Tcp(_ws_port))
                 .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
             Multiaddr::empty()
                 .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
                 .with(Protocol::Tcp(0))
                 .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-        )?;
+        ) {
+            tracing::warn!("IPv6 WebSocket listen failed: {e}");
+        }
     } // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
 
     Ok(swarm)
@@ -288,7 +302,6 @@ fn create_kademlia(
     peer_id: PeerId,
     data_dir: &Path,
     bootstrap_nodes: &[(String, String)],
-    peerid_was_rotated: bool,
 ) -> P2pResult<kad::Behaviour<MemoryStore>> {
     let mut config = KadConfig::new(PROTOCOL_KAD.deref().to_owned());
     let replication_factor = NonZero::new(KAD_REPLICATION_FACTOR).ok_or_else(|| {
@@ -307,13 +320,11 @@ fn create_kademlia(
     let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
     kademlia.set_mode(Some(Mode::Client));
 
-    // PeerID 未轮换时加载路由表缓存，加速节点发现
-    if !peerid_was_rotated {
-        let cache_path = data_dir.join("routing_table.cache");
-        let loaded = load_routing_table(&mut kademlia, &cache_path);
-        if loaded > 0 {
-            tracing::info!("从路由表缓存加载了 {} 个节点", loaded);
-        }
+    // 加载路由表缓存，加速节点发现
+    let cache_path = data_dir.join("routing_table.cache");
+    let loaded = load_routing_table(&mut kademlia, &cache_path);
+    if loaded > 0 {
+        tracing::info!("从路由表缓存加载了 {} 个节点", loaded);
     }
 
     // 始终使用 bootstrap 节点作为基础路由

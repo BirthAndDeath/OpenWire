@@ -36,11 +36,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::p2p::behaviour::{MyBehaviour, MyBehaviourEvent};
-use crate::p2p::dht_cache::DhtCache;
+use crate::p2p::{self, dht_cache::DhtCache};
 use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
-use crate::p2p::{self, DHT_PROVIDER_CALLBACKS};
 use crate::{ChatMessage, ChatResponse};
-use crate::command::NetworkStatusData;
+
 
 use self::swarm_ops as p2p_swarm_ops;
 
@@ -362,13 +361,16 @@ pub struct P2pActor {
 impl P2pActor {
     /// 创建新的 P2pActor
     pub fn new(
-        swarm: Swarm<MyBehaviour>,
+        mut swarm: Swarm<MyBehaviour>,
         dht_cache: Arc<DhtCache>,
         data_dir: std::path::PathBuf,
         event_tx: mpsc::Sender<P2pEvent>,
         relay_nodes: Vec<(PeerId, Multiaddr)>,
         bootstrap_nodes: Vec<(PeerId, Multiaddr)>,
     ) -> Self {
+        // 默认角色 client：启动时先关闭 relay server behaviour 运行时开关，
+        // 由 try_enable_relay_server 在角色为 server 时重新打开（本地 libp2p-relay patch）。
+        swarm.behaviour_mut().relay_server.set_server_enabled(false);
         Self {
             swarm,
             dht_cache,
@@ -1056,13 +1058,6 @@ impl P2pActor {
                             &key_str[..16.min(key_str.len())]
                         );
 
-                        // 通知等待的 oneshot callbacks
-                        if let Ok(mut callbacks) = DHT_PROVIDER_CALLBACKS.lock()
-                            && let Some(sender) = callbacks.remove(key_str)
-                                && let Some(first_provider) = providers.iter().next() {
-                                    let _ = sender.send(*first_provider);
-                                }
-
                         // 发送事件给 ChatCore
                         self.send_event(P2pEvent::GetProvidersResult {
                             key: key_str.to_string(),
@@ -1543,7 +1538,10 @@ impl P2pActor {
 
         let mut imported = 0u32;
         let mut errors: Vec<String> = Vec::new();
-        const MAX_IMPORT_ADDRESSES: u32 = 10_000;
+        // 与 Kademlia 路由表容量匹配，避免恶意导出文件淹没本地路由表并挤掉合法节点
+        const MAX_IMPORT_ADDRESSES: u32 = 1_000;
+        let mut seen: std::collections::HashSet<(PeerId, Multiaddr)> =
+            std::collections::HashSet::new();
 
         fn is_valid_routing_addr(addr: &Multiaddr) -> bool {
         // 必须有传输层协议（Tcp / QuicV1），拒绝 /p2p-circuit 等无传输地址
@@ -1592,7 +1590,7 @@ impl P2pActor {
                 }
             };
             if imported >= MAX_IMPORT_ADDRESSES {
-                    errors.push("import limit reached (max 10,000 addresses)".to_string());
+                    errors.push("import limit reached (max 1,000 addresses)".to_string());
                     break;
                 }
             for addr_str in &peer.addresses {
@@ -1606,6 +1604,9 @@ impl P2pActor {
                 // 地址语义校验：拒绝不可路由或内部地址
                 if !is_valid_routing_addr(&addr) {
                     errors.push(format!("unroutable addr for {}: {}", &peer.peer_id[..16.min(peer.peer_id.len())], addr));
+                    continue;
+                }
+                if !seen.insert((pid, addr.clone())) {
                     continue;
                 }
                 self.swarm.behaviour_mut().kademlia.add_address(&pid, addr.clone());
@@ -1790,7 +1791,7 @@ impl P2pActorBuilder {
                         tracing::info!("P2pActor 收到取消信号");
                         actor.disable_relay_server();
                         let cache_path = actor.data_dir.join("routing_table.cache");
-                        p2p::save_routing_table(&mut actor.swarm, &cache_path, &actor.connected_peers);
+                        p2p::save_routing_table(&mut actor.swarm, &cache_path, &actor.connected_peers).await;
                         break;
                     }
                 }

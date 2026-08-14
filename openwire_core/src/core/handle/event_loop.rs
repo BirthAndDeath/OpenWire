@@ -361,14 +361,14 @@ impl ChatCore {
                 tracing::warn!("DHT 发布失败: {}", error);
                 self.send_warning_mpsc(format!("DHT 发布失败: {}", error)).await;
             }
-            P2pEvent::MessageSent { peer, message_hash } => {
+            P2pEvent::MessageSent { peer: _, message_hash } => {
                 // P2P 层确认消息已发送，标记为已发送
                 if let Some(pool) = storage::pool() {
                     let _ = storage::mark_sent_by_hash(pool, &message_hash).await;
                     tracing::debug!("P2P 确认消息 {}.. 发送成功", &message_hash[..16]);
                 }
             }
-            P2pEvent::MessageSendFailed { peer, message_hash } => {
+            P2pEvent::MessageSendFailed { peer: _, message_hash } => {
                 tracing::warn!("P2P 发送消息 {}.. 失败（消息已保持待发送状态，等待重试）", &message_hash[..16]);
             }
             P2pEvent::BootstrapReady => {
@@ -530,20 +530,28 @@ impl ChatCore {
                 return;
             }
         }
-        if let Some(sig) = &signature {
-            if !crate::p2p::netevent::verify_friend_online_signature(
-                &mldsa_pubkey_hex, &claimed_peer_id, &listen_addrs, &mlkem_pubkey_hex, sig,
-            ) {
-                let short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
-                tracing::warn!("FriendOnline 签名验证失败: 声称公钥 {}.. (PeerID={})", short, peer);
-                self.send_netevent_response(
-                    channel,
-                    crate::p2p::netevent::NetEventResponse::Nack {
-                        reason: crate::p2p::netevent::NackReason::SignatureVerificationFailed,
-                    },
-                );
-                return;
-            }
+        let Some(sig) = &signature else {
+            tracing::warn!("FriendOnline 缺少签名: 公钥 {}.. (PeerID={})", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())], peer);
+            self.send_netevent_response(
+                channel,
+                crate::p2p::netevent::NetEventResponse::Nack {
+                    reason: crate::p2p::netevent::NackReason::SignatureVerificationFailed,
+                },
+            );
+            return;
+        };
+        if !crate::p2p::netevent::verify_friend_online_signature(
+            &mldsa_pubkey_hex, &claimed_peer_id, &listen_addrs, &mlkem_pubkey_hex, sig,
+        ) {
+            let short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
+            tracing::warn!("FriendOnline 签名验证失败: 声称公钥 {}.. (PeerID={})", short, peer);
+            self.send_netevent_response(
+                channel,
+                crate::p2p::netevent::NetEventResponse::Nack {
+                    reason: crate::p2p::netevent::NackReason::SignatureVerificationFailed,
+                },
+            );
+            return;
         }
         tracing::debug!("收到有效的 FriendOnline: {}.. (PeerID={})", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())], peer);
         let store = self.get_dht_store();

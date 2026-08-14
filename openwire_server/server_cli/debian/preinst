@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+# 创建专用系统用户（仅安装时创建一次）
+if ! getent passwd openwire >/dev/null 2>&1; then
+    adduser --system --group --home /var/lib/openwire-relay --no-create-home openwire
+fi
+
+exit 0

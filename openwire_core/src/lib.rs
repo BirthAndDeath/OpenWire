@@ -54,10 +54,11 @@ pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, Net
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{
-    extract_public_key_from_private, generate_complete_identity, generate_temporary_peerid,
+    extract_public_key_from_private, generate_complete_identity,
     load_or_create_peerid, load_or_generate_complete_identity,
 };
 pub use message::{ChatMessage, ChatMessageType, ChatResponse, OnlineStatusPayload};
 pub use signature::{
-    generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_hex, verify_signature,
+    generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_bytes, validate_mldsa_pubkey_hex,
+    verify_signature,
 };

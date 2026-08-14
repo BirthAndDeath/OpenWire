@@ -89,6 +89,17 @@ fn init_file_logger(path: &Path, filter: &EnvFilter) -> crate::error::LogResult<
         .map_err(|e| crate::error::LogError::CreateRollingFileAppenderFailed(e.into()))?;
     let safe_path = validate_log_path(path)?; // 规范化后的安全路径
 
+    // 清理旧版无 ".log" 后缀的日志文件（文件名变更前遗留，滚动清理不会匹配它们）
+    if let Ok(entries) = std::fs::read_dir(&safe_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("chat-") && !name.ends_with(".log") && entry.path().is_file() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::HOURLY) // 按小时轮转
         .filename_prefix("chat") // 文件名前缀

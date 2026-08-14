@@ -70,7 +70,37 @@ New-NetFirewallRule -DisplayName "OpenWire Relay UDP" -Direction Inbound -Protoc
 - 公网 IP（非 NAT 后）。NAT 后的中继失去意义。
 - 端口 44909 TCP/UDP 未被占用。
 
-## systemd 服务（Linux）
+## .deb 打包（Linux）
+
+使用 [cargo-deb](https://crates.io/crates/cargo-deb) 构建 Debian 包，安装后自动创建 `openwire` 用户、数据目录，并注册 systemd 服务：
+
+```bash
+# 构建（需在 Linux 环境）
+cargo install cargo-deb
+cargo deb -p openwire-server-cli
+
+# 安装
+sudo dpkg -i target/debian/openwire-server-cli_*.deb
+
+# 服务已自动启用并启动
+sudo systemctl status openwire-relay
+```
+
+### 包内容
+
+| 路径 | 说明 |
+|------|------|
+| `/usr/bin/openwire-server-cli` | 服务端二进制 |
+| `/etc/systemd/system/openwire-relay.service` | systemd 服务单元 |
+| `/var/lib/openwire-relay/` | 数据目录（Ed25519 密钥、DHT 数据库、nodes.json） |
+
+### 维护脚本行为
+
+- **安装**：创建 `openwire` 系统用户，生成默认 `nodes.json`，`systemctl enable + start` 服务
+- **升级**：不删除数据目录，服务自动重启，密钥和路由表保留
+- **卸载（purge）**：停止并禁用服务，删除数据目录和用户
+
+### 手动 systemd 配置（不使用 .deb）
 
 ```ini
 [Unit]
@@ -90,8 +120,21 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+# 手动创建用户和数据目录
+sudo useradd --system --home /var/lib/openwire-relay --shell /usr/sbin/nologin openwire
+sudo mkdir -p /var/lib/openwire-relay
+sudo chown openwire:openwire /var/lib/openwire-relay
 sudo systemctl enable openwire-relay
 sudo systemctl start openwire-relay
+```
+
+### 常用命令
+
+```bash
+sudo systemctl status openwire-relay      # 查看状态
+sudo journalctl -u openwire-relay -f      # 查看日志
+sudo systemctl restart openwire-relay     # 重启
+sudo systemctl stop openwire-relay        # 停止
 ```
 
 ## 功能
@@ -100,6 +143,21 @@ sudo systemctl start openwire-relay
 - **DHT 节点**: 参与 Kademlia DHT 网络，提供路由查询
 - **FriendOnline 缓存**: 缓存客户端 FriendOnline 通知，支持 DiscoverPeer 协议
 - **DHT 注册**: 启动后向 DHT 注册为中继节点（key: `relay_nodes_public`）
+
+## 数据存储路径 / Data Storage Paths
+
+服务器将以下文件存储在数据目录（默认 `.openwire-relay`，可通过命令行第一个参数指定）中：
+
+| 文件 / File | 说明 / Description |
+|-------------|-------------------|
+| `<data_dir>/ed25519.bin` | Ed25519 身份密钥对（0600 权限），用于生成服务器 PeerId / Ed25519 identity keypair (0600 perms), derives the server PeerId |
+| `<data_dir>/dht.redb` | 持久化 Kademlia 路由表与 DHT 记录（Redb 数据库，重启后路由表不丢失）/ Persistent Kademlia routing table & DHT records (Redb database, survives restarts) |
+| `<data_dir>/nodes.json` | 节点配置（仅 `bootstrap_nodes` 字段被使用）/ Node config (only `bootstrap_nodes` is used) |
+| `<data_dir>/relay-info.json` | 中继信息：PeerId 与带 `/p2p/` 后缀的监听地址，可直接复制到客户端 `nodes.json` / Relay info: PeerId and listen addresses with `/p2p/` suffix, copy-paste ready for client `nodes.json` |
+
+`.deb` 安装版使用固定目录 `/var/lib/openwire-relay/`。
+
+The server stores all state in the data directory (default `.openwire-relay`, overridable via the first CLI arg); the `.deb` package uses the fixed `/var/lib/openwire-relay/`.
 
 ## 配置
 

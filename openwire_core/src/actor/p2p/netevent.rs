@@ -22,7 +22,7 @@ pub fn handle_friend_online(
     request: &NetEventRequest,
     store: Option<Arc<redb::Database>>,
 ) {
-    let (mldsa_pubkey_hex, peer_id_str, listen_addrs) = match request {
+    let (mldsa_pubkey_hex, peer_id_str, _listen_addrs) = match request {
         NetEventRequest::FriendOnline {
             mldsa_pubkey_hex,
             peer_id,

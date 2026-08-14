@@ -40,6 +40,41 @@
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let sceneReady = $state(false);
 
+  let dialPeerId = $state("");
+  let dialAddr = $state("");
+  let dialing = $state(false);
+  let dialMessage = $state("");
+  let dialMessageOk = $state(false);
+
+  async function copyPeerId() {
+    if (!status?.local_peer_id) return;
+    try {
+      await navigator.clipboard.writeText(status.local_peer_id);
+    } catch {
+      // fallback for non-secure contexts
+    }
+  }
+
+  async function handleDial() {
+    const pid = dialPeerId.trim();
+    const addr = dialAddr.trim();
+    if (!pid || !addr) return;
+    dialing = true;
+    dialMessage = "";
+    try {
+      await invoke("dial_peer", { peerId: pid, addr });
+      dialMessage = "拨号请求已发送";
+      dialMessageOk = true;
+      dialPeerId = "";
+      dialAddr = "";
+    } catch (e) {
+      dialMessage = `Dial failed: ${e}`;
+      dialMessageOk = false;
+    } finally {
+      dialing = false;
+    }
+  }
+
   let scene: THREE.Scene | null = null;
   let camera: THREE.PerspectiveCamera | null = null;
   let renderer: THREE.WebGLRenderer | null = null;
@@ -140,10 +175,10 @@
 
   function getColor(peer: PeerInfo): number {
     if (peer.is_self) return 0x3b82f6;
+    if (!peer.connected) return 0x6b7280;
+    if (peer.is_bootstrap) return 0xef4444;
     if (peer.is_relay) return 0xf59e0b;
-    if (peer.is_bootstrap) return 0x10b981;
-    if (peer.connected) return 0x22c55e;
-    return 0x6b7280;
+    return 0x22c55e;
   }
 
   function getRadius(peer: PeerInfo): number {
@@ -476,6 +511,7 @@
         <li><strong>Disabled</strong> — relay permanently off. No auto-detection.</li>
       </ul>
       <p>Click the Network badge to cycle between modes. Default: Paid (conservative, no charges).</p>
+      <p><em>Note:</em> auto-detection relies on <code>navigator.connection.metered</code>, which is not exposed by desktop WebViews (Chromium/Edge). On Windows/macOS/Linux the mode is never auto-switched, so "Paid" is a conservative default, not a measured network cost.</p>
     </div>
   {/if}
 
@@ -600,6 +636,24 @@
       <h4>Peers</h4>
       <span class="addr-item">{status?.connected_peer_count ?? 0} connected</span>
     </div>
+    <div class="info-section">
+      <h4>PeerID</h4>
+      <span class="addr-item peerid-display" onclick={copyPeerId} onkeydown={(e) => e.key === 'Enter' && copyPeerId()} role="button" tabindex="0" title="Click to copy">
+        {status?.local_peer_id ?? "Unknown"}
+      </span>
+    </div>
+    <div class="info-section">
+      <h4>Multiaddrs {#if status?.external_addresses?.length}<span class="addr-count">({status.external_addresses.length})</span>{/if}</h4>
+      <div class="addr-list">
+        {#if status?.external_addresses?.length}
+          {#each status.external_addresses as maddr}
+            <span class="addr-item">{maddr}</span>
+          {/each}
+        {:else}
+          <span class="addr-item addr-empty">None</span>
+        {/if}
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -630,12 +684,38 @@
       {#if status && status.known_peers.length > 0}
         <div class="topology-legend">
           <span class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span>Self</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#6b7280"></span>Disconnected</span>
           <span class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>Connected</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>Bootstrap</span>
           <span class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span>Relay</span>
-          <span class="legend-item"><span class="legend-dot" style="background:#10b981"></span>Bootstrap</span>
         </div>
       {/if}
     </div>
+  </div>
+
+  <!-- Row 4: Manual dial -->
+  <div class="dial-section">
+    <h4>Connect to Peer</h4>
+    <div class="dial-form">
+      <input
+        type="text"
+        placeholder="PeerID (12D3KooW...)"
+        bind:value={dialPeerId}
+        class="dial-input peerid-input"
+      />
+      <input
+        type="text"
+        placeholder="/ip4/1.2.3.4/tcp/1234"
+        bind:value={dialAddr}
+        class="dial-input addr-input"
+      />
+      <button class="dial-btn" onclick={handleDial} disabled={!dialPeerId.trim() || !dialAddr.trim() || dialing}>
+        {dialing ? "Connecting..." : "Connect"}
+      </button>
+    </div>
+    {#if dialMessage}
+      <div class="dial-message" class:success={dialMessageOk} class:error={!dialMessageOk}>{dialMessage}</div>
+    {/if}
   </div>
 </div>
 
@@ -943,6 +1023,15 @@
     font-style: italic;
   }
 
+  .peerid-display {
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .peerid-display:hover {
+    color: #3b82f6;
+  }
+
   .topology-section {
     margin-top: 4px;
   }
@@ -1030,5 +1119,86 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
+  }
+
+  .dial-section {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-color, #2a2a2a);
+  }
+
+  .dial-section h4 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary, #fafafa);
+  }
+
+  .dial-form {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .dial-input {
+    background: var(--bg-secondary, #222);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: var(--text-primary, #fafafa);
+    font-size: 12px;
+    font-family: monospace;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  .dial-input:focus {
+    border-color: #3b82f6;
+  }
+
+  .peerid-input {
+    flex: 2;
+    min-width: 0;
+  }
+
+  .addr-input {
+    flex: 3;
+    min-width: 0;
+  }
+
+  .dial-btn {
+    background: #3b82f6;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.2s;
+  }
+
+  .dial-btn:hover:not(:disabled) {
+    background: #2563eb;
+  }
+
+  .dial-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dial-message {
+    margin-top: 6px;
+    font-size: 11px;
+    font-family: monospace;
+  }
+
+  .dial-message.success {
+    color: #22c55e;
+  }
+
+  .dial-message.error {
+    color: #ef4444;
   }
 </style>

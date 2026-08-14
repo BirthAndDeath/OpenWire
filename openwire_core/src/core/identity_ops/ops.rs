@@ -1,9 +1,11 @@
 use aws_lc_rs::kem::{DecapsulationKey, ML_KEM_768};
 use zeroize::Zeroizing;
 
+use libp2p::identity;
+
 use crate::{
     actor::p2p::{P2pActorBuilder, P2pActorHandle, P2pCommand},
-    core::ChatCore, p2p, storage,
+    core::ChatCore, p2p, peerid_store::PeerIdConfig, storage,
 };
 
 /// 关闭旧的 P2pActor 并等待事件循环退出
@@ -67,17 +69,7 @@ impl ChatCore {
 
     /// 选择当前身份（运行时切换）
     pub(crate) async fn select_identity(&mut self, identity_id: String) {
-        if let Some(pool) = storage::pool() {
-            if let Err(e) = storage::set_current_identity(pool, &identity_id).await {
-                tracing::error!("Failed to set current identity in DB: {e}");
-                let msg = format!("切换身份失败: {}", e);
-                self.send_warning_mpsc(msg).await;
-                return;
-            }
-        } else {
-            tracing::error!("Database pool not available for identity switch");
-            return;
-        }
+        // 所有 fallible 操作完成后才写 DB，避免中间失败导致 DB 与内存状态不一致
 
         let mldsa_handle = match rootcell::identity::PrivateKeyHandle::load(
             &self.data_dir.to_string_lossy(),
@@ -134,24 +126,34 @@ impl ChatCore {
         };
         let mlkem_pubkey_hex = hex::encode(&mlkem_public_key);
 
-        shutdown_old_actor(&self.p2p_handle).await;
-
         // 身份切换时复用设备级 PeerID，保持网络拓扑稳定
-        let (keypair, peerid_config) = match self.peerid_config.take() {
-            Some(config) => match config.to_keypair() {
-                Ok(kp) => (kp, config),
-                Err(e) => {
-                    tracing::warn!("Failed to restore PeerID from config, generating new: {e}");
-                    crate::identity::load_or_create_peerid(&self.data_dir)
-                }
-            },
-            None => crate::identity::load_or_create_peerid(&self.data_dir),
+        // 必须在 shutdown_old_actor 之前 resolve，避免 fallible 失败后无 actor 可用
+        let (keypair, peerid_config) = match self.ensure_peerid().await {
+            Ok(v) => v,
+            Err(e) => {
+                self.send_warning_mpsc(format!("切换身份失败：无法加载 PeerID: {e}")).await;
+                return;
+            }
         };
         self.peerid_config = Some(peerid_config);
         let peer_id = keypair.public().to_peer_id();
 
+        shutdown_old_actor(&self.p2p_handle).await;
+
         if let Err(e) = self.rebuild_p2p_stack(keypair).await {
             self.send_warning_mpsc(format!("切换身份失败：{}", e)).await;
+            return;
+        }
+
+        // 所有 fallible 操作成功，写入 DB 持久化当前身份
+        if let Some(pool) = storage::pool() {
+            if let Err(e) = storage::set_current_identity(pool, &identity_id).await {
+                tracing::error!("Failed to set current identity in DB: {e}");
+                self.send_warning_mpsc(format!("切换身份失败：{}", e)).await;
+                return;
+            }
+        } else {
+            tracing::error!("Database pool not available for identity switch");
             return;
         }
 
@@ -228,6 +230,7 @@ impl ChatCore {
             .dht_cache(self.dht_cache.clone())
             .data_dir(self.data_dir.clone())
             .relay_nodes(self.relay_nodes.clone())
+            .bootstrap_nodes(self.bootstrap_nodes.clone())
             .channel_size(crate::core::CHANNEL_CAPACITY)
             .cancellation_token(self.core_handle.shutdown_token.clone())
             .start();
@@ -236,19 +239,32 @@ impl ChatCore {
         Ok(())
     }
 
-    async fn reinitialize_swarm(&mut self) {
-        shutdown_old_actor(&self.p2p_handle).await;
-        let (keypair, peerid_config) = match self.peerid_config.take() {
+    #[allow(clippy::unused_async)]
+    async fn ensure_peerid(&mut self) -> Result<(identity::Keypair, PeerIdConfig), String> {
+        match self.peerid_config.take() {
             Some(config) => match config.to_keypair() {
-                Ok(kp) => (kp, config),
+                Ok(kp) => Ok((kp, config)),
                 Err(e) => {
-                    tracing::warn!("Failed to restore PeerID from config, generating new: {e}");
+                    tracing::warn!("Failed to restore PeerID from config, deleting corrupted entry: {e}");
                     crate::identity::load_or_create_peerid(&self.data_dir)
                 }
             },
             None => crate::identity::load_or_create_peerid(&self.data_dir),
+        }
+    }
+
+    async fn reinitialize_swarm(&mut self) {
+        // 先 resolve PeerID 再关机，避免 fallible 失败后无 actor 可用
+        let (keypair, peerid_config) = match self.ensure_peerid().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("重新初始化 swarm 失败：无法加载 PeerID: {e}");
+                self.send_warning_mpsc(format!("网络重建失败：无法加载 PeerID: {e}")).await;
+                return;
+            }
         };
         self.peerid_config = Some(peerid_config);
+        shutdown_old_actor(&self.p2p_handle).await;
         if let Err(e) = self.rebuild_p2p_stack(keypair).await {
             tracing::error!("{e}");
         }

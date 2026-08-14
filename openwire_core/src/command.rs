@@ -148,6 +148,14 @@ pub enum ChatCommand {
         /// 响应通道：返回 JSON 序列化的 RoutingTableExport
         resp: tokio::sync::oneshot::Sender<String>,
     },
+    /// 拨号到指定节点（手动连接，PeerID + Multiaddr）
+    DialPeer {
+        /// 目标节点 PeerID 字符串
+        peer_id: String,
+        /// 目标节点 Multiaddr 字符串
+        addr: String,
+    },
+
     /// 导入路由表（将其他节点导出的 peers 加入本地路由表）
     ImportRoutingTable {
         /// 导出的路由表 JSON 字符串
@@ -263,9 +271,13 @@ pub type ChatcoreEvent = MessageEvent;
 /// 导出文件中的单个节点信息
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutingTableExportPeer {
+    /// PeerID 字符串
     pub peer_id: String,
+    /// 该节点的 Multiaddr 列表
     pub addresses: Vec<String>,
+    /// 是否为 bootstrap 节点
     pub is_bootstrap: bool,
+    /// 是否为中继节点
     pub is_relay: bool,
 }
 
@@ -273,14 +285,20 @@ pub struct RoutingTableExportPeer {
 /// 注意：此文件不含任何密钥，仅含公网可发现的 PeerID 和 Multiaddr。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutingTableExport {
+    /// 导出格式版本号
     pub version: u32,
+    /// 导出时间戳（Unix 秒）
     pub exported_at: i64,
+    /// 本节点 PeerID
     pub self_peer_id: String,
+    /// 本节点地址列表
     pub self_addresses: Vec<String>,
+    /// 导出包含的节点列表
     pub peers: Vec<RoutingTableExportPeer>,
 }
 
 impl RoutingTableExport {
+    /// 当前导出格式版本号
     pub const CURRENT_VERSION: u32 = 1;
 }
 
@@ -291,6 +309,7 @@ impl RoutingTableExport {
 /// 单个节点的网络信息（用于拓扑图展示）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerInfoDto {
+    /// 节点 PeerID 字符串
     pub peer_id: String,
     /// 是否在线（当前有连接）
     pub connected: bool,
@@ -348,12 +367,19 @@ pub struct NetworkStatusData {
 impl NetworkStatusData {
     /// 错误码常量
     pub const OK: &'static str = "OK";
+    /// 核心未就绪
     pub const ERR_NOT_READY: &'static str = "not_ready";
+    /// 已连接网络但无 peer
     pub const ERR_DEGRADED_NO_PEERS: &'static str = "degraded_no_peers";
+    /// 核心未初始化
     pub const ERR_CORE_NOT_INITIALIZED: &'static str = "core_not_initialized";
+    /// 核心通道已关闭
     pub const ERR_CORE_CHANNEL_CLOSED: &'static str = "core_channel_closed";
+    /// 核心无响应
     pub const ERR_CORE_NO_RESPONSE: &'static str = "core_no_response";
+    /// P2P 通道已关闭
     pub const ERR_P2P_CHANNEL_CLOSED: &'static str = "p2p_channel_closed";
+    /// P2P 无响应
     pub const ERR_P2P_NO_RESPONSE: &'static str = "p2p_no_response";
 
     /// 生成包含最小完整字段集的错误 JSON（保证与 schema 一致）

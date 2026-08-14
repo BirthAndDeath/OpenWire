@@ -20,8 +20,8 @@ updates:
           - "patch"
       tauri:
         patterns: ["tauri*", "serde*", "specta*"]
-      frontend:
-        patterns: ["javascript"]
+      backend:
+        patterns: ["openwire*", "rootcell*"]
     versioning-strategy: "auto"
 
   - package-ecosystem: "npm"

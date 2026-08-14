@@ -14,6 +14,10 @@ pub mod notui;
 pub mod tui;
 pub mod use_json;
 
+/// ML-DSA 公钥验证失败的提示文案（CLI 多入口共用，避免漂移）
+pub const MLDSA_PUBKEY_INVALID: &str =
+    "ML-DSA 公钥无效（格式或密码学验证失败，应为3904字符的hex编码）";
+
 /// 文件分享信息，用于 TUI 渲染下载按钮
 #[derive(Debug, Clone)]
 pub struct FileShareInfo {

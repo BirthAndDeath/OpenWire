@@ -1,6 +1,6 @@
 use aws_lc_rs::encoding::AsRawBytes;
 use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey};
-use aws_lc_rs::unstable::signature::{ML_DSA_65, ML_DSA_65_SIGNING, PqdsaKeyPair};
+use aws_lc_rs::signature::{ML_DSA_65, ML_DSA_65_SIGNING, PqdsaKeyPair};
 /// ML-DSA 密钥对类型别名 (public_key, secret_key)
 pub type MlDsaKeypair = (Vec<u8>, Vec<u8>);
 
@@ -11,38 +11,41 @@ pub const ML_DSA_65_PRIVATE_KEY_LEN: usize = 4032;
 /// ML-DSA 65 签名长度（字节）
 pub const ML_DSA_65_SIGNATURE_LEN: usize = 3309;
 
-/// 验证 ML-DSA 公钥 hex 格式
-/// 此函数会：
-/// 解码并验证字节是否符合 ML-DSA-65 规范
-/// warn:需稳定aws-lc-rs稳定后使用密码学验证！！！
+/// 验证 ML-DSA 公钥字节是否为有效密钥（密码学验证）
+///
+/// 使用 aws-lc-rs 的 `UnparsedPublicKey::parse()` 方法对公钥字节进行
+/// 密码学级别的格式验证（包括算法匹配、编码有效性和系数范围检查）。
+///
 /// # 参数
-/// - hex: ML-DSA 公钥的十六进制字符串
+/// - pubkey: ML-DSA 公钥字节（原始格式，非 hex）
 ///
 /// # 返回
-/// - true 如果格式有效，false 则无效
+/// - true 如果公钥有效，false 则无效
+pub fn validate_mldsa_pubkey_bytes(pubkey: &[u8]) -> bool {
+    if pubkey.len() != ML_DSA_65_PUBLIC_KEY_LEN {
+        return false;
+    }
+    UnparsedPublicKey::new(&ML_DSA_65, pubkey)
+        .parse()
+        .is_ok()
+}
+
+/// 验证 ML-DSA 公钥 hex 字符串是否为有效密钥（格式 + 密码学验证）
+///
+/// 先验证 hex 编码格式和长度，再通过 aws-lc-rs 进行密码学级别验证
+/// （算法匹配、编码有效性、多项式系数范围检查）。
+///
+/// # 参数
+/// - hex: ML-DSA 公钥的十六进制字符串（3904 字符）
+///
+/// # 返回
+/// - true 如果公钥有效，false 则无效
 pub fn validate_mldsa_pubkey_hex(hex: &str) -> bool {
-    // 验证 hex 字符
     if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
-
-    // 尝试解码 hex 并验证长度
     match hex::decode(hex) {
-        Ok(bytes) => {
-            // 验证长度必须匹配 ML-DSA 65 公钥长度（1952 字节）
-            if bytes.len() != ML_DSA_65_PUBLIC_KEY_LEN {
-                return false;
-            }
-
-            // 创建 UnparsedPublicKey 对象来触发 aws-lc-rs 的基本验证
-            // 虽然 new() 不会立即验证，但它会存储算法和公钥的引用
-            // 如果后续调用 verify() 时公钥无效，会返回错误
-            let _public_key = UnparsedPublicKey::new(&ML_DSA_65, &bytes);
-
-            // 如果能成功创建对象且长度正确，认为基本格式有效
-            // 真正的密码学验证会在实际使用时通过 verify_signature() 进行
-            true
-        }
+        Ok(bytes) => validate_mldsa_pubkey_bytes(&bytes),
         Err(_) => false,
     }
 }

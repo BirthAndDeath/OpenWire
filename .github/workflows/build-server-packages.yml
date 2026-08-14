@@ -1,0 +1,148 @@
+name: "build-server-packages"
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - release
+      - nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build-deb:
+    name: "DEB (${{ matrix.platform }})"
+    permissions:
+      contents: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+          - platform: "ubuntu-22.04-arm"
+            target: "aarch64-unknown-linux-gnu"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: install dependencies (ubuntu arm only)
+        if: matrix.platform == 'ubuntu-22.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev:arm64 pkg-config
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            openwire_core
+            rootcell
+            openwire_cli
+            openwire_server
+          cache-targets: "true"
+          cache-all-crates: "true"
+          cache-bin: "true"
+          cache-on-failure: "true"
+
+      - name: install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: build server .deb
+        run: cargo deb -p openwire-server-cli --target ${{ matrix.target }}
+
+      - name: upload .deb artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openwire-server-cli-deb-${{ matrix.target }}
+          path: target/${{ matrix.target }}/debian/*.deb
+
+      - name: create GitHub release with .deb
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/${{ matrix.target }}/debian/*.deb
+          draft: true
+          generate_release_notes: true
+
+  build-rpm:
+    name: "RPM (${{ matrix.target }})"
+    permissions:
+      contents: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+          - platform: "ubuntu-22.04-arm"
+            target: "aarch64-unknown-linux-gnu"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: install dependencies (ubuntu arm only)
+        if: matrix.platform == 'ubuntu-22.04-arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev:arm64 pkg-config
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            openwire_core
+            rootcell
+            openwire_cli
+            openwire_server
+          cache-targets: "true"
+          cache-all-crates: "true"
+          cache-bin: "true"
+          cache-on-failure: "true"
+
+      - name: install rpmbuild and cargo-rpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          cargo install cargo-rpm --locked
+
+      - name: build server .rpm
+        run: cargo rpm build -p openwire-server-cli --target ${{ matrix.target }}
+
+      - name: upload .rpm artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: openwire-server-cli-rpm-${{ matrix.target }}
+          path: target/${{ matrix.target }}/rpm/**/*.rpm
+
+      - name: create GitHub release with .rpm
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/${{ matrix.target }}/rpm/**/*.rpm
+          draft: true
+          generate_release_notes: true
+
+  # build-snap: 暂未注册 snap store 包名，待准备就绪后启用

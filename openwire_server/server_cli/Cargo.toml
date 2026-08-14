@@ -2,6 +2,10 @@
 name = "openwire-server-cli"
 version = "0.1.0"
 edition = "2024"
+description = "OpenWire Circuit Relay v2 server for NAT traversal"
+license = "AGPL-3.0"
+homepage = "https://github.com/BirthAndDeath/OpenWire"
+repository = "https://github.com/BirthAndDeath/OpenWire"
 
 [dependencies]
 openwire_server_common = { path = "../common" }
@@ -9,3 +13,29 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 anyhow = "1.0.104"
+
+[package.metadata.deb]
+maintainer = "OpenWire Contributors"
+copyright = "2026, OpenWire Contributors"
+extended-description = "OpenWire relay server used for NAT traversal. Deploy on a public-IP host so NATed clients can connect over Circuit Relay v2 and upgrade to direct connection via DCUtR."
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/openwire-server-cli", "usr/bin/", "755"],
+    ["debian/openwire-relay.service", "etc/systemd/system/", "644"],
+]
+pre-install-script = "debian/preinst"
+post-install-script = "debian/postinst"
+pre-remove-script = "debian/prerm"
+post-remove-script = "debian/postrm"
+
+[package.metadata.rpm]
+package = "openwire-server-cli"
+license = "AGPL-3.0"
+group = "Networking"
+summary = "OpenWire Circuit Relay v2 server for NAT traversal"
+description = """OpenWire relay server used for NAT traversal. Deploy on a public-IP host so NATed clients can connect over Circuit Relay v2 and upgrade to direct connection via DCUtR."""
+assets = [
+    ["target/release/openwire-server-cli", "/usr/bin/", "755"],
+    ["debian/openwire-relay.service", "/usr/lib/systemd/system/", "644"],
+]

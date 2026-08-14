@@ -42,7 +42,7 @@ pub enum NetEventRequest {
         /// 发送者的当前 ML-KEM 公钥 hex（随通知直接传递，无需 DHT 查询）
         mlkem_pubkey_hex: String,
         /// 发送者对身份声明（FriendOnline 负载）的 ML-DSA 签名。
-        /// `None` 表示来自旧客户端，跳过签名验证（降级信任）。
+        /// `None` 表示缺失签名，接收端会直接拒绝此请求并记录警告。
         /// 用于在接收端验证通告者确实持有 mldsa_pubkey_hex 对应的私钥，
         /// 防止攻击者冒充他人公钥污染 pubkey→PeerID / ML-KEM 缓存。
         #[serde(default)]

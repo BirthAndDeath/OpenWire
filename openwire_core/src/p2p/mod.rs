@@ -12,12 +12,3 @@ mod swarm;
 pub use behaviour::MyBehaviour;
 pub use events::handle_incoming_request;
 pub use swarm::{save_routing_table, swarm_init};
-
-use libp2p::PeerId;
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-
-/// GetProviders 查询回调注册表
-pub(crate) static DHT_PROVIDER_CALLBACKS: LazyLock<
-    Mutex<HashMap<String, tokio::sync::oneshot::Sender<PeerId>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));

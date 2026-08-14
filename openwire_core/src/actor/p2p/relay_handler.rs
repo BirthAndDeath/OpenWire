@@ -287,7 +287,8 @@ impl P2pActor {
             return;
         }
         // libp2p 0.56 中继服务 behaviour 复用基础 TCP/QUIC 传输，
-        // 无需 listen_on(/p2p-circuit)；启用即向 DHT 注册以便任何节点发现。
+        // 无需 listen_on(/p2p-circuit)；启用即向 DHT 注册以便任何节点发现，
+        // 同时打开 behaviour 的运行时开关（本地 patch），真正开始服务入站中继请求。
         let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY);
         match self
             .swarm
@@ -296,6 +297,10 @@ impl P2pActor {
             .start_providing(relay_key)
         {
             Ok(_) => {
+                self.swarm
+                    .behaviour_mut()
+                    .relay_server
+                    .set_server_enabled(true);
                 tracing::info!(
                     "Relay server enabled: providing /{DHT_RELAY_INDEX_KEY}, serving HOP to any peer"
                 );
@@ -314,8 +319,13 @@ impl P2pActor {
             .behaviour_mut()
             .kademlia
             .stop_providing(&relay_key);
+        // 关闭 behaviour 运行时开关，拒绝新的入站 reservation/circuit 请求
+        self.swarm
+            .behaviour_mut()
+            .relay_server
+            .set_server_enabled(false);
         self.relay_server_enabled = false;
-        tracing::info!("Relay server disabled (stopped DHT providing)");
+        tracing::info!("Relay server disabled (stopped DHT providing + relay behaviour)");
     }
 
     /// 设置中继角色，强制互斥：server / client / off

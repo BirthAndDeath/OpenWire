@@ -82,6 +82,10 @@ pub struct ChatCore {
     pub(crate) mldsa_private_key: Option<Zeroizing<Vec<u8>>>,
     /// 活跃的文件传输状态（file_id -> FileTransferState）
     pub(crate) file_transfers: HashMap<String, FileTransferState>,
+    /// 出站传输计数（下载请求，单独计算保持各方向有独立配额）
+    pub(crate) outbound_file_count: usize,
+    /// 入站传输计数（文件流分片，单独计算保持各方向有独立配额）
+    pub(crate) inbound_file_count: usize,
     /// 上次文件传输超时扫描时间（限制扫描频率，避免每分片触发）
     pub(crate) last_file_timeout_scan: std::time::Instant,
     /// 内存 DHT 缓存
@@ -153,15 +157,11 @@ impl ChatCore {
             &mlkem_pubkey_hex[..16]
         );
 
-        // 加载或创建持久化的 PeerID（8h~24h 随机 TTL，仅启动时检查）
-        let (keypair, peerid_config) = identity::load_or_create_peerid(&cfg.data_dir);
+        // 加载或创建持久化的 PeerID
+        let (keypair, peerid_config) = identity::load_or_create_peerid(&cfg.data_dir)
+            .map_err(|e| CoreError::InitFailed(format!("PeerID 初始化失败: {e}")))?;
         let peer_id = keypair.public().to_peer_id();
-        tracing::info!(
-            "PeerID for transport: {} (TTL={}s, ~{}h remaining)",
-            peer_id,
-            peerid_config.ttl_secs(),
-            peerid_config.ttl_secs() / 3600,
-        );
+        tracing::info!("PeerID for transport: {}", peer_id);
 
         // 初始化内存 DHT 缓存
         let dht_cache = DhtCache::new();
@@ -223,6 +223,8 @@ impl ChatCore {
             mlkem_pubkey_hex: Some(mlkem_pubkey_hex_for_dht),
             mldsa_private_key: Some(mldsa_private_key),
             file_transfers: HashMap::new(),
+            outbound_file_count: 0,
+            inbound_file_count: 0,
             last_file_timeout_scan: std::time::Instant::now(),
             dht_cache,
             connected_peers: std::collections::HashMap::new(),

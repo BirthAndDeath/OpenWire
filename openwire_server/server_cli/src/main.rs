@@ -1,5 +1,16 @@
 use std::path::Path;
 
+fn print_usage() {
+    println!("OpenWire Relay Server v{}", env!("CARGO_PKG_VERSION"));
+    println!("用法 / Usage: openwire-server-cli [data_dir] [port]");
+    println!("示例 / Examples:");
+    println!("  openwire-server-cli                      # 默认数据目录 .openwire-relay，端口 44909");
+    println!("  openwire-server-cli /path/to/data 44909  # 指定数据目录和端口");
+    println!("参数 / Args:");
+    println!("  data_dir  数据目录，存放密钥/DB/配置 / data directory for keys, DB and config");
+    println!("  port      监听端口 / listen port (default 44909)");
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -8,8 +19,18 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        print_usage();
+        return Ok(());
+    }
+
     let dir = args.get(1).map(|s| Path::new(&s).to_path_buf());
-    let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(44909);
+    let port: u16 = match args.get(2) {
+        Some(raw) => raw.parse().map_err(|_| {
+            anyhow::anyhow!("端口无效 / invalid port '{}'", raw)
+        })?,
+        None => 44909,
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(async {

@@ -9,6 +9,32 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
+/// 移除字符串中的终端转义序列，防止终端注入攻击
+/// 保留可打印 ASCII 与普通非 ASCII 字符（CJK/emoji 等），剥离：
+/// - C0/C1 控制字符（ESC 等）
+/// - Unicode 格式控制字符（bidi 覆盖/定向符、零宽字符等，General_Category=Cf）
+/// 使用 unicode-properties 的 General_Category API，而非硬编码码位范围，
+/// 随 Unicode 数据表演进自动覆盖新增字符。
+fn strip_escape(s: &str) -> String {
+    use unicode_properties::GeneralCategory;
+    use unicode_properties::UnicodeGeneralCategory;
+    s.chars()
+        .filter(|&c| {
+            if c.is_control() {
+                return false;
+            }
+            let gc = c.general_category();
+            if gc == GeneralCategory::Format
+                || gc == GeneralCategory::LineSeparator
+                || gc == GeneralCategory::ParagraphSeparator
+            {
+                return false;
+            }
+            c.is_ascii_graphic() || c == ' ' || !c.is_ascii()
+        })
+        .collect()
+}
+
 pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
     // 获取对 core 的引用并启动它
     let mut core = app.core.take().ok_or(CliError::CoreNotInitialized)?;
@@ -32,7 +58,7 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                         } else {
                             sender.clone()
                         };
-                        println!("[{}] {}", short_sender, text);
+                        println!("[{}] {}", short_sender, strip_escape(&text));
                     }
                     IncomingMessage::FileShare {
                         filename,
@@ -48,7 +74,7 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                         };
                         println!(
                             "[文件] {} 向你分享文件: {} ({} bytes, id: {})",
-                            short_sender, filename, total_size, file_id
+                            short_sender, strip_escape(&filename), total_size, file_id
                         );
                     }
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
@@ -84,7 +110,7 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                 MessageEvent::FileTransferProgress(progress) => {
                     println!(
                         "[文件传输] {} ({}/{}) - {}",
-                        progress.filename,
+                        strip_escape(&progress.filename),
                         progress.received_bytes,
                         progress.total_size,
                         progress.status,
@@ -159,7 +185,7 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
             }
 
             if !validate_mldsa_pubkey_hex(&pubkey_hex) {
-                println!("ML-DSA 公钥格式不正确（应为3904字符的hex编码），请重新输入");
+                println!("{}，请重新输入", crate::MLDSA_PUBKEY_INVALID);
                 continue;
             }
 

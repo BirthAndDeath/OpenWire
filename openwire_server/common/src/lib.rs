@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZero;
 use std::path::Path;
 use std::str::FromStr;
@@ -23,6 +24,9 @@ const DHT_RELAY_INDEX_KEY: &str = "relay_nodes_public";
 const PROTOCOL_KAD: StreamProtocol = StreamProtocol::new("/chat/kad/0.0.1");
 const PROTOCOL_NETEVENT: StreamProtocol = StreamProtocol::new("/chat/rr_netevent/0.0.1");
 
+/// 中继信息输出文件：PeerId 与监听地址，供运维复制到客户端 nodes.json
+const RELAY_INFO_FILE: &str = "relay-info.json";
+
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
     relay: relay::Behaviour,
@@ -41,7 +45,8 @@ fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
         )?)?);
     }
     let kp = identity::Keypair::generate_ed25519();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("密钥路径 {} 没有父目录", path.display()))?;
+    std::fs::create_dir_all(parent)?;
     let encoded = kp.to_protobuf_encoding()?;
     #[cfg(unix)]
     {
@@ -52,7 +57,16 @@ fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
         let mut f = opts.open(path)?;
         f.write_all(&encoded)?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).share_mode(0);
+        let mut f = opts.open(path)?;
+        f.write_all(&encoded)?;
+    }
+    #[cfg(not(any(unix, windows)))]
     std::fs::write(path, &encoded)?;
     Ok(kp)
 }
@@ -187,40 +201,87 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
         .build();
 
-    swarm.listen_on(
+    // 各地址族独立尝试监听：端口被占用时回退到 OS 分配端口，仅记录警告不中断启动。
+    try_listen_or_fallback(
+        &mut swarm,
         Multiaddr::empty()
-            .with(Protocol::from(std::net::Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
             .with(Protocol::Tcp(port)),
-    )?;
-    swarm.listen_on(
         Multiaddr::empty()
-            .with(Protocol::from(std::net::Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    );
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
             .with(Protocol::Tcp(port)),
-    )?;
-    swarm.listen_on(
         Multiaddr::empty()
-            .with(Protocol::from(std::net::Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    );
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
             .with(Protocol::Udp(port))
             .with(Protocol::QuicV1),
-    )?;
-    swarm.listen_on(
         Multiaddr::empty()
-            .with(Protocol::from(std::net::Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    );
+    try_listen_or_fallback(
+        &mut swarm,
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
             .with(Protocol::Udp(port))
             .with(Protocol::QuicV1),
-    )?;
+        Multiaddr::empty()
+            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    );
 
     let relay_key = libp2p::kad::RecordKey::new(&DHT_RELAY_INDEX_KEY.as_bytes().to_vec());
     swarm.behaviour_mut().kademlia.start_providing(relay_key)?;
+
+    // 定时清理已过期的 DHT 记录与 provider 记录，防止 redb 数据库无限增长。
+    // 清理在独立任务中执行，避免阻塞 swarm 主循环。
+    {
+        let cleanup_db = db.clone();
+        tokio::spawn(async move {
+            let store = RedbRecordStore::new(cleanup_db);
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            interval.tick().await; // 跳过首次立即触发
+            loop {
+                interval.tick().await;
+                match store.cleanup_expired_records() {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("DHT expired record cleanup failed: {e}"),
+                }
+            }
+        });
+    }
 
     let mut friend_online_rate: HashMap<PeerId, Instant> = HashMap::new();
     const FRIEND_ONLINE_COOLDOWN: Duration = Duration::from_secs(5);
     const FRIEND_ONLINE_RATE_MAX: usize = 10_000;
 
+    // 监听地址集合：NewListenAddr 事件到达后重写 relay-info.json
+    let mut listened: HashSet<Multiaddr> = HashSet::new();
+    write_relay_info(dir, &peer_id, &listened);
+    println!(
+        "中继信息已写入 / Relay info written to: {:?}",
+        dir.join(RELAY_INFO_FILE)
+    );
+
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("Listening on {address}");
+                listened.insert(address);
+                write_relay_info(dir, &peer_id, &listened);
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(
                 relay::Event::ReservationReqAccepted { src_peer_id, .. },
@@ -249,7 +310,8 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                     } => {
                         // 校验 PeerID 与签名：无效请求返回 Nack，不缓存
                         let mut response = NetEventResponse::Ack;
-                        if *peer_id != peer.to_string() {
+                        let claimed_peer: Option<PeerId> = peer_id.parse().ok();
+                        if claimed_peer != Some(peer) {
                             tracing::warn!(
                                 "relay FriendOnline PeerID mismatch: claimed={}, actual={}",
                                 peer_id,
@@ -359,5 +421,59 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             // 忽略其他事件
             _ => {}
         }
+    }
+}
+
+/// 尝试用偏好端口监听，失败则回退到 OS 分配端口（port 0）。
+///
+/// 中继服务器的端口常被客户端硬编码，但端口被占用时不应让整个服务器崩溃；
+/// 记录警告并继续运行，监听地址通过 `NewListenAddr` 事件输出。
+fn try_listen_or_fallback(swarm: &mut libp2p::swarm::Swarm<RelayBehaviour>, preferred: Multiaddr, fallback: Multiaddr) {
+    match swarm.listen_on(preferred.clone()) {
+        Ok(_) => tracing::debug!("Listening on preferred {}", preferred),
+        Err(e) => {
+            tracing::warn!("Preferred {} unavailable ({e}), falling back to OS-assigned port", preferred);
+            tracing::debug!("Attempting fallback listen on {fallback}");
+            if let Err(fe) = swarm.listen_on(fallback.clone()) {
+                tracing::error!("Listen fallback {fallback} failed: {fe}");
+            }
+        }
+    }
+}
+
+/// 将中继服务器的 PeerId 与监听地址写入数据目录 `relay-info.json`，
+///
+/// 地址附加 `/p2p/<peer_id>` 后缀，格式与客户端配置一致。
+/// 端口从实际监听地址解析，避免使用偏好端口掩盖回退分配。
+fn write_relay_info(dir: &Path, peer_id: &PeerId, addresses: &HashSet<Multiaddr>) {
+    let port = addresses
+        .iter()
+        .find_map(|a| {
+            a.iter().find_map(|p| match p {
+                Protocol::Tcp(p) | Protocol::Udp(p) => Some(p),
+                _ => None,
+            })
+        })
+        .unwrap_or(0);
+    let list: Vec<String> = addresses
+        .iter()
+        .map(|a| format!("{a}/p2p/{peer_id}"))
+        .collect();
+    let mut sorted = list;
+    sorted.sort();
+    let info = serde_json::json!({
+        "peer_id": peer_id.to_string(),
+        "port": port,
+        "addresses": sorted,
+        "note": "Replace /ip4/0.0.0.0 with the server's public IP; add an entry to client nodes.json relay_nodes"
+    });
+    let path = dir.join(RELAY_INFO_FILE);
+    match serde_json::to_string_pretty(&info) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, format!("{s}\n")) {
+                tracing::warn!("Failed to write relay info file {:?}: {e}", path);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize relay info: {e}"),
     }
 }

@@ -165,6 +165,33 @@ impl ChatCore {
                     Err(_) => { let _ = resp.send(serde_json::json!({ "version": 0, "peers": [], "error": "P2pActor did not respond" }).to_string()); }
                 }
             }
+            ChatCommand::DialPeer { peer_id, addr } => {
+                let peer_id = match peer_id.parse::<libp2p::PeerId>() {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        tracing::warn!("Invalid PeerId for dial: {peer_id}: {e}");
+                        return;
+                    }
+                };
+                let multiaddr = match addr.parse::<libp2p::Multiaddr>() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!("Invalid Multiaddr for dial: {addr}: {e}");
+                        return;
+                    }
+                };
+                // 先添加到 Kademlia 路由表，再拨号
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::AddKademliaAddress {
+                    peer_id,
+                    addr: multiaddr.clone(),
+                }) {
+                    tracing::warn!("Failed to send AddKademliaAddress: {e:?}");
+                }
+                let dial_addr = multiaddr.with(libp2p::multiaddr::Protocol::P2p(peer_id));
+                if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::DialAddr { addr: dial_addr }) {
+                    tracing::warn!("Failed to send DialAddr: {e:?}");
+                }
+            }
             ChatCommand::ImportRoutingTable { data, resp } => {
                 let (p2p_tx, p2p_rx) = tokio::sync::oneshot::channel();
                 if let Err(e) = self.p2p_handle.tx.try_send(P2pCommand::ImportRoutingTable { data, resp: p2p_tx }) {

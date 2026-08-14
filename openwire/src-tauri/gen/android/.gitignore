@@ -1,5 +1,6 @@
 *.iml
 .gradle
+/gradle/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -18,3 +19,4 @@ keystore.properties
 
 /.tauri
 /tauri.settings.gradle
+upload-keystore.jks

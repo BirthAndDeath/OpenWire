@@ -121,7 +121,7 @@ impl ChatCore {
                 .await;
             return;
         }
-        if self.file_transfers.len() >= crate::transfer::MAX_CONCURRENT_TRANSFERS {
+        if self.outbound_file_count >= crate::transfer::MAX_CONCURRENT_TRANSFERS {
             let max = crate::transfer::MAX_CONCURRENT_TRANSFERS;
             tracing::warn!("并发下载数已达上限 {max}");
             self.send_warning_mpsc(format!("并发下载数已达上限 ({max})，请等待当前下载完成"))
@@ -146,6 +146,7 @@ impl ChatCore {
             started_at: Instant::now(),
         };
         self.file_transfers.insert(hash_hex.clone(), state);
+        self.outbound_file_count += 1;
 
         let request = crate::message::DownloadRequest { file_hash };
         let data = match postcard::to_allocvec(&request) {
@@ -153,6 +154,7 @@ impl ChatCore {
             Err(e) => {
                 tracing::error!("序列化 DownloadRequest 失败: {e}");
                 self.file_transfers.remove(&hash_hex);
+                self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
                 return;
             }
         };
@@ -166,6 +168,7 @@ impl ChatCore {
         {
             tracing::error!("发送 FileDownloadRequest 失败: {e}");
             self.file_transfers.remove(&hash_hex);
+            self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
             self.send_warning_mpsc(format!("文件下载请求发送失败: {e}"))
                 .await;
         }
@@ -176,15 +179,22 @@ impl ChatCore {
         response: crate::message::DownloadResponse,
     ) {
         let hash_hex = hex::encode(response.file_hash);
-        let output_path = self
-            .downloads_dir()
-            .join(response.filename.as_deref().unwrap_or("unknown"));
+        let raw_filename = response.filename.as_deref().unwrap_or("unknown");
+        let safe = sanitize_filename(raw_filename).unwrap_or_else(|| "unknown".to_string());
+        let downloads_dir = self.downloads_dir();
+        let output_path = downloads_dir.join(&safe);
+        if !validate_path_within_base(&output_path, &downloads_dir) {
+            tracing::warn!("DownloadResponse 文件名不安全: {}", raw_filename);
+            self.send_warning_mpsc(format!("下载响应文件名校验失败: {}", raw_filename)).await;
+            self.file_transfers.remove(&hash_hex);
+            self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
+            return;
+        }
         let Some(state) = self.file_transfers.get_mut(&hash_hex) else {
             tracing::warn!("DownloadResponse 无对应状态: {}..", &hash_hex[..16]);
             return;
         };
-        let filename = response.filename.unwrap_or_else(|| "unknown".to_string());
-        state.filename = filename.clone();
+        state.filename = safe;
         state.total_size = response.total_size.unwrap_or(0);
         state.total_chunks = response.total_chunks.unwrap_or(0);
         state.chunk_size = response.chunk_size.unwrap_or(0);
@@ -195,7 +205,10 @@ impl ChatCore {
                 .ok() == Some(response.file_hash))
         {
             tracing::info!("文件已存在且哈希匹配: {:?}", output_path);
-            self.file_transfers.remove(&hash_hex);
+            let filename = state.filename.clone();
+            let file_transfers = &mut self.file_transfers;
+            file_transfers.remove(&hash_hex);
+            self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
             self.send_log_mpsc(format!("文件已存在: {}", filename))
                 .await;
             return;
@@ -211,13 +224,13 @@ impl ChatCore {
             return;
         }
         self.last_file_timeout_scan = now;
-        let timed_out: Vec<String> = self
+        let timed_out: Vec<(String, bool)> = self
             .file_transfers
             .iter()
             .filter(|(_, s)| now.duration_since(s.started_at) > crate::transfer::TRANSFER_TIMEOUT)
-            .map(|(id, _)| id.clone())
+            .map(|(id, s)| (id.clone(), !matches!(s.status, TransferStatus::Requesting)))
             .collect();
-        for id in &timed_out {
+        for (id, is_inbound) in &timed_out {
             let state_path = self.downloads_dir().join(format!(
                 ".{}.state",
                 &hex::encode(
@@ -233,6 +246,11 @@ impl ChatCore {
                 let _ = std::fs::remove_file(&state_path);
             }
             self.file_transfers.remove(id);
+            if *is_inbound {
+                self.inbound_file_count = self.inbound_file_count.saturating_sub(1);
+            } else {
+                self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
+            }
         }
         if !timed_out.is_empty() {
             tracing::info!("已清理 {} 个超时传输", timed_out.len());
@@ -380,6 +398,7 @@ impl ChatCore {
             TransferProgressStatus::Completed,
         );
         self.file_transfers.remove(file_id_hex);
+        self.inbound_file_count = self.inbound_file_count.saturating_sub(1);
         let _ = std::fs::remove_file(
             self.downloads_dir()
                 .join(format!(".{}.state", &file_id_hex[..16])),
@@ -397,6 +416,11 @@ impl ChatCore {
 
         let is_new = !self.file_transfers.contains_key(&id_hex);
         if is_new {
+            if self.inbound_file_count >= crate::transfer::MAX_CONCURRENT_TRANSFERS {
+                return Err(CoreError::FileTransferFailed(format!(
+                    "入站并发传输数已达上限 ({})", crate::transfer::MAX_CONCURRENT_TRANSFERS
+                )));
+            }
             let temp = self.downloads_dir().join(format!(".{}.tmp", &id_hex[..16]));
             let out = self.downloads_dir().join(&safe_name);
             if !validate_path_within_base(&out, &self.downloads_dir()) {
@@ -421,6 +445,7 @@ impl ChatCore {
                     started_at: Instant::now(),
                 },
             );
+            self.inbound_file_count += 1;
         }
 
         if let Some(state) = self.file_transfers.get(&id_hex)

@@ -281,13 +281,35 @@ impl Behaviour {
     }
 
     /// Enable or disable serving as a relay server at runtime.
-    /// Disabling closes all existing reservations/circuits and stops accepting
-    /// new inbound relay requests. Local patch addition.
+    ///
+    /// Disabling stops accepting new inbound reservation/circuit requests
+    /// (including on already-established connections) and closes both endpoints
+    /// of every active circuit so relayed traffic stops immediately. Existing
+    /// reservations are kept in the tracker so their teardown is still reported
+    /// through [`Event::ReservationClosed`]/[`Event::CircuitClosed`] by
+    /// `on_connection_closed`; per-connection denial rejects renewals.
+    /// Local patch addition.
     pub fn set_server_enabled(&mut self, enabled: bool) {
         self.server_enabled = enabled;
         if !enabled {
-            self.reservations.clear();
-            self.circuits.circuits.clear();
+            let close_targets: Vec<(PeerId, ConnectionId)> = self
+                .circuits
+                .circuits
+                .values()
+                .filter(|c| matches!(c.status, CircuitStatus::Accepted))
+                .flat_map(|c| {
+                    [
+                        (c.src_peer_id, c.src_connection_id),
+                        (c.dst_peer_id, c.dst_connection_id),
+                    ]
+                })
+                .collect();
+            for (peer_id, connection) in close_targets {
+                self.queued_actions.push_back(ToSwarm::CloseConnection {
+                    peer_id,
+                    connection: libp2p_swarm::CloseConnection::One(connection),
+                });
+            }
         }
     }
 
@@ -568,8 +590,8 @@ impl NetworkBehaviour for Behaviour {
                         }
                     }
                     hash_map::Entry::Vacant(_) => {
-                        unreachable!(
-                            "Expect to track timed out reservation with peer {:?} on connection {:?}",
+                        tracing::debug!(
+                            "Reservation timed out for peer {:?} on connection {:?} but no longer tracked",
                             event_source,
                             connection,
                         );

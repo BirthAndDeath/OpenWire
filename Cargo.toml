@@ -50,6 +50,7 @@ tracing = "0.1.44"
 rand = "0.10"
 [patch.crates-io]
 libp2p-mdns = { path = "patches/libp2p-mdns" }
+libp2p-relay = { path = "patches/libp2p-relay" }
 libp2p-request-response = { path = "patches/libp2p-request-response" }
 
 [profile.dev]

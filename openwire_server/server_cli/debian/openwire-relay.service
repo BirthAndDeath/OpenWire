@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenWire Relay Server
+Documentation=https://github.com/BirthAndDeath/OpenWire
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openwire
+Group=openwire
+ExecStart=/usr/bin/openwire-server-cli /var/lib/openwire-relay 44909
+Restart=on-failure
+RestartSec=30
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+# 运行目录可写，便于 ./openwire-relay 兜底路径与日志
+WorkingDirectory=/var/lib/openwire-relay
+
+[Install]
+WantedBy=multi-user.target

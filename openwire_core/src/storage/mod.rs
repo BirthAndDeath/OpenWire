@@ -22,11 +22,10 @@ pub use identity::{
     set_current_identity,
 };
 pub use message::{
-    Message, add_message, add_message_with_hash, add_messages_batch, delete_message,
-    delete_messages_batch, delete_messages_by_peer, get_last_message, get_message,
-    get_message_by_hash, get_messages, get_messages_range, list_failed, list_pending,
-    list_pending_by_peer, mark_failed, mark_pending, mark_sent, mark_sent_batch, mark_sent_by_hash,
-    update_message_hash,
+    Message, MAX_MESSAGE_PAGE_SIZE, add_message_with_hash, delete_message, delete_messages_batch,
+    delete_messages_by_peer, get_last_message, get_message, get_message_by_hash, get_messages,
+    get_messages_range, list_failed, list_pending, list_pending_by_peer, mark_failed, mark_pending,
+    mark_sent, mark_sent_batch, mark_sent_by_hash, update_message_hash,
 };
 pub use sent_file::{
     SentFile, add_sent_file, delete_sent_file, get_sent_file, list_all_sent_files, verify_sent_file,

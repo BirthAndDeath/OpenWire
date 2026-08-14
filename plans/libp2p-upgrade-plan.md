@@ -17,11 +17,9 @@
 
 | 项目 | 版本 |
 |------|------|
-| aws-lc-rs (crates.io) | **1.17.3**（最新） |
-| ML-DSA 状态 | 🔴 仍处于 `unstable` feature gate 下 |
-| 依赖路径 | `openwire_core → aws-lc-rs`（features = `["unstable", "prebuilt-nasm"]`） |
-| 使用位置 | `signature.rs`、`identity.rs` 中的 `ML_DSA_65_SIGNING`、`PqdsaKeyPair` |
-| 上游状态 | `src/unstable/signature.rs` 暴露，`src/pqdsa/` 为 `pub(crate)` 内部模块 |
+| aws-lc-rs (crates.io) | **1.18.0**（最新） |
+| ML-DSA 状态 | ✅ 已稳定，从 `aws_lc_rs::signature` 直接导入，无需 `unstable` feature gate |
+| 依赖路径 | `openwire_core → aws-lc-rs`（features = `["prebuilt-nasm"]`） |
 
 ---
 
@@ -175,43 +173,25 @@ cargo clippy --workspace
 
 ---
 
-## 附加：ML-DSA 稳定化跟踪
+## 附加：ML-DSA 稳定化（✅ 已完成）
 
-### 当前需要 `unstable` feature 的代码
-
-```rust
-// openwire_core/src/signature.rs:3
-use aws_lc_rs::unstable::signature::{ML_DSA_65, ML_DSA_65_SIGNING, PqdsaKeyPair};
-
-// openwire_core/src/identity.rs:178-179
-use aws_lc_rs::unstable::signature::ML_DSA_65_SIGNING;
-use aws_lc_rs::unstable::signature::PqdsaKeyPair;
-```
-
-### 稳定化后的迁移
-
-当 `aws-lc-rs` 将 ML-DSA 移出 `unstable` 后：
-
-```toml
-# Cargo.toml 移除 unstable feature
-aws-lc-rs = { version = "1.x", features = ["prebuilt-nasm"] }
-```
+`aws-lc-rs 1.18.0` 已将 ML-DSA 移出 unstable。当前代码直接从 `aws_lc_rs::signature` 导入：
 
 ```rust
-// 移除 unstable 路径前缀
 use aws_lc_rs::signature::{ML_DSA_65, ML_DSA_65_SIGNING, PqdsaKeyPair};
 ```
 
-### 检查方法
+`openwire_core/Cargo.toml` 中已移除 `unstable` feature：
+
+```toml
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+```
+
+### 后续检查
 
 ```bash
 # 定期检查 aws-lc-rs 是否有新版本
 cargo search aws-lc-rs --limit 1
-
-# 检查 unstable 是否被移除（PowerShell）
-Select-String -Path Cargo.lock -Pattern 'aws-lc-rs' -SimpleMatch -Context 0,3
-# 检查 Cargo.toml 中 unstable feature 是否仍被启用
-Select-String -Path openwire_core/Cargo.toml -Pattern 'unstable'
 ```
 
 ## 补丁维护清单

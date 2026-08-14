@@ -37,6 +37,23 @@ pub enum ChatMessageType {
     FileDownloadResponse = 6,
 }
 
+impl TryFrom<i32> for ChatMessageType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Text),
+            1 => Ok(Self::FileHash),
+            2 => Ok(Self::FileStream),
+            3 => Ok(Self::FileDownloadRequest),
+            4 => Ok(Self::DeliveryReceipt),
+            5 => Ok(Self::OnlineStatus),
+            6 => Ok(Self::FileDownloadResponse),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// 聊天消息结构，包含签名、时间戳和完整性校验
 pub struct ChatMessage {

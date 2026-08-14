@@ -1,5 +1,6 @@
-use crate::actor::p2p::{swarm_ops as p2p_swarm_ops, P2pCommand};
 use sha2::{Digest, Sha256};
+
+use crate::actor::p2p::{swarm_ops as p2p_swarm_ops, P2pCommand};
 
 use crate::{core::ChatCore, crypto, error::CoreError, message::ChatMessageType, storage};
 
@@ -27,7 +28,7 @@ impl ChatCore {
         data: Vec<u8>,
         is_retry: bool,
     ) -> Result<String, CoreError> {
-        let pubkey_short = &mldsa_pubkey_hex[..16];
+        let pubkey_short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
         tracing::debug!(
             "send_text_impl: is_retry={}, msgtype={:?}, data_len={}",
             is_retry,
@@ -244,17 +245,17 @@ impl ChatCore {
     ) {
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
         if let Some(pool) = storage::pool() {
+            let content = match msgtype {
+                ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
+                _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
+            };
+
             let message_hash = {
                 let mut hasher = Sha256::new();
                 hasher.update(mldsa_pubkey_hex.as_bytes());
                 hasher.update([msgtype as u8]);
                 hasher.update(data);
                 hex::encode(hasher.finalize())
-            };
-
-            let content = match msgtype {
-                ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
-                _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
             };
 
             tracing::debug!(
@@ -264,6 +265,9 @@ impl ChatCore {
                 data.len(),
             );
 
+            // 离线队列尚未构建 ChatMessage（缺发送方时间戳/nonce/密文），
+            // 无法计算协议 hash。此处使用内容派生的 hash 作为去重键，
+            // 真实协议 hash 在重试发送时通过 update_message_hash 回填。
             match storage::add_message_with_hash(
                 pool,
                 owner_identity_id,
@@ -272,6 +276,7 @@ impl ChatCore {
                 true,
                 true,
                 &message_hash,
+                msgtype as i32,
             )
             .await
             {
@@ -284,6 +289,7 @@ impl ChatCore {
                     self.send_log_mpsc(msg).await;
                 }
                 Ok(None) => {
+                    // 空去重键不会触发 add_message_with_hash 的去重检查，此分支理论不可达
                     tracing::debug!("离线队列中已存在相同消息，跳过");
                 }
                 Err(e) => {
@@ -323,6 +329,7 @@ impl ChatCore {
             true,
             true,
             message_hash,
+            msgtype as i32,
         )
         .await
         {
@@ -376,12 +383,37 @@ impl ChatCore {
         tracing::info!("离线消息重试完成");
     }
 
-    async fn retry_single_pending_message(
+    /// 从消息内容前缀推断消息类型，用于回退 detect_msgtype 缺失的迁移前行。
+fn detect_msgtype_from_content(content: &str) -> Option<ChatMessageType> {
+    let content = content.trim();
+    if content.starts_with('[') {
+        if let Some(end) = content.find(']') {
+            let num_str = &content[1..end];
+            if let Ok(num) = num_str.parse::<i32>() {
+                return ChatMessageType::try_from(num).ok();
+            }
+        }
+    }
+    None
+}
+
+async fn retry_single_pending_message(
         &mut self,
         pool: &sqlx::Pool<sqlx::sqlite::Sqlite>,
         msg: &storage::Message,
     ) -> Result<(), CoreError> {
-        let msgtype = detect_msgtype(&msg.content);
+        let mut msgtype = match ChatMessageType::try_from(msg.msgtype) {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::warn!("未知消息类型 {}，跳过重试，保留 pending 状态", msg.msgtype);
+                return Ok(());
+            }
+        };
+
+        // 回退内容推断：覆盖 003_add_msgtype.sql 迁移前 msgtype=0 的历史行
+        if msgtype == ChatMessageType::Text {
+            msgtype = Self::detect_msgtype_from_content(&msg.content).unwrap_or(ChatMessageType::Text);
+        }
 
         let original_data = if msgtype == ChatMessageType::Text {
             msg.content.as_bytes().to_vec()
@@ -514,25 +546,4 @@ impl ChatCore {
     }
 }
 
-/// 根据消息内容检测消息类型
-fn detect_msgtype(content: &str) -> ChatMessageType {
-    if content.starts_with(crate::command::FILE_SHARE_CONTENT_PREFIX) {
-        return ChatMessageType::FileHash;
-    }
-    if let Some(stripped) = content.strip_prefix('[') {
-        if let Some(rest) = stripped.split(']').next() {
-            match rest.parse::<u8>() {
-                Ok(n) if n == ChatMessageType::FileHash as u8 => ChatMessageType::FileHash,
-                Ok(n) if n == ChatMessageType::FileDownloadRequest as u8 => {
-                    ChatMessageType::FileDownloadRequest
-                }
-                Ok(n) if n == ChatMessageType::FileStream as u8 => ChatMessageType::FileStream,
-                _ => ChatMessageType::Text,
-            }
-        } else {
-            ChatMessageType::Text
-        }
-    } else {
-        ChatMessageType::Text
-    }
-}
+

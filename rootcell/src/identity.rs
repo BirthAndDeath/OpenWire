@@ -95,14 +95,15 @@ impl PrivateKeyHandle {
     pub fn generate_and_save_master_key() -> anyhow::Result<Zeroizing<[u8; 32]>> {
         let mut key: [u8; 32] = rand::random();
         let key_hex = Zeroizing::new(hex::encode(key));
-        let result = keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).and_then(|entry| {
+        let result =
+            keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).and_then(|entry| {
             entry.set_password(&key_hex)?;
             tracing::info!("Generated and saved master key to Keyring");
             Ok(Zeroizing::new(key))
         });
         // 清零栈上的原始 key 副本（Zeroizing::new 对 Copy 类型只做了拷贝）
         key.zeroize();
-        result.map_err(|e: keyring::Error| {
+        result.map_err(|e: keyring_core::Error| {
             anyhow::anyhow!("Failed to create Keyring entry for master key: {e}")
         })
     }
@@ -113,11 +114,12 @@ impl PrivateKeyHandle {
     /// 返回 `Err` 表示密钥存在但无法读取（损坏或密钥环错误）。
     /// 调用方必须区分这两种情况，避免在损坏时覆盖密钥导致数据丢失。
     pub fn load_master_key() -> anyhow::Result<Option<Zeroizing<[u8; 32]>>> {
-        match keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
+        match keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER) {
             Ok(entry) => match entry.get_password() {
                 Ok(mut pwd) if !pwd.trim().is_empty() => {
-                    let decoded = Zeroizing::new(hex::decode(pwd.trim())?);
+                    let decode_result = hex::decode(pwd.trim());
                     pwd.zeroize();
+                    let decoded = Zeroizing::new(decode_result?);
                     if decoded.len() == 32 {
                         let mut key = Zeroizing::new([0u8; 32]);
                         key.copy_from_slice(&decoded);
@@ -133,7 +135,7 @@ impl PrivateKeyHandle {
                     tracing::debug!("Master key entry in Keyring is empty");
                     Ok(None)
                 }
-                Err(keyring::Error::NoEntry) => {
+                Err(keyring_core::Error::NoEntry) => {
                     tracing::debug!("Master key not found in Keyring");
                     Ok(None)
                 }
@@ -199,21 +201,21 @@ impl PrivateKeyHandle {
     pub fn check_keyring_available() -> bool {
         ensure_keyring_init();
         // Entry::new 只构造句柄，不写入凭据，因此不会残留测试条目。
-        keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).is_ok()
+        keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).is_ok()
     }
 
     pub fn delete_master_key() -> anyhow::Result<()> {
         let _guard = MASTER_KEY_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let entry = keyring::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
+        let entry = keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
         match entry.get_password() {
             Ok(_) => {
                 entry.delete_credential()?;
                 tracing::info!("Deleted master key from Keyring");
                 Ok(())
             }
-            Err(keyring::Error::NoEntry) => {
+            Err(keyring_core::Error::NoEntry) => {
                 tracing::debug!("Master key not found in Keyring, skipping deletion");
                 Ok(())
             }

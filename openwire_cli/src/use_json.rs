@@ -159,7 +159,10 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
 
         loop {
             line.clear();
-            reader.read_line(&mut line).await?;
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
             let input = line.trim().to_string();
 
             if input.is_empty() {
@@ -236,7 +239,7 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             if !validate_mldsa_pubkey_hex(mldsa_pubkey_hex) {
                                 let error_output = json!({
                                     "type": "error",
-                                    "data": "ML-DSA 公钥格式不正确（应为3904字符的hex编码）",
+                                    "data": crate::MLDSA_PUBKEY_INVALID,
                                     "timestamp": chrono::Utc::now().to_rfc3339()
                                 });
                                 let err_str =
@@ -292,7 +295,7 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             if !validate_mldsa_pubkey_hex(mldsa_pubkey_hex) {
                                 let error_output = json!({
                                     "type": "error",
-                                    "data": "ML-DSA 公钥格式不正确（应为3904字符的hex编码）",
+                                    "data": crate::MLDSA_PUBKEY_INVALID,
                                     "timestamp": chrono::Utc::now().to_rfc3339()
                                 });
                                 let err_str =
@@ -356,7 +359,7 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             if !validate_mldsa_pubkey_hex(sender_mldsa_pubkey_hex) {
                                 let error_output = json!({
                                     "type": "error",
-                                    "data": "发送方 ML-DSA 公钥格式不正确（应为3904字符的hex编码）",
+                                    "data": &format!("发送方 {}", crate::MLDSA_PUBKEY_INVALID),
                                     "timestamp": chrono::Utc::now().to_rfc3339()
                                 });
                                 let err_str =

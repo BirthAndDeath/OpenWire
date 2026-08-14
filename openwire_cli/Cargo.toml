@@ -18,6 +18,7 @@ arboard = "3.6"
 etcetera = "0.11.0"
 rootcell = { workspace = true }
 hex = "0.4.3"
+unicode-properties = "0.1.4"
 [package.metadata.docs.rs]
 # docs.rs 构建时使用
 no-deps = true

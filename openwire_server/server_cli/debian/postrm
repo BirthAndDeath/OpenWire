@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# purge 时删除配置和数据；升级时不删（处理参量不含 purge）
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/openwire-relay
+    if getent passwd openwire >/dev/null 2>&1; then
+        userdel openwire >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

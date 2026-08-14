@@ -85,20 +85,27 @@ pub async fn decompress(data: &[u8]) -> crate::error::CompressionResult<Vec<u8>>
         ));
     }
 
-    use futures::io::Cursor;
+    use futures::io::{AsyncReadExt, Cursor};
 
     let reader = Cursor::new(data);
-    let decoder = ZstdDecoder::new(reader);
+    let mut decoder = ZstdDecoder::new(reader);
 
     let mut output = Vec::new();
-    futures::io::copy(decoder, &mut output)
-        .await
-        .map_err(crate::error::CompressionError::DecompressFailed)?;
-
-    if output.len() > DECOMPRESS_MAX_SIZE {
-        return Err(crate::error::CompressionError::DecompressedDataTooLarge(
-            output.len(),
-        ));
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .await
+            .map_err(crate::error::CompressionError::DecompressFailed)?;
+        if n == 0 {
+            break;
+        }
+        if output.len().saturating_add(n) > DECOMPRESS_MAX_SIZE {
+            return Err(crate::error::CompressionError::DecompressedDataTooLarge(
+                output.len().saturating_add(n),
+            ));
+        }
+        output.extend_from_slice(&buf[..n]);
     }
 
     Ok(output)

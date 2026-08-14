@@ -14,6 +14,7 @@ use rand::rng;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,22 +40,42 @@ struct StoredProvider {
 }
 
 /// 基于 Redb 的持久化记录存储（完整 Kademlia RecordStore 实现 + 本地缓存）
+///
+/// 说明：RecordStore trait 为同步接口，Kademlia 在 poll 中同步调用，
+/// redb 磁盘 I/O 是持久化代价（重启后路由表不丢失），已接受的权衡。
 pub struct RedbRecordStore {
     db: Arc<Database>,
+    /// 内存反查索引 peerid → pubkey，避免 get_pubkey_by_peerid 全表扫描
+    pubkey_by_peerid: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl RedbRecordStore {
     /// 创建新的 RedbRecordStore，自动创建所需表
     pub fn new(db: Arc<Database>) -> Self {
         if let Ok(write_txn) = db.begin_write() {
-            let _ = write_txn.open_table(RECORDS_TABLE);
-            let _ = write_txn.open_table(PROVIDERS_TABLE);
-            let _ = write_txn.open_table(PEER_MULTIADDRS_TABLE);
-            let _ = write_txn.open_table(PUBKEY_PEERID_TABLE);
-            let _ = write_txn.open_table(PUBKEY_MLKEM_TABLE);
-            let _ = write_txn.commit();
+            if let Err(e) = write_txn.open_table(RECORDS_TABLE) {
+                tracing::warn!("Failed to open records table: {e}");
+            }
+            if let Err(e) = write_txn.open_table(PROVIDERS_TABLE) {
+                tracing::warn!("Failed to open providers table: {e}");
+            }
+            if let Err(e) = write_txn.open_table(PEER_MULTIADDRS_TABLE) {
+                tracing::warn!("Failed to open peer_multiaddrs table: {e}");
+            }
+            if let Err(e) = write_txn.open_table(PUBKEY_PEERID_TABLE) {
+                tracing::warn!("Failed to open pubkey_peerid table: {e}");
+            }
+            if let Err(e) = write_txn.open_table(PUBKEY_MLKEM_TABLE) {
+                tracing::warn!("Failed to open pubkey_mlkem table: {e}");
+            }
+            if let Err(e) = write_txn.commit() {
+                tracing::warn!("Failed to commit table creation: {e}");
+            }
         }
-        Self { db }
+        Self {
+            db,
+            pubkey_by_peerid: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     fn now_unix() -> u64 {
@@ -171,7 +192,12 @@ impl RedbRecordStore {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
             table.insert(pubkey_hex, peer_id_str.as_str())?;
             Ok(())
-        })
+        })?;
+        self.pubkey_by_peerid
+            .lock()
+            .expect("pubkey_by_peerid lock poisoned")
+            .insert(peer_id_str, pubkey_hex.to_string());
+        Ok(())
     }
 
     /// 通过 pubkey 从 Redb 持久化存储查询对应 peerid
@@ -190,10 +216,14 @@ impl RedbRecordStore {
         })
     }
 
-    /// 通过 peerid 从 Redb 持久化存储查询对应 pubkey
+    /// 通过 peerid 从内存反查索引查询对应 pubkey（O(1)，避免全表扫描）
     pub fn get_pubkey_by_peerid(&self, peer_id: &PeerId) -> DhtResult<Option<String>> {
         let peer_id_str = peer_id.to_string();
-        self.with_read_txn(|read_txn| {
+        if let Some(pubkey) = self.pubkey_by_peerid.lock().expect("pubkey_by_peerid lock poisoned").get(&peer_id_str) {
+            return Ok(Some(pubkey.clone()));
+        }
+        // 冷启动：反查索引尚未填充，回退到全表扫描一次并缓存结果
+        let found = self.with_read_txn(|read_txn| {
             let table = read_txn.open_table(PUBKEY_PEERID_TABLE)?;
             for result in table.iter()? {
                 let (key, value) = result?;
@@ -202,7 +232,14 @@ impl RedbRecordStore {
                 }
             }
             Ok(None)
-        })
+        })?;
+        if let Some(pubkey) = &found {
+            self.pubkey_by_peerid
+                .lock()
+                .expect("pubkey_by_peerid lock poisoned")
+                .insert(peer_id_str, pubkey.clone());
+        }
+        Ok(found)
     }
 
     /// 删除 pubkey ↔ peerid 映射
@@ -211,7 +248,12 @@ impl RedbRecordStore {
             let mut table = write_txn.open_table(PUBKEY_PEERID_TABLE)?;
             table.remove(pubkey_hex)?;
             Ok(())
-        })
+        })?;
+        self.pubkey_by_peerid
+            .lock()
+            .expect("pubkey_by_peerid lock poisoned")
+            .retain(|_, v| v != pubkey_hex);
+        Ok(())
     }
 
     /// 获取所有已缓存的 pubkey 列表

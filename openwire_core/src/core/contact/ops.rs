@@ -11,6 +11,12 @@ impl ChatCore {
         mlkem_public_key: Vec<u8>,
         name: Option<String>,
     ) -> bool {
+        if !crate::signature::validate_mldsa_pubkey_hex(&mldsa_pubkey_hex) {
+            tracing::warn!("拒绝添加联系人：ML-DSA 公钥密码学验证失败");
+            self.send_warning_mpsc("ML-DSA 公钥无效，拒绝添加".to_string())
+                .await;
+            return false;
+        }
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
 
         if let Some(pool) = storage::pool() {
@@ -98,7 +104,7 @@ impl ChatCore {
     ///
     /// 双路并行（DHT + 中继）确保最快发现路径。
     pub(crate) async fn discover_contact(&mut self, mldsa_pubkey_hex: &str, name: Option<String>) {
-        let pubkey_short = &mldsa_pubkey_hex[..16];
+        let pubkey_short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
         tracing::info!("Discovering contact {} via DHT network", pubkey_short);
 
         // 发现冷却：防止重复发现

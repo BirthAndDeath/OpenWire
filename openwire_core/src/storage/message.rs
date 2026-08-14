@@ -4,6 +4,9 @@ use sqlx::{self, AssertSqlSafe, FromRow, Pool, Row, Sqlite};
 
 use crate::error::StorageResult;
 
+/// 单次加载消息的最大分页数。所有层（storage、Tauri command、JS isolation hook）共享此值。
+pub const MAX_MESSAGE_PAGE_SIZE: i64 = 200;
+
 #[derive(Debug, Clone, FromRow)]
 /// 消息结构
 pub struct Message {
@@ -21,8 +24,10 @@ pub struct Message {
     pub pending: i32,
     /// 时间戳
     pub ts: i64,
-    /// 消息哈希（用于去重和送达回执匹配）
+    /// 消息哈希（ChatMessage.hash hex，用于去重和送达回执匹配）
     pub message_hash: Option<String>,
+    /// 消息类型（ChatMessageType 的 u8 值，消除 detect_msgtype 内容推断）
+    pub msgtype: i32,
 }
 
 #[allow(dead_code)]
@@ -30,42 +35,6 @@ fn feature_err<T>() -> StorageResult<T> {
     Err(crate::error::StorageError::FeatureNotEnabled(
         "sqlite_history_storage",
     ))
-}
-
-#[cfg(feature = "sqlite_history_storage")]
-pub async fn add_message(
-    pool: &Pool<Sqlite>,
-    owner_identity_id: &str,
-    peer_pubkey_hex: &str,
-    content: &str,
-    is_outgoing: bool,
-    pending: bool,
-) -> StorageResult<i64> {
-    let pending_val = if pending { 1 } else { 0 };
-    let row = sqlx::query(
-        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts)
-          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
-          RETURNING id"#,
-    )
-    .bind(owner_identity_id)
-    .bind(peer_pubkey_hex)
-    .bind(content)
-    .bind(is_outgoing as i32)
-    .bind(pending_val)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.get(0))
-}
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn add_message(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-    _content: &str,
-    _is_outgoing: bool,
-    _pending: bool,
-) -> StorageResult<i64> {
-    feature_err()
 }
 
 #[cfg(feature = "sqlite_history_storage")]
@@ -77,6 +46,7 @@ pub async fn add_message_with_hash(
     is_outgoing: bool,
     pending: bool,
     dedup_hash: &str,
+    msgtype: i32,
 ) -> StorageResult<Option<i64>> {
     if !dedup_hash.is_empty() {
         let existing: Option<String> =
@@ -96,8 +66,8 @@ pub async fn add_message_with_hash(
         Some(dedup_hash)
     };
     let row = sqlx::query(
-        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash)
-          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6)
+        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype)
+          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6, ?7)
           RETURNING id"#,
     )
     .bind(owner_identity_id)
@@ -106,6 +76,7 @@ pub async fn add_message_with_hash(
     .bind(is_outgoing as i32)
     .bind(pending_val)
     .bind(hash)
+    .bind(msgtype)
     .fetch_one(pool)
     .await?;
     Ok(Some(row.get(0)))
@@ -119,38 +90,8 @@ pub async fn add_message_with_hash(
     _is_outgoing: bool,
     _pending: bool,
     _dedup_hash: &str,
+    _msgtype: i32,
 ) -> StorageResult<Option<i64>> {
-    feature_err()
-}
-
-#[cfg(feature = "sqlite_history_storage")]
-pub async fn add_messages_batch(
-    pool: &Pool<Sqlite>,
-    messages: &[(&str, &str, &str, bool, bool)],
-) -> StorageResult<()> {
-    let mut tx = pool.begin().await?;
-    for (owner_id, peer, content, is_outgoing, pending) in messages {
-        let pending_val = if *pending { 1 } else { 0 };
-        sqlx::query(
-            r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts)
-              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())"#,
-        )
-        .bind(owner_id)
-        .bind(peer)
-        .bind(content)
-        .bind(*is_outgoing as i32)
-        .bind(pending_val)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn add_messages_batch(
-    _pool: &Pool<Sqlite>,
-    _messages: &[(&str, &str, &str, bool, bool)],
-) -> StorageResult<()> {
     feature_err()
 }
 
@@ -164,7 +105,7 @@ pub async fn get_messages(
 ) -> StorageResult<Vec<Message>> {
     let messages = if let Some(limit) = limit {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
              FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC LIMIT ?3 OFFSET ?4",
         )
         .bind(owner_identity_id)
@@ -175,7 +116,7 @@ pub async fn get_messages(
         .await?
     } else {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
              FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC",
         )
         .bind(owner_identity_id)
@@ -207,12 +148,12 @@ pub async fn get_messages_range(
     after_id: Option<i64>,
     limit: i64,
 ) -> StorageResult<Vec<Message>> {
-    let limit = limit.min(200);
+    let limit = limit.clamp(0, MAX_MESSAGE_PAGE_SIZE);
     let before = before.unwrap_or(i64::MAX);
     let before_id = before_id.unwrap_or(i64::MAX);
     let messages = if let (Some(after_id), Some(after)) = (after_id, after) {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
              FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
              AND (ts, id) < (?3, ?4) AND (ts, id) > (?5, ?6) \
              ORDER BY ts DESC LIMIT ?7",
@@ -228,7 +169,7 @@ pub async fn get_messages_range(
         .await?
     } else {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
              FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
              AND (ts, id) < (?3, ?4) \
              ORDER BY ts DESC LIMIT ?5",
@@ -260,7 +201,7 @@ pub async fn get_messages_range(
 #[cfg(feature = "sqlite_history_storage")]
 pub async fn get_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE id = ?1",
     )
     .bind(id)
@@ -279,7 +220,7 @@ pub async fn get_message_by_hash(
     hash: &str,
 ) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE message_hash = ?1",
     )
     .bind(hash)
@@ -302,7 +243,7 @@ pub async fn get_last_message(
     peer_pubkey_hex: &str,
 ) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
          ORDER BY ts DESC LIMIT 1",
     )
@@ -382,7 +323,7 @@ pub async fn delete_messages_by_peer(
 #[cfg(feature = "sqlite_history_storage")]
 pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE pending = 1 ORDER BY ts ASC",
     )
     .fetch_all(pool)
@@ -400,7 +341,7 @@ pub async fn list_pending_by_peer(
     peer_pubkey_hex: &str,
 ) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE pending = 1 AND peer_pubkey_hex = ?1 ORDER BY ts ASC",
     )
     .bind(peer_pubkey_hex)
@@ -422,7 +363,7 @@ pub async fn list_pending_by_peer(
 #[cfg(feature = "sqlite_history_storage")]
 pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash \
+        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
          FROM messages WHERE pending = 2 ORDER BY ts ASC",
     )
     .fetch_all(pool)
@@ -509,7 +450,11 @@ pub async fn mark_failed(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<()> {
 }
 
 #[cfg(feature = "sqlite_history_storage")]
-pub async fn update_message_hash(pool: &Pool<Sqlite>, id: i64, hash: &str) -> StorageResult<()> {
+pub async fn update_message_hash(
+    pool: &Pool<Sqlite>,
+    id: i64,
+    hash: &str,
+) -> StorageResult<()> {
     sqlx::query("UPDATE messages SET message_hash = ?1 WHERE id = ?2")
         .bind(hash)
         .bind(id)
@@ -518,7 +463,11 @@ pub async fn update_message_hash(pool: &Pool<Sqlite>, id: i64, hash: &str) -> St
     Ok(())
 }
 #[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn update_message_hash(_pool: &Pool<Sqlite>, _id: i64, _hash: &str) -> StorageResult<()> {
+pub async fn update_message_hash(
+    _pool: &Pool<Sqlite>,
+    _id: i64,
+    _hash: &str,
+) -> StorageResult<()> {
     feature_err()
 }
 

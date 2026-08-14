@@ -45,10 +45,6 @@ all-features = true
 name = "libp2p_relay"
 path = "src/lib.rs"
 
-[[test]]
-name = "lib"
-path = "tests/lib.rs"
-
 [dependencies.asynchronous-codec]
 version = "0.7.0"
 

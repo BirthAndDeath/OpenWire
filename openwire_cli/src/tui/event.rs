@@ -264,7 +264,7 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
                     // 验证公钥格式
                     if !openwire_core::validate_mldsa_pubkey_hex(&pubkey_hex) {
                         app.push_message(
-                            "错误: ML-DSA 公钥格式不正确（应为3904字符的hex编码）".to_string(),
+                            format!("错误: {}", crate::MLDSA_PUBKEY_INVALID),
                         );
                         app.input.clear();
                         app.add_contact_mode = false;

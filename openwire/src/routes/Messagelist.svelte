@@ -114,17 +114,25 @@
             }
         }
 
-        // 尝试解析旧版 JSON 格式（兼容历史消息）
+        // 尝试解析旧版 JSON 格式（兼容历史消息）。
+        // 仅当字段同时满足文件卡片结构时才升级为 file_hash 类型，
+        // 避免任意 JSON 文本被恶意渲染为可点击的下载卡片。
         if (type === "text") {
             try {
                 const parsed = JSON.parse(m.content);
-                if (parsed.file_hash && parsed.filename !== undefined) {
+                const isHex64 = typeof parsed.file_hash === "string" && /^[0-9a-fA-F]{64}$/.test(parsed.file_hash);
+                if (
+                    isHex64 &&
+                    typeof parsed.filename === "string" &&
+                    parsed.filename.length > 0 &&
+                    parsed.filename.length <= 512
+                ) {
                     type = "file_hash";
                     file_hash_info = {
                         filename: parsed.filename,
-                        total_size: parsed.total_size || 0,
+                        total_size: typeof parsed.total_size === "number" ? parsed.total_size : 0,
                         file_hash: parsed.file_hash,
-                        file_id: parsed.file_id || parsed.file_hash,
+                        file_id: typeof parsed.file_id === "string" ? parsed.file_id : parsed.file_hash,
                     };
                 }
             } catch {
