@@ -224,13 +224,13 @@ impl ChatCore {
             return;
         }
         self.last_file_timeout_scan = now;
-        let timed_out: Vec<(String, bool)> = self
+        let timed_out: Vec<String> = self
             .file_transfers
             .iter()
             .filter(|(_, s)| now.duration_since(s.started_at) > crate::transfer::TRANSFER_TIMEOUT)
-            .map(|(id, s)| (id.clone(), !matches!(s.status, TransferStatus::Requesting)))
+            .map(|(id, _)| id.clone())
             .collect();
-        for (id, is_inbound) in &timed_out {
+        for id in &timed_out {
             let state_path = self.downloads_dir().join(format!(
                 ".{}.state",
                 &hex::encode(
@@ -246,11 +246,8 @@ impl ChatCore {
                 let _ = std::fs::remove_file(&state_path);
             }
             self.file_transfers.remove(id);
-            if *is_inbound {
-                self.inbound_file_count = self.inbound_file_count.saturating_sub(1);
-            } else {
-                self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
-            }
+            self.outbound_file_count = self.outbound_file_count.saturating_sub(1);
+            self.inbound_file_count = self.inbound_file_count.saturating_sub(1);
         }
         if !timed_out.is_empty() {
             tracing::info!("已清理 {} 个超时传输", timed_out.len());

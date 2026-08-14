@@ -195,7 +195,7 @@ impl RedbRecordStore {
         })?;
         self.pubkey_by_peerid
             .lock()
-            .expect("pubkey_by_peerid lock poisoned")
+            .expect("pubkey_by_peerid lock poisoned") // 中毒仅因其他线程 panic，此时系统已异常，连锁崩溃无害
             .insert(peer_id_str, pubkey_hex.to_string());
         Ok(())
     }
@@ -219,6 +219,7 @@ impl RedbRecordStore {
     /// 通过 peerid 从内存反查索引查询对应 pubkey（O(1)，避免全表扫描）
     pub fn get_pubkey_by_peerid(&self, peer_id: &PeerId) -> DhtResult<Option<String>> {
         let peer_id_str = peer_id.to_string();
+        // 中毒仅因其他线程 panic，此时系统已异常，连锁崩溃无害
         if let Some(pubkey) = self.pubkey_by_peerid.lock().expect("pubkey_by_peerid lock poisoned").get(&peer_id_str) {
             return Ok(Some(pubkey.clone()));
         }
@@ -236,7 +237,7 @@ impl RedbRecordStore {
         if let Some(pubkey) = &found {
             self.pubkey_by_peerid
                 .lock()
-                .expect("pubkey_by_peerid lock poisoned")
+                .expect("pubkey_by_peerid lock poisoned") // 中毒仅因其他线程 panic，此时系统已异常，连锁崩溃无害
                 .insert(peer_id_str, pubkey.clone());
         }
         Ok(found)
@@ -251,7 +252,7 @@ impl RedbRecordStore {
         })?;
         self.pubkey_by_peerid
             .lock()
-            .expect("pubkey_by_peerid lock poisoned")
+            .expect("pubkey_by_peerid lock poisoned") // 中毒仅因其他线程 panic，此时系统已异常，连锁崩溃无害
             .retain(|_, v| v != pubkey_hex);
         Ok(())
     }
