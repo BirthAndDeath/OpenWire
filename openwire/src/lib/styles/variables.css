@@ -27,7 +27,6 @@
   --avatar-font: clamp(12px, 1.5vw, 16px);
 
   /* ========== 布局 ========== */
-  --layout-max-width: 1600px;
   --resizer-size: 6px;
 
   /* ========== 安全区域（适配刘海屏/挖孔屏） ========== */

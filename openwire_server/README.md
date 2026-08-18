@@ -19,7 +19,7 @@ cargo build --release -p openwire-server-cli
 # 默认端口 44909，数据目录 .openwire-relay
 RUST_LOG=info ./target/release/openwire-server-cli
 
-# 指定数据目录和端口
+# 指定端口（若被占用则回退到 OS 分配并持久化新端口）
 RUST_LOG=info ./target/release/openwire-server-cli /path/to/data 44909
 ```
 
@@ -27,48 +27,52 @@ RUST_LOG=info ./target/release/openwire-server-cli /path/to/data 44909
 
 首次运行自动生成 `nodes.json` 和 Ed25519 密钥对（`<data_dir>/ed25519.bin`），控制台输出 `PeerId=<peer_id>`。
 
-默认监听地址：
+端口策略：
 
-| 协议 | 地址 |
-|------|------|
-| TCP IPv4 | `/ip4/0.0.0.0/tcp/44909` |
-| TCP IPv6 | `/ip6/::/tcp/44909` |
-| QUIC IPv4 | `/ip4/0.0.0.0/udp/44909/quic-v1` |
-| QUIC IPv6 | `/ip6/::/udp/44909/quic-v1` |
+- 不指定端口 → 默认 44909（若被占用则回退到 OS 分配），实际端口写入 `port-preference.txt`，下次启动优先复用
+- 指定端口 → 使用该端口，被占用时回退到 OS 分配，新端口自动持久化
+- 查看 `relay-info.json` 获取实际监听地址
 
 ## 防火墙配置
+
+默认端口为 44909；若服务回退到 OS 分配端口，先从 `relay-info.json` 或 `port-preference.txt` 获取实际端口，再放行：
 
 ### Ubuntu (ufw)
 
 ```bash
-sudo ufw allow 44909/tcp
-sudo ufw allow 44909/udp
+# 先查看实际端口
+cat /var/lib/openwire-relay/relay-info.json
+# 或 cat .openwire-relay/relay-info.json
+
+# 放行实际端口（将 <PORT> 替换为实际端口号）
+sudo ufw allow <PORT>/tcp
+sudo ufw allow <PORT>/udp
 sudo ufw reload
 ```
 
 ### CentOS/RHEL (firewall-cmd)
 
 ```bash
-sudo firewall-cmd --permanent --add-port=44909/tcp
-sudo firewall-cmd --permanent --add-port=44909/udp
+sudo firewall-cmd --permanent --add-port=<PORT>/tcp
+sudo firewall-cmd --permanent --add-port=<PORT>/udp
 sudo firewall-cmd --reload
 ```
 
 ### Windows Defender
 
 ```powershell
-New-NetFirewallRule -DisplayName "OpenWire Relay TCP" -Direction Inbound -Protocol TCP -LocalPort 44909 -Action Allow
-New-NetFirewallRule -DisplayName "OpenWire Relay UDP" -Direction Inbound -Protocol UDP -LocalPort 44909 -Action Allow
+New-NetFirewallRule -DisplayName "OpenWire Relay TCP" -Direction Inbound -Protocol TCP -LocalPort <PORT> -Action Allow
+New-NetFirewallRule -DisplayName "OpenWire Relay UDP" -Direction Inbound -Protocol UDP -LocalPort <PORT> -Action Allow
 ```
 
 ### 云服务商安全组
 
-- AWS EC2 / 阿里云 / 腾讯云 / 所有 VPS 面板：放行 44909 TCP + UDP
+放行 `relay-info.json` 中 `addresses` 字段列出的实际端口（TCP + UDP）。
 
 ## 前置条件
 
 - 公网 IP（非 NAT 后）。NAT 后的中继失去意义。
-- 端口 44909 TCP/UDP 未被占用。
+- 端口未被占用（若指定端口被占用，服务仍可启动，但会使用 OS 分配的随机端口）。
 
 ## .deb 打包（Linux）
 
@@ -86,10 +90,18 @@ sudo dpkg -i target/debian/openwire-server-cli_*.deb
 sudo systemctl status openwire-relay
 ```
 
+`.deb` 安装版默认使用端口 44909（首次启动），若被占用会自动回退并持久化新端口。
+
+### 查看中继信息
+
+```bash
+cat /var/lib/openwire-relay/relay-info.json
+```
+
 ### 包内容
 
 | 路径 | 说明 |
-|------|------|
+| ------ | ------ |
 | `/usr/bin/openwire-server-cli` | 服务端二进制 |
 | `/etc/systemd/system/openwire-relay.service` | systemd 服务单元 |
 | `/var/lib/openwire-relay/` | 数据目录（Ed25519 密钥、DHT 数据库、nodes.json） |
@@ -105,23 +117,29 @@ sudo systemctl status openwire-relay
 ```ini
 [Unit]
 Description=OpenWire Relay Server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=openwire
-ExecStart=/usr/local/bin/openwire-server-cli /var/lib/openwire-relay 44909
+ExecStart=/usr/bin/openwire-server-cli /var/lib/openwire-relay 44909
 Restart=on-failure
 RestartSec=30
+LimitNOFILE=65536
 Environment=RUST_LOG=info
+WorkingDirectory=/var/lib/openwire-relay
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+服务默认使用端口 44909；若端口被占用会自动回退到 OS 分配，并在 `port-preference.txt` 中持久化实际端口（与 `.deb` 安装版行为一致）。
+
+手动创建用户和数据目录：
+
 ```bash
-# 手动创建用户和数据目录
-sudo useradd --system --home /var/lib/openwire-relay --shell /usr/sbin/nologin openwire
+sudo useradd --system --group --home /var/lib/openwire-relay --no-create-home openwire
 sudo mkdir -p /var/lib/openwire-relay
 sudo chown openwire:openwire /var/lib/openwire-relay
 sudo systemctl enable openwire-relay
@@ -149,11 +167,12 @@ sudo systemctl stop openwire-relay        # 停止
 服务器将以下文件存储在数据目录（默认 `.openwire-relay`，可通过命令行第一个参数指定）中：
 
 | 文件 / File | 说明 / Description |
-|-------------|-------------------|
+| ------------- | ------------------- |
 | `<data_dir>/ed25519.bin` | Ed25519 身份密钥对（0600 权限），用于生成服务器 PeerId / Ed25519 identity keypair (0600 perms), derives the server PeerId |
 | `<data_dir>/dht.redb` | 持久化 Kademlia 路由表与 DHT 记录（Redb 数据库，重启后路由表不丢失）/ Persistent Kademlia routing table & DHT records (Redb database, survives restarts) |
 | `<data_dir>/nodes.json` | 节点配置（仅 `bootstrap_nodes` 字段被使用）/ Node config (only `bootstrap_nodes` is used) |
 | `<data_dir>/relay-info.json` | 中继信息：PeerId 与带 `/p2p/` 后缀的监听地址，可直接复制到客户端 `nodes.json` / Relay info: PeerId and listen addresses with `/p2p/` suffix, copy-paste ready for client `nodes.json` |
+| `<data_dir>/port-preference.txt` | 持久化的端口偏好，下次启动优先使用该端口（若被占用则回退到 OS 分配）/ Persisted port preference, used on next startup (falls back to OS-assigned if occupied) |
 
 `.deb` 安装版使用固定目录 `/var/lib/openwire-relay/`。
 
@@ -176,12 +195,12 @@ The server stores all state in the data directory (default `.openwire-relay`, ov
 
 ## 客户端配置
 
-客户端 `nodes.json` 的 `relay_nodes` 中添加本中继的 PeerId 和地址：
+客户端 `nodes.json` 的 `relay_nodes` 中添加本中继的 PeerId 和地址（从 `relay-info.json` 获取实际端口）：
 
 ```json
 {
   "relay_nodes": [
-    ["<relay_server_peer_id>", "/ip4/<relay_server_ip>/tcp/44909"]
+    ["<relay_server_peer_id>", "/ip4/<relay_server_ip>/tcp/<actual_port>"]
   ]
 }
 ```

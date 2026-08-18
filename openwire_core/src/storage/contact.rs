@@ -68,7 +68,7 @@ pub async fn update_contact_mlkem_pubkey(
     mlkem_public_key: &[u8],
 ) -> StorageResult<bool> {
     let rows = sqlx::query(
-        "UPDATE contacts SET mlkem_public_key = ? WHERE owner_identity_id = ?2 AND mldsa_pubkey_hex = ?3",
+        "UPDATE contacts SET mlkem_public_key = ?1 WHERE owner_identity_id = ?2 AND mldsa_pubkey_hex = ?3",
     )
     .bind(mlkem_public_key)
     .bind(owner_identity_id)

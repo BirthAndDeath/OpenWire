@@ -118,7 +118,6 @@ impl Default for NodesConfig {
     }
 }
 
-
 impl NodesConfig {
     /// 节点配置文件名
     const NODES_CONFIG_FILE: &'static str = "nodes.json";

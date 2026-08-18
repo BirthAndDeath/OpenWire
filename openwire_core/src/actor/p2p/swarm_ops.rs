@@ -99,10 +99,10 @@ pub fn publish_identity_to_dht(swarm: &mut Swarm<MyBehaviour>, mldsa_pubkey_hex:
     }
 }
 
-/// 发起 GetProviders 查询（key 由调用方用 dht_key 哈希）
-pub fn get_providers(swarm: &mut Swarm<MyBehaviour>, key: &str) {
+/// 发起 GetProviders 查询（key 由调用方用 dht_key 哈希），返回查询 ID 供许可回收
+pub fn get_providers(swarm: &mut Swarm<MyBehaviour>, key: &str) -> libp2p::kad::QueryId {
     let record_key = libp2p::kad::RecordKey::new(&key);
-    let _query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+    swarm.behaviour_mut().kademlia.get_providers(record_key)
 }
 
 /// 停止在 DHT 提供身份（删除 identity 时调用，撤销 DHT 上的提供记录）

@@ -3,7 +3,7 @@
     import { open } from "@tauri-apps/plugin-dialog";
     import { slide } from "svelte/transition";
     import "../lib/i18n";
-    import { _, locale } from "svelte-i18n";
+    import { _ } from "svelte-i18n";
     let {
         onsend,
         disabled = false,
@@ -210,6 +210,7 @@
 <style>
     .wrap {
         position: relative;
+        box-sizing: border-box; /* width:100% 含 padding，防止整体溢出被裁 */
         background: transparent;
         backdrop-filter: blur(10px);
         border: 1px solid var(--border-color, #2a2a2a);
@@ -270,6 +271,7 @@
     }
     .box {
         flex: 1;
+        min-width: 0; /* 允许 flex 收缩，防止 btn-group 溢出右侧被裁 */
         background: var(--bg-primary, #0f0f0f);
         border: 1px solid #333;
         border-radius: 8px;

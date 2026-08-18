@@ -81,11 +81,3 @@ export async function setTheme(newTheme: Theme) {
   await persistTheme(newTheme);
 }
 
-// 获取当前主题（同步访问）
-export function getTheme(): Theme {
-  let currentTheme: Theme = 'dark';
-  themeStore.subscribe(value => {
-    currentTheme = value;
-  })();
-  return currentTheme;
-}

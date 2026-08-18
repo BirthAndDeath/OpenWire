@@ -1,6 +1,6 @@
 <script lang="ts">
   import "../../lib/i18n";
-  import { _, locale } from "svelte-i18n";
+  import { _ } from "svelte-i18n";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
