@@ -37,7 +37,7 @@
         "default-src": "'self'",
         "script-src": "'self'",
         "style-src": "'self'",
-        "img-src": "'self' asset: data:",
+        "img-src": "'self' asset: data: blob:",
         "font-src": "'self'",
         "connect-src": "'self'",
         "media-src": "'self'",
