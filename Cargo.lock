@@ -1170,12 +1170,6 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6245d59a3e82a7fc217c5828a6692dbc6dfb63a0c8c90495621f7b9d79704a0e"
-
-[[package]]
-name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
@@ -1758,7 +1752,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case 0.10.0",
+ "convert_case",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -5304,6 +5298,7 @@ dependencies = [
  "futures",
  "hex",
  "openwire_core",
+ "postcard",
  "ratatui",
  "rootcell",
  "serde_json",
@@ -5319,9 +5314,7 @@ dependencies = [
  "aes-gcm 0.11.0",
  "anyhow",
  "async-compression",
- "async-trait",
  "aws-lc-rs",
- "blake3",
  "dashmap",
  "did-key",
  "futures",
@@ -5345,7 +5338,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "vstd",
  "zeroize",
 ]
 
@@ -8806,71 +8798,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "verus_builtin"
-version = "0.0.0-2026-08-09-0044"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f2985ebd252c492375e32f2bfcff6e6a04523009a0d624785d3468f3729158"
-
-[[package]]
-name = "verus_builtin_macros"
-version = "0.0.0-2026-08-09-0044"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57091b5661094900006f07621654a455ecf8ab40efc22981cb39b773ff7bc21c"
-dependencies = [
- "convert_case 0.4.0",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "synstructure",
- "verus_prettyplease",
- "verus_syn",
-]
-
-[[package]]
-name = "verus_prettyplease"
-version = "0.0.0-2026-08-09-0044"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51fc115de5fb3806bc362060bb683024660ed2bc13c1183d1f01d464e4537139"
-dependencies = [
- "proc-macro2",
- "verus_syn",
-]
-
-[[package]]
-name = "verus_state_machines_macros"
-version = "0.0.0-2026-08-02-0125"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93f77ff8d121edb1bf2651335769a80a2f611da8573c3b498434a66b3162805f"
-dependencies = [
- "indexmap 2.14.0",
- "proc-macro2",
- "quote",
- "verus_syn",
-]
-
-[[package]]
-name = "verus_syn"
-version = "0.0.0-2026-08-02-0125"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f17237ea6d267e457d53ce36f55b315fc9edd26eb88c765dd95e035c0b415869"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "vstd"
-version = "0.0.0-2026-08-09-0044"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "512e38f177f75c473a03121bf0934a276468f78fea84c073f979d6670e862705"
-dependencies = [
- "verus_builtin",
- "verus_builtin_macros",
- "verus_state_machines_macros",
-]
 
 [[package]]
 name = "vswhom"

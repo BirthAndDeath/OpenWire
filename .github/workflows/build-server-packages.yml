@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build-deb:
@@ -30,7 +30,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
       - name: install dependencies (ubuntu arm only)
         if: matrix.platform == 'ubuntu-22.04-arm'
@@ -45,7 +45,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@v2.9.2
         with:
           workspaces: |
             . -> target
@@ -65,13 +65,13 @@ jobs:
         run: cargo deb -p openwire-server-cli --target ${{ matrix.target }}
 
       - name: upload .deb artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: openwire-server-cli-deb-${{ matrix.target }}
           path: target/${{ matrix.target }}/debian/*.deb
 
       - name: create GitHub release with .deb
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@v2.6.2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: target/${{ matrix.target }}/debian/*.deb
@@ -94,7 +94,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
 
       - name: install dependencies (ubuntu arm only)
         if: matrix.platform == 'ubuntu-22.04-arm'
@@ -109,7 +109,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@v2.9.2
         with:
           workspaces: |
             . -> target
@@ -122,26 +122,28 @@ jobs:
           cache-bin: "true"
           cache-on-failure: "true"
 
-      - name: install rpmbuild and cargo-rpm
+      - name: install rpmbuild and cargo-generate-rpm
         run: |
           sudo apt-get update
           sudo apt-get install -y rpm
-          cargo install cargo-rpm --locked
+          cargo install cargo-generate-rpm --locked
 
       - name: build server .rpm
-        run: cargo rpm build -p openwire-server-cli --target ${{ matrix.target }}
+        run: |
+          cargo build --release -p openwire-server-cli --target ${{ matrix.target }}
+          cargo generate-rpm -p openwire-server-cli --target ${{ matrix.target }}
 
       - name: upload .rpm artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: openwire-server-cli-rpm-${{ matrix.target }}
-          path: target/${{ matrix.target }}/rpm/**/*.rpm
+          path: target/${{ matrix.target }}/generate-rpm/*.rpm
 
       - name: create GitHub release with .rpm
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@v2.6.2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/rpm/**/*.rpm
+          files: target/${{ matrix.target }}/generate-rpm/*.rpm
           draft: true
           generate_release_notes: true
 
