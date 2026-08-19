@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   publish-tauri:
+    environment: signature
     permissions:
       contents: write
     timeout-minutes: 60
@@ -116,7 +117,7 @@ jobs:
 
       - name: decode keystore
         if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 != ''
-        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ${{ runner.temp }}/upload-keystore.jks
+        run: printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "${{ runner.temp }}/upload-keystore.jks"
       - name: fail if keystore missing
         if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 == ''
         run: exit 1

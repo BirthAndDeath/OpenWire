@@ -28,7 +28,7 @@ maintainer-scripts = "debian/"
 
 [package.metadata.generate-rpm]
 assets = [
-    # 二进制不在此列举：cargo generate-rpm --target 会按 target/<triple>/release/ 自动定位
+    { source = "target/release/openwire-server-cli", dest = "/usr/bin/openwire-server-cli", mode = "755" },
     { source = "debian/openwire-relay.service", dest = "/usr/lib/systemd/system/", mode = "644" },
 ]
 pre_install_script = "debian/preinst"
