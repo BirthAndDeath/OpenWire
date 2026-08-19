@@ -37,9 +37,10 @@ jobs:
           - platform: "ubuntu-22.04"
             args: "--apk"
             mobile: "android"
-          - platform: "macos-latest"
-            args: "--target aarch64"
-            mobile: "ios"
+          # iOS 构建暂禁用：需要 Xcode 项目初始化 (`tauri ios init`) 和代码签名证书
+          # - platform: "macos-latest"
+          #   args: "--target aarch64"
+          #   mobile: "ios"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -47,18 +48,21 @@ jobs:
 
       - name: install dependencies (ubuntu only)
         if: matrix.platform == 'ubuntu-22.04' && !matrix.mobile
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=180
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: install dependencies (ubuntu arm only)
         if: matrix.platform == 'ubuntu-22.04-arm'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=180
           sudo apt-get install -y libgtk-3-dev:arm64 libwebkit2gtk-4.1-dev:arm64 libappindicator3-dev:arm64 librsvg2-dev:arm64 patchelf pkg-config xdg-utils
       - name: install dependencies (android)
         if: matrix.mobile == 'android'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
+          sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=180
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: setup java (android)
         if: matrix.mobile == 'android'

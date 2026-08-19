@@ -131,7 +131,7 @@ jobs:
       - name: build server .rpm
         run: |
           cargo build --release -p openwire-server-cli --target ${{ matrix.target }}
-          cargo generate-rpm -p openwire-server-cli --target ${{ matrix.target }}
+          cargo generate-rpm -p openwire-server-cli --manifest-path openwire_server/server_cli/Cargo.toml --target ${{ matrix.target }}
 
       - name: upload .rpm artifact
         uses: actions/upload-artifact@v4.6.2
