@@ -57,4 +57,4 @@ jobs:
 
       - name: clippy
         # 排除 openwire（Tauri GUI crate，ubuntu runner 上需要 webkit2gtk 系统依赖）
-        run: cargo clippy -p openwire_core -p rootcell -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-targets -- -D warnings
+        run: cargo clippy -p openwire_core -p rootcell -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-features --all-targets -- -D warnings
