@@ -24,10 +24,7 @@ assets = [
     ["target/release/openwire-server-cli", "usr/bin/", "755"],
     ["debian/openwire-relay.service", "etc/systemd/system/", "644"],
 ]
-pre-install-script = "debian/preinst"
-post-install-script = "debian/postinst"
-pre-remove-script = "debian/prerm"
-post-remove-script = "debian/postrm"
+maintainer-scripts = "debian/"
 
 [package.metadata.generate-rpm]
 assets = [
