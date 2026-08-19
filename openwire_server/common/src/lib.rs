@@ -69,7 +69,7 @@ fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).mode(0o600);
+        opts.write(true).create(true).truncate(true).mode(0o600);
         let mut f = opts.open(path)?;
         f.write_all(&encoded)?;
     }
@@ -130,6 +130,7 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&db_path)
             .map_err(|e| anyhow::anyhow!("创建 DHT 数据库失败 {}: {e}", db_path.display()))?;

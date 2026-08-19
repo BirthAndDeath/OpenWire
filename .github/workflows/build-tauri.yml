@@ -18,6 +18,8 @@ jobs:
     permissions:
       contents: write
     timeout-minutes: 60
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
     strategy:
       fail-fast: false
       matrix:
@@ -109,10 +111,10 @@ jobs:
           cache-on-failure: "true"
 
       - name: decode keystore
-        if: matrix.mobile == 'android' && secrets.ANDROID_KEYSTORE_BASE64 != ''
+        if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 != ''
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ${{ runner.temp }}/upload-keystore.jks
       - name: fail if keystore missing
-        if: matrix.mobile == 'android' && secrets.ANDROID_KEYSTORE_BASE64 == ''
+        if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 == ''
         run: exit 1
         shell: bash
 
