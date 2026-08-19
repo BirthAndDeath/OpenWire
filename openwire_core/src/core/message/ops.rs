@@ -2,10 +2,15 @@ use sha2::{Digest, Sha256};
 
 use crate::actor::p2p::{swarm_ops as p2p_swarm_ops, P2pCommand};
 
+
 use crate::{core::ChatCore, crypto, error::CoreError, message::ChatMessageType, storage};
 
 impl ChatCore {
     /// send_text 的公开入口
+    ///
+    /// - `allow_dht_query`: 是否允许在本地无 PeerID 缓存时发起 DHT GetProviders 网络查询。
+    ///   文件传输等已有直接联系的消息传递场景必须传 `false`：DHT 查询查到的对象不一定是
+    ///   好友，无法加密且不应响应；且会向 DHT 网络泄露通信元数据，违反 E2EE。
     ///
     /// 返回发送的消息的 hash（hex 编码），供调用方（如 command_handler）通知前端
     pub(crate) async fn send_text(
@@ -13,8 +18,9 @@ impl ChatCore {
         mldsa_pubkey_hex: &str,
         msgtype: ChatMessageType,
         data: Vec<u8>,
+        allow_dht_query: bool,
     ) -> Result<String, CoreError> {
-        self.send_text_impl(mldsa_pubkey_hex, msgtype, data, false)
+        self.send_text_impl(mldsa_pubkey_hex, msgtype, data, false, allow_dht_query)
             .await
     }
 
@@ -27,6 +33,7 @@ impl ChatCore {
         msgtype: ChatMessageType,
         data: Vec<u8>,
         is_retry: bool,
+        allow_dht_query: bool,
     ) -> Result<String, CoreError> {
         let pubkey_short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
         tracing::debug!(
@@ -40,7 +47,7 @@ impl ChatCore {
         let recipient_peer_id = {
             let store = self.get_dht_store();
             match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
-                Ok(Some(peer_id)) => {
+                Some(peer_id) => {
                     tracing::debug!(
                         "Found PeerID {} for {} in local DHT database",
                         peer_id,
@@ -48,17 +55,13 @@ impl ChatCore {
                     );
                     peer_id
                 }
-                Ok(None) => {
+                None => {
                     // 本地 DHT 未找到 PeerID 时，先通过已建立的连接或本地数据库查找
-                    tracing::info!(
-                        "PeerID not found locally for {}, performing DHT lookup...",
-                        pubkey_short
-                    );
-
                     // dht_lookup_peerid 是纯本地查询（检查 connected_peers + 本地数据库），
-                    // 不阻塞事件循环。如果本地未找到，会发起非阻塞 GetProviders 网络查询，
-                    // 查询结果通过 events.rs 自动缓存到本地数据库并触发重试。
-                    match self.dht_lookup_peerid(mldsa_pubkey_hex).await {
+                    // 不阻塞事件循环。allow_dht_query=false 时跳过 GetProviders 网络查询
+                    // （文件传输场景：DHT 查到的对象不一定是好友，无法加密且不应响应，
+                    //  且会泄露通信元数据，违反 E2EE）。
+                    match self.dht_lookup_peerid(mldsa_pubkey_hex, allow_dht_query).await {
                         Some(peer_id) => {
                             tracing::info!(
                                 "通过已建立连接找到 {} 的 PeerID: {}",
@@ -67,10 +70,16 @@ impl ChatCore {
                             );
                             // 将找到的 PeerID 缓存到本地 DHT 数据库，供后续使用
                             let store = self.get_dht_store();
-                            let _ = store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
+                            store.set_pubkey_peerid(mldsa_pubkey_hex, &peer_id);
                             peer_id
                         }
                         None => {
+                            if !allow_dht_query {
+                                return Err(CoreError::ContactOffline(format!(
+                                    "联系人 {} 当前不在线（本地未缓存 PeerID），文件传输要求对方在线",
+                                    pubkey_short
+                                )));
+                            }
                             tracing::info!("未找到 {} 的 PeerID，保存到离线队列", pubkey_short);
                             if !is_retry {
                                 self.save_pending_message(mldsa_pubkey_hex, msgtype, &data)
@@ -90,7 +99,6 @@ impl ChatCore {
                         }
                     }
                 }
-                Err(e) => return Err(CoreError::DhtError(e)),
             }
         };
 
@@ -178,9 +186,9 @@ impl ChatCore {
         // 步骤 1：从 peerid_to_mlkem 缓存查询（FriendOnline 直接传递，无需 DHT）
         // 通过 DHT 缓存找到目标公钥对应的 PeerID，再查 ML-KEM 公钥
         let store = self.get_dht_store();
-        let peer_id = store.get_peerid_by_pubkey(mldsa_pubkey_hex).ok().flatten();
+        let peer_id = store.get_peerid_by_pubkey(mldsa_pubkey_hex);
         if let Some(pid) = peer_id
-            && let Some(mlkem_hex) = self.peerid_to_mlkem.get(&pid)
+            && let Some(mlkem_hex) = self.peer_cache.peerid_to_mlkem.get(&pid)
                 && !mlkem_hex.is_empty() {
                     tracing::info!("Found ML-KEM pubkey for {} via peerid_to_mlkem", pubkey_short);
                     return hex::decode(mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
@@ -245,10 +253,7 @@ impl ChatCore {
     ) {
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
         if let Some(pool) = storage::pool() {
-            let content = match msgtype {
-                ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
-                _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
-            };
+            let content = encode_data_for_storage(msgtype, data);
 
             let message_hash = {
                 let mut hasher = Sha256::new();
@@ -265,8 +270,7 @@ impl ChatCore {
                 data.len(),
             );
 
-            // 离线队列尚未构建 ChatMessage（缺发送方时间戳/nonce/密文），
-            // 无法计算协议 hash。此处使用内容派生的 hash 作为去重键，
+            // 使用内容派生的 hash 作为去重键，
             // 真实协议 hash 在重试发送时通过 update_message_hash 回填。
             match storage::add_message_with_hash(
                 pool,
@@ -308,11 +312,8 @@ impl ChatCore {
         message_hash: &str,
     ) -> Option<i64> {
         let owner_identity_id = self.mldsa_identity_id.as_deref().unwrap_or("");
-        let Some(pool) = storage::pool() else { return None };
-        let content = match msgtype {
-            ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
-            _ => format!("[{}] {}", msgtype as u8, hex::encode(data)),
-        };
+        let pool = storage::pool()?;
+        let content = encode_data_for_storage(msgtype, data);
 
         tracing::debug!(
             "save_pending_message_with_hash: msgtype={:?}, hash={}.., data_len={}",
@@ -383,26 +384,12 @@ impl ChatCore {
         tracing::info!("离线消息重试完成");
     }
 
-    /// 从消息内容前缀推断消息类型，用于回退 detect_msgtype 缺失的迁移前行。
-fn detect_msgtype_from_content(content: &str) -> Option<ChatMessageType> {
-    let content = content.trim();
-    if content.starts_with('[') {
-        if let Some(end) = content.find(']') {
-            let num_str = &content[1..end];
-            if let Ok(num) = num_str.parse::<i32>() {
-                return ChatMessageType::try_from(num).ok();
-            }
-        }
-    }
-    None
-}
-
-async fn retry_single_pending_message(
+    async fn retry_single_pending_message(
         &mut self,
         pool: &sqlx::Pool<sqlx::sqlite::Sqlite>,
         msg: &storage::Message,
     ) -> Result<(), CoreError> {
-        let mut msgtype = match ChatMessageType::try_from(msg.msgtype) {
+        let msgtype = match ChatMessageType::try_from(msg.msgtype) {
             Ok(t) => t,
             Err(_) => {
                 tracing::warn!("未知消息类型 {}，跳过重试，保留 pending 状态", msg.msgtype);
@@ -410,31 +397,11 @@ async fn retry_single_pending_message(
             }
         };
 
-        // 回退内容推断：覆盖 003_add_msgtype.sql 迁移前 msgtype=0 的历史行
-        if msgtype == ChatMessageType::Text {
-            msgtype = Self::detect_msgtype_from_content(&msg.content).unwrap_or(ChatMessageType::Text);
-        }
-
-        let original_data = if msgtype == ChatMessageType::Text {
-            msg.content.as_bytes().to_vec()
-        } else {
-            match msg.content.find(']') {
-                Some(pos) => {
-                    let hex_part = msg.content[pos + 1..].trim();
-                    match hex::decode(hex_part) {
-                        Ok(decoded) => decoded,
-                        Err(_) => msg.content.as_bytes().to_vec(),
-                    }
-                }
-                None => msg.content.as_bytes().to_vec(),
-            }
-        };
+        let original_data = decode_data_from_storage(msgtype, &msg.content);
 
         let has_local_peerid = self
             .get_dht_store()
             .get_peerid_by_pubkey(&msg.peer_pubkey_hex)
-            .ok()
-            .flatten()
             .is_some();
 
         if !has_local_peerid {
@@ -445,7 +412,7 @@ async fn retry_single_pending_message(
         }
 
         let message_hash = self
-            .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true)
+            .send_text_impl(&msg.peer_pubkey_hex, msgtype, original_data, true, true)
             .await?;
 
         tracing::info!(
@@ -459,32 +426,26 @@ async fn retry_single_pending_message(
         Ok(())
     }
 
-    /// 通过 DHT 网络查询或已建立的连接查找对方的 PeerID
-    ///
-    /// 查找顺序：
-    ///   1. 先检查已建立的连接（connected_peers），通过 DHT 本地数据库反向查找
-    ///      每个已连接 PeerID 对应的 ML-DSA 公钥，看是否匹配目标公钥
-    ///   2. 如果未找到，发起 DHT 网络查询获取对方的 PeerID 绑定记录
-    ///
-    /// 当本地 DHT 数据库中没有对方的 PeerID 缓存时使用此方法。
-    ///
-    /// 注意：此方法在事件循环的 cmd 分支中调用，因此需要主动处理 swarm 事件
-    /// 来驱动 DHT 查询完成。使用 tokio::select! 同时处理 swarm 事件和超时。
     /// 查找 ML-DSA 公钥对应的 PeerID（仅本地查询，不阻塞事件循环）
     ///
     /// 查询顺序：
     /// 1. 遍历 connected_peers，反向查找已连接 PeerID 对应的 ML-DSA 公钥
     /// 2. 查询本地 DHT 数据库
     ///
-    /// 如果本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞），
-    /// 查询结果会通过 events.rs 中的事件处理自动缓存到本地数据库，
+    /// `allow_network_query=true` 时，本地未找到才发起 Kademlia GetProviders 网络查询
+    /// （非阻塞），查询结果会通过 events.rs 中的事件处理自动缓存到本地数据库，
     /// 并触发 retry_pending_messages 重试。
     ///
-    /// 此函数不会 await 网络查询结果，确保不阻塞事件循环。
-    pub(crate) async fn dht_lookup_peerid(&mut self, mldsa_pubkey_hex: &str) -> Option<libp2p::PeerId> {
+    /// 文件传输等场景传 `false`：DHT 网络查询查到的对象不一定是好友，无法加密且
+    /// 不应响应，且会泄露通信元数据，违反 E2EE。此时仅做本地查询。
+    pub(crate) async fn dht_lookup_peerid(
+        &mut self,
+        mldsa_pubkey_hex: &str,
+        allow_network_query: bool,
+    ) -> Option<libp2p::PeerId> {
         // === 步骤 1：检查内存缓存 peerid_to_pubkey ===
         // gossipsub 在线状态通知和 identify 协议会更新此缓存，比 DHT 数据库更快
-        for (peer_id, pubkey_hex) in &self.peerid_to_pubkey {
+        for (peer_id, pubkey_hex) in &self.peer_cache.peerid_to_pubkey {
             if pubkey_hex == mldsa_pubkey_hex {
                 tracing::info!(
                     "dht_lookup_peerid: 通过内存缓存找到 {}.. -> PeerID={}",
@@ -503,7 +464,7 @@ async fn retry_single_pending_message(
         for peer_id in &connected {
             // 反向查找：检查这个已连接的 PeerID 是否对应目标 ML-DSA 公钥
             match store.get_pubkey_by_peerid(peer_id) {
-                Ok(Some(pubkey_hex)) if pubkey_hex == mldsa_pubkey_hex => {
+                Some(pubkey_hex) if pubkey_hex == mldsa_pubkey_hex => {
                     tracing::info!(
                         "dht_lookup_peerid: 通过 connected_peers 找到 {}.. -> PeerID={}",
                         &mldsa_pubkey_hex[..16],
@@ -516,7 +477,7 @@ async fn retry_single_pending_message(
         }
 
         // === 步骤 3：查询本地 DHT 数据库 ===
-        if let Ok(Some(peer_id)) = store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
+        if let Some(peer_id) = store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
             tracing::info!(
                 "dht_lookup_peerid: 本地数据库找到 {}.. -> PeerID={}",
                 &mldsa_pubkey_hex[..16],
@@ -525,24 +486,57 @@ async fn retry_single_pending_message(
             return Some(peer_id);
         }
 
-        // === 步骤 4：本地未找到，发起 Kademlia GetProviders 网络查询（非阻塞） ===
-        // 使用 SHA256(ML-DSA 公钥) 作为查询 key，隐藏原始公钥
-        let query_key = p2p_swarm_ops::dht_key(mldsa_pubkey_hex);
-        let _ = self
-            .p2p_handle
-            .send(
-                P2pCommand::GetProviders {
-                    key: query_key,
-                },
-            )
-            .await;
+        // === 步骤 4：本地未找到，可选发起 Kademlia GetProviders 网络查询（非阻塞） ===
+        // 使用 SHA256(ML-DSA 公钥) 作为查询 key，隐藏原始公钥。
+        // 文件传输等场景 allow_network_query=false：DHT 查到的对象不一定是好友，
+        // 无法加密且不应响应，且会泄露通信元数据，违反 E2EE，故禁止网络查询。
+        if allow_network_query {
+            let query_key = p2p_swarm_ops::dht_key(mldsa_pubkey_hex);
+            let _ = self
+                .p2p_handle
+                .send(
+                    P2pCommand::GetProviders {
+                        key: query_key,
+                    },
+                )
+                .await;
 
-        tracing::debug!(
-            "dht_lookup_peerid: 本地未找到 {}..，已发起非阻塞 GetProviders 查询",
-            &mldsa_pubkey_hex[..16]
-        );
+            tracing::debug!(
+                "dht_lookup_peerid: 本地未找到 {}..，已发起非阻塞 GetProviders 查询",
+                &mldsa_pubkey_hex[..16]
+            );
+        } else {
+            tracing::debug!(
+                "dht_lookup_peerid: 本地未找到 {}..，allow_network_query=false 跳过 DHT 网络查询",
+                &mldsa_pubkey_hex[..16]
+            );
+        }
 
         None
+    }
+}
+
+/// 将消息数据编码为字符串用于数据库存储。
+/// Text 类型直接存 UTF-8 字符串，其余存 hex 编码。
+fn encode_data_for_storage(msgtype: ChatMessageType, data: &[u8]) -> String {
+    match msgtype {
+        ChatMessageType::Text => String::from_utf8_lossy(data).to_string(),
+        _ => hex::encode(data),
+    }
+}
+
+/// 从数据库 content 字符串解码回原始消息数据（postcard 字节）。
+/// 与 `encode_data_for_storage` 互逆。
+fn decode_data_from_storage(msgtype: ChatMessageType, content: &str) -> Vec<u8> {
+    match msgtype {
+        ChatMessageType::Text => content.as_bytes().to_vec(),
+        _ => match hex::decode(content) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!("decode_data_from_storage: hex decode failed for msgtype={:?}: {e}", msgtype);
+                content.as_bytes().to_vec()
+            }
+        },
     }
 }
 

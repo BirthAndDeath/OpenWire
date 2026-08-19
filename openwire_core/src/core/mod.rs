@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 use aws_lc_rs::kem::DecapsulationKey;
 use libp2p::PeerId;
@@ -22,9 +22,7 @@ use crate::{
     log::init_logger,
     message::{ChatMessage, ChatMessageType},
     p2p,
-    p2p::dht_cache::DhtCache,
     storage,
-    transfer::FileTransferState,
 };
 /// 命令处理 + 事件循环
 pub mod handle;
@@ -33,7 +31,9 @@ pub mod contact;
 /// DHT 操作（身份发布至 Kademlia 网络）
 pub mod dht;
 /// 文件传输
-pub mod file_transfer;
+pub mod file_transfer_manager;
+/// Peer 缓存
+pub mod peer_cache;
 /// 身份操作（生成、切换、删除）
 pub mod identity_ops;
 /// 消息操作
@@ -52,13 +52,9 @@ pub struct ChatCore {
     pub(crate) p2p_handle: P2pActorHandle,
     /// P2pActor 事件接收通道：接收网络事件
     pub(crate) rx_p2p_event: mpsc::Receiver<P2pEvent>,
-    /// 临时传输层 PeerID 密钥对（Ed25519，每次启动重新生成）
-    #[allow(dead_code)]
-    pub(crate) identity_keypair: libp2p::identity::Keypair,
     /// 消息发送通道：向外部（UI）发送事件
     pub(crate) tx_message: mpsc::Sender<ChatcoreEvent>,
     /// 消息接收通道：外部可取走事件（Option 用于 run() 时 take）
-    #[allow(dead_code)]
     pub(crate) rx_message: Option<mpsc::Receiver<ChatcoreEvent>>,
     /// 命令接收通道：接收外部控制指令
     pub(crate) rx_cmd: mpsc::Receiver<ChatCommand>,
@@ -80,47 +76,20 @@ pub struct ChatCore {
     /// 仅在内存中保留，不持久化
     /// 使用 Zeroizing 包装，确保 drop 时自动清零内存
     pub(crate) mldsa_private_key: Option<Zeroizing<Vec<u8>>>,
-    /// 活跃的文件传输状态（file_id -> FileTransferState）
-    pub(crate) file_transfers: HashMap<String, FileTransferState>,
-    /// 出站传输计数（下载请求，单独计算保持各方向有独立配额）
-    pub(crate) outbound_file_count: usize,
-    /// 入站传输计数（文件流分片，单独计算保持各方向有独立配额）
-    pub(crate) inbound_file_count: usize,
-    /// 上次文件传输超时扫描时间（限制扫描频率，避免每分片触发）
-    pub(crate) last_file_timeout_scan: std::time::Instant,
-    /// 内存 DHT 缓存
-    pub(crate) dht_cache: Arc<DhtCache>,
+    /// 文件传输状态管理
+    pub(crate) file_transfer: file_transfer_manager::FileTransferManager,
+    /// Peer 缓存（DHT + 映射）
+    pub(crate) peer_cache: peer_cache::PeerCache,
     /// 已建立连接的 PeerID 及其连接数（用于在线状态计数）
-    /// 使用 HashMap<PeerId, usize> 以支持每个 Peer 有多条连接（如 mDNS 双端互拨）
-    /// ConnectionEstablished 时 +1，ConnectionClosed 时 -1，减到 0 才移除
     pub(crate) connected_peers: std::collections::HashMap<PeerId, usize>,
-    /// PeerID → ML-DSA 公钥 hex 的内存缓存
-    ///
-    /// 在 ConnectionEstablished 时从 DHT 反向查找并缓存，
-    /// 在 handle_incoming_request 中 set_pubkey_peerid 后更新。
-    /// 避免因 DHT 写入延迟导致在线状态无法正确显示。
-    pub(crate) peerid_to_pubkey: HashMap<PeerId, String>,
-    /// 当前会话的 ML-KEM 解封装密钥对象（缓存，避免序列化/反序列化问题）
-    ///
-    /// # 设计说明
-    /// aws-lc-rs 的 `DecapsulationKey::key_bytes()` 输出格式与
-    /// `DecapsulationKey::new()` 输入格式不兼容（已知的库限制），
-    /// 因此无法通过序列化/反序列化私钥字节来重建 DecapsulationKey。
-    /// 解决方案是在 ChatCore 中缓存 DecapsulationKey 对象，直接传入引用。
-    ///
-    /// 此字段在 try_init() 中初始化，生命周期与 ChatCore 实例相同。
-    /// 每次会话重新生成 ML-KEM 密钥对时，此字段也会更新。
+    /// 当前会话的 ML-KEM 解封装密钥对象（缓存，避免每次解密重建）
     pub(crate) mlkem_decap_key: Option<DecapsulationKey>,
-    /// 已连接 peer 的 ML-KEM 公钥缓存（通过 FriendOnline 直接获取，无需 DHT）
-    pub(crate) peerid_to_mlkem: HashMap<PeerId, String>,
     /// 配置的中继节点列表 [(PeerId, Multiaddr)]
     pub(crate) relay_nodes: Vec<(String, String)>,
     /// 配置的 bootstrap 节点列表 [(PeerId, Multiaddr)]
     pub(crate) bootstrap_nodes: Vec<(String, String)>,
     /// 每个联系人的最近发现时间（用于防重复发现冷却）
     pub(crate) last_discovery_time: HashMap<String, Instant>,
-    /// DHT 查询键（SHA256）→ ML-DSA 公钥 hex 映射（用于 GetProvidersResult 反向查找）
-    pub(crate) dht_query_key_to_pubkey: HashMap<String, String>,
 }
 
 impl ChatCore {
@@ -164,10 +133,7 @@ impl ChatCore {
         tracing::info!("PeerID for transport: {}", peer_id);
 
         // 初始化内存 DHT 缓存
-        let dht_cache = DhtCache::new();
-
-        // ML-KEM 公钥不再存入 DHT，改为通过 FriendOnline 直接传递。
-        // 每次启动生成新的 ML-KEM 密钥对，旧的 ML-KEM 公钥自然失效。
+        let dht_cache = p2p::dht_cache::DhtCache::new();
 
         // 加载节点配置（bootstrap 节点）
         let bootstrap_nodes: Vec<(String, String)> = cfg.bootstrap_nodes.clone();
@@ -204,10 +170,11 @@ impl ChatCore {
             .cancellation_token(shutdown_token.clone())
             .start();
 
+        let file_transfer = file_transfer_manager::FileTransferManager::new(cfg.data_dir.clone(), tx.clone());
+        let peer_cache = peer_cache::PeerCache::new(dht_cache);
         Ok(ChatCore {
             p2p_handle,
             rx_p2p_event,
-            identity_keypair: keypair,
             peerid_config: Some(peerid_config),
             tx_message: tx,
             rx_message: Some(rx),
@@ -222,25 +189,19 @@ impl ChatCore {
             mldsa_identity_id: Some(mldsa_identity_id),
             mlkem_pubkey_hex: Some(mlkem_pubkey_hex_for_dht),
             mldsa_private_key: Some(mldsa_private_key),
-            file_transfers: HashMap::new(),
-            outbound_file_count: 0,
-            inbound_file_count: 0,
-            last_file_timeout_scan: std::time::Instant::now(),
-            dht_cache,
+            file_transfer,
+            peer_cache,
             connected_peers: std::collections::HashMap::new(),
-            peerid_to_pubkey: HashMap::new(),
             mlkem_decap_key: Some(mlkem_decap_key),
-            peerid_to_mlkem: HashMap::new(),
             relay_nodes: cfg.relay_nodes.clone(),
             bootstrap_nodes: cfg.bootstrap_nodes.clone(),
             last_discovery_time: HashMap::new(),
-            dht_query_key_to_pubkey: HashMap::new(),
         })
     }
 
     /// 获取 DHT 缓存
-    pub(crate) fn get_dht_store(&self) -> &DhtCache {
-        &self.dht_cache
+    pub(crate) fn get_dht_store(&self) -> &p2p::dht_cache::DhtCache {
+        self.peer_cache.dht()
     }
 
     /// 获取消息接收通道（用于外部 UI 接收核心事件）
@@ -327,43 +288,17 @@ impl ChatCore {
     }
 
     /// 解析当前所有已连接 PeerID 对应的 ML-DSA 公钥 hex
-    ///
-    /// 优先使用内存缓存 `peerid_to_pubkey`，如果缓存中没有则回退到 DHT 查询。
-    /// 找到后自动写入缓存，避免后续重复查询。
     fn resolve_online_contacts(&self) -> Vec<String> {
-        let store = self.get_dht_store();
-        let mut online = Vec::with_capacity(self.connected_peers.len());
-        for peer_id in self.connected_peers.keys() {
-            // 1. 优先使用内存缓存
-            if let Some(pubkey_hex) = self.peerid_to_pubkey.get(peer_id) {
-                online.push(pubkey_hex.clone());
-                continue;
-            }
-            // 2. 回退到 DHT 查询
-            match store.get_pubkey_by_peerid(peer_id) {
-                Ok(Some(pubkey_hex)) => {
-                    online.push(pubkey_hex);
-                }
-                _ => {
-                    tracing::trace!("Peer {peer_id} has no pubkey mapping yet");
-                }
-            }
-        }
-        online
+        self.peer_cache.resolve_online(&self.connected_peers)
     }
 
     /// 更新 PeerID → ML-DSA 公钥 hex 的内存缓存
-    ///
-    /// 当 `set_pubkey_peerid` 被调用时（如收到入站请求后），
-    /// 同步更新内存缓存，确保后续在线状态查询能立即反映新映射。
-    /// 如果该 PeerID 当前已连接，则触发一次在线状态刷新。
     pub(crate) async fn update_peerid_pubkey_mapping(
         &mut self,
         peer_id: PeerId,
         pubkey_hex: String,
     ) {
-        let is_new = self.peerid_to_pubkey.insert(peer_id, pubkey_hex).is_none();
-        // 如果这是新映射且该 PeerID 当前已连接，刷新在线状态
+        let is_new = self.peer_cache.cache_pubkey(peer_id, pubkey_hex);
         if is_new && self.connected_peers.contains_key(&peer_id) {
             self.send_online_status().await;
         }
@@ -372,14 +307,6 @@ impl ChatCore {
 
 impl Drop for ChatCore {
     fn drop(&mut self) {
-        // 先发送关闭命令，确保 P2pActor 有机会处理 SaveRoutingTable 和 Shutdown
-        // 再触发取消信号，避免后台任务在命令处理前退出
-        let _ = self.core_handle.cmd_tx.try_send(ChatCommand::Shutdown);
-        let _ = self
-            .p2p_handle
-            .tx
-            .try_send(P2pCommand::SaveRoutingTable);
-        let _ = self.p2p_handle.tx.try_send(P2pCommand::Shutdown);
         self.core_handle.shutdown_token.cancel();
     }
 }

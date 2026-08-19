@@ -21,6 +21,7 @@ use libp2p::{
 /// - `relay`: NAT 穿透中继
 /// - `dcutr`: 直连升级
 /// - `pathranker`: 路径评分协议（行为感知路由）
+///
 /// libp2p 网络行为组合（由 NetworkBehaviour derive 生成事件枚举）
 #[derive(NetworkBehaviour)]
 #[allow(missing_docs)]
@@ -58,7 +59,6 @@ pub struct MyBehaviour {
     pub memory_limits: memory_connection_limits::Behaviour,
 
     /// 路径评分协议（行为感知路由，EWMA 评分 + 信誉 + 协作评分）
-    #[cfg(feature = "pathranker")]
     pub pathranker: libp2p_pathranker::PathRankerBehaviour,
 
     /// UPnP 端口映射（自动添加公网端口转发）

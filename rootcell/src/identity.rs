@@ -132,8 +132,7 @@ impl PrivateKeyHandle {
                     }
                 }
                 Ok(_) => {
-                    tracing::debug!("Master key entry in Keyring is empty");
-                    Ok(None)
+                    anyhow::bail!("Master key entry in Keyring is empty or whitespace-only");
                 }
                 Err(keyring_core::Error::NoEntry) => {
                     tracing::debug!("Master key not found in Keyring");
@@ -183,31 +182,35 @@ impl PrivateKeyHandle {
         aes_key
     }
 
-    /// 旧格式 AES 密钥派生（无 salt，使用固定 HKDF salt）。
-    ///
-    /// 仅用于解密旧格式加密文件迁移，不用于新加密。
-    /// HKDF info 参数必须为 identifier.as_bytes()，不可修改。
-    pub(crate) fn derive_aes_key_legacy(
-        master_key: &[u8; 32],
-        identifier: &str,
-    ) -> Zeroizing<[u8; 32]> {
-        let hk = Hkdf::<Sha256>::new(Some(b"openwire-key-derivation"), master_key);
-        let mut aes_key = Zeroizing::new([0u8; 32]);
-        hk.expand(identifier.as_bytes(), &mut *aes_key)
-            .expect("HKDF expand should not fail with valid output length");
-        aes_key
-    }
-
     pub fn check_keyring_available() -> bool {
         ensure_keyring_init();
         // Entry::new 只构造句柄，不写入凭据，因此不会残留测试条目。
         keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER).is_ok()
     }
 
-    pub fn delete_master_key() -> anyhow::Result<()> {
+    pub fn delete_master_key(data_dir: &str) -> anyhow::Result<()> {
         let _guard = MASTER_KEY_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+
+        let keys_dir = std::path::Path::new(data_dir).join("keys");
+        if keys_dir.exists() {
+            let enc_count = match std::fs::read_dir(&keys_dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().map(|ext| ext == "enc").unwrap_or(false))
+                    .count(),
+                Err(_) => 0,
+            };
+            if enc_count > 0 {
+                anyhow::bail!(
+                    "Cannot delete master key: {enc_count} encrypted key file(s) exist in {:?}. \
+                     Delete all identities first.",
+                    keys_dir
+                );
+            }
+        }
+
         let entry = keyring_core::Entry::new(KEYRING_SERVICE, MASTER_KEY_IDENTIFIER)?;
         match entry.get_password() {
             Ok(_) => {
@@ -228,10 +231,11 @@ impl PrivateKeyHandle {
 
     pub(crate) fn hash_identifier(identifier: &str) -> String {
         let hash = blake3::hash(identifier.as_bytes());
-        hex::encode(&hash.as_bytes()[..16])
+        let bytes = hash.as_bytes();
+        hex::encode(&bytes[..16.min(bytes.len())])
     }
 
-    pub(crate) fn encrypted_file_path(data_dir: &str, identifier: &str) -> std::path::PathBuf {
+    pub fn encrypted_file_path(data_dir: &str, identifier: &str) -> std::path::PathBuf {
         let short_name = Self::hash_identifier(identifier);
         Path::new(data_dir).join("keys").join(format!("{}.enc", short_name))
     }
@@ -255,6 +259,23 @@ impl PrivateKeyHandle {
 
     pub fn delete_encrypted_private_key(data_dir: &str, identifier: &str) {
         delete_file(data_dir, identifier);
+    }
+
+    /// 备份加密的私钥文件为 `<name>.bak`，供删除重建前保留旧密钥。
+    /// 文件不存在时静默成功。
+    pub fn backup_encrypted_private_key(data_dir: &str, identifier: &str) {
+        let path = Self::encrypted_file_path(data_dir, identifier);
+        if !path.exists() {
+            return;
+        }
+        let backup = path.with_extension("enc.bak");
+        if let Err(e) = std::fs::copy(&path, &backup) {
+            tracing::warn!(
+                "Failed to back up encrypted private key for {}: {}",
+                identifier,
+                e
+            );
+        }
     }
 
     /// 将私钥加密保存到 Keyring + 加密文件。
@@ -305,9 +326,14 @@ impl PrivateKeyHandle {
             ))?;
 
         let mut private_key = private_key;
+        // 复制到 Box<[u8]> 后显式零化原 Vec：into_boxed_slice 在容量 > 长度时会
+        // realloc，旧缓冲中未零化的明文会被释放到堆上。
         let private_key_vec = std::mem::take(&mut *private_key);
+        let mut private_key_vec = private_key_vec;
+        let boxed_slice: Box<[u8]> = private_key_vec.as_slice().into();
+        private_key_vec.zeroize();
         let mut handle = Self {
-            private_key: Box::into_pin(private_key_vec.into_boxed_slice()),
+            private_key: Box::into_pin(boxed_slice),
             identifier: identifier.to_string(),
             data_dir: data_dir.to_string(),
             locked: false,
@@ -321,7 +347,7 @@ impl PrivateKeyHandle {
     }
 
     pub fn get_private_key(&self) -> &[u8] {
-        &*self.private_key
+        &self.private_key
     }
 
     pub fn identifier(&self) -> &str {
@@ -490,7 +516,7 @@ pub(crate) fn save_bytes(
 }
 
 /// 原子写入：先写同目录临时文件再 rename，避免中途崩溃留下截断/损坏的密钥文件。
-///
+/// Windows 上 rename 在目标已存在时失败，不会出现旧文件已被删除而新文件未就位的窗口期。
 /// 临时文件在创建后立即设置 0o600 权限（仅 unix），避免 umask 默认权限下的
 /// TOCTOU 窗口；rename 保留源文件权限。
 fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -502,12 +528,6 @@ fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
-    }
-
-    // Windows 的 rename 在目标已存在时会失败，先移除目标（非原子，但可避免半写文件）
-    #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(path);
     }
 
     std::fs::rename(&tmp_path, path)
@@ -528,39 +548,24 @@ pub(crate) fn load_bytes(
         Err(e) => return Err(e.into()),
     };
     if file_content.len() < NONCE_LEN {
-        tracing::warn!(
-            "Encrypted file for {} is too short ({} bytes), ignoring",
+        anyhow::bail!(
+            "Encrypted file for {} is too short ({} bytes) — file exists but is corrupt",
             identifier,
             file_content.len()
         );
-        return Ok(None);
     }
 
     let version = file_content[0];
-    if version == FILE_FORMAT_VERSION {
-        return decode_v1_format(identifier, &file_content, master_key)
-            .map(|v| Some(Zeroizing::new(v)));
-    }
-
-    // 检测旧格式（无版本字节，nonce[12] + ciphertext）
     if version != FILE_FORMAT_VERSION {
-        return match decode_legacy_format(identifier, &file_content, master_key) {
-            Ok(plaintext) => {
-                tracing::info!(
-                    "Migrated encrypted file for {} from legacy format to v1",
-                    identifier
-                );
-                let _ = save_bytes(data_dir, identifier, &plaintext, master_key);
-                Ok(Some(Zeroizing::new(plaintext)))
-            }
-            Err(e) => {
-                tracing::warn!("Legacy encrypted file for {} migration failed: {e}", identifier);
-                Ok(None)
-            }
-        };
+        // 开发版本无兼容约束：未知/旧格式版本直接报错，不做旧格式回退或迁移
+        anyhow::bail!(
+            "Encrypted file for {} has unknown format version {:#04x} (expected {:#04x})",
+            identifier,
+            version,
+            FILE_FORMAT_VERSION
+        );
     }
-
-    Ok(None)
+    decode_v1_format(identifier, &file_content, master_key).map(|v| Some(Zeroizing::new(v)))
 }
 
 /// 解密 v1 格式：version(1) + salt(16) + nonce(12) + AES-GCM-AAD(ciphertext)
@@ -588,27 +593,6 @@ fn decode_v1_format(
         .decrypt(&Nonce::from(nonce_array), Payload { msg: ciphertext, aad: &aad })
         .map_err(|_| anyhow::anyhow!(
             "Failed to decrypt file for {} (wrong key or corrupted file)", identifier
-        ))
-}
-
-/// 解密旧格式（无版本字节，nonce[12] + AES-GCM(ciphertext)，使用旧 derive_aes_key）
-fn decode_legacy_format(
-    identifier: &str,
-    file_content: &[u8],
-    master_key: &[u8; 32],
-) -> anyhow::Result<Vec<u8>> {
-    let (nonce_bytes, ciphertext) = file_content.split_at(NONCE_LEN);
-    let nonce_array: [u8; NONCE_LEN] = nonce_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid legacy nonce length"))?;
-
-    let derived = PrivateKeyHandle::derive_aes_key_legacy(master_key, identifier);
-    let cipher = Aes256Gcm::new_from_slice(&*derived)
-        .map_err(|e| anyhow::anyhow!("Invalid legacy AES key length: {e}"))?;
-    cipher
-        .decrypt(&Nonce::from(nonce_array), ciphertext)
-        .map_err(|_| anyhow::anyhow!(
-            "Failed to decrypt legacy file for {} (wrong key or corrupted file)", identifier
         ))
 }
 

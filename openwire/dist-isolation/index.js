@@ -8,10 +8,9 @@ const ALLOWED_COMMANDS = new Set([
     'is_keyring_available',
     'get_nodes_config', 'save_nodes_config', 'reset_nodes_config',
     'list_sent_files', 'delete_sent_file',
-    'copy_file',
     'get_network_status',
     'export_routing_table', 'import_routing_table', 'read_text_file', 'set_paid_network',
-    'set_relay_role', 'dial_peer', 'get_version',
+    'set_relay_role', 'dial_peer', 'get_version', 'on_foreground',
     'plugin:window|set_content_protected'
 ]);
 
@@ -21,8 +20,8 @@ const SENSITIVE_COMMANDS = new Set([
     'send', 'send_file', 'delete_identity', 'select_identity',
     'generate_identity', 'add_contact', 'delete_contact', 'delete_message',
     'request_file_download', 'delete_sent_file',
-    'copy_file',
-    'save_nodes_config', 'reset_nodes_config'
+    'save_nodes_config', 'reset_nodes_config',
+    'discover_contact', 'export_routing_table', 'set_paid_network'
 ]);
 
 const RATE_LIMITS = {
@@ -41,7 +40,6 @@ const RATE_LIMITS = {
     check_core_ready: { maxCalls: 300, windowMs: 60000 },
     list_sent_files: { maxCalls: 60, windowMs: 60000 },
     delete_sent_file: { maxCalls: 10, windowMs: 60000 },
-    copy_file: { maxCalls: 10, windowMs: 60000 },
     get_network_status: { maxCalls: 60, windowMs: 60000 },
     export_routing_table: { maxCalls: 10, windowMs: 60000 },
     import_routing_table: { maxCalls: 10, windowMs: 60000 },
@@ -49,6 +47,7 @@ const RATE_LIMITS = {
     set_paid_network: { maxCalls: 30, windowMs: 60000 },
     set_relay_role: { maxCalls: 30, windowMs: 60000 },
     dial_peer: { maxCalls: 10, windowMs: 60000 },
+    on_foreground: { maxCalls: 60, windowMs: 60000 },
 };
 
 const DEFAULT_RATE_LIMIT = { maxCalls: 30, windowMs: 60000 };
@@ -202,14 +201,6 @@ if (p.limit !== undefined && (typeof p.limit !== 'number' || p.limit < 0 || p.li
         if (p.fileHashHex.length !== 64) return 'fileHashHex must be 64 hex chars';
         return null;
     },
-    copy_file: (p) => {
-        let err = requiredString(p.src, 'src', 4096);
-        if (err) return err;
-        err = requiredString(p.dst, 'dst', 4096);
-        if (err) return err;
-        if (/\.\./.test(p.src) || /\.\./.test(p.dst)) return 'path traversal not allowed';
-        return null;
-    },
     save_nodes_config: (p) => {
         if (!Array.isArray(p.relayNodes)) return 'relayNodes must be an array';
         if (!Array.isArray(p.bootstrapNodes)) return 'bootstrapNodes must be an array';
@@ -272,6 +263,7 @@ if (p.limit !== undefined && (typeof p.limit !== 'number' || p.limit < 0 || p.li
         return null;
     },
     get_version: () => null,
+    on_foreground: () => null,
 };
 
 window.__TAURI_ISOLATION_HOOK__ = (payload) => {

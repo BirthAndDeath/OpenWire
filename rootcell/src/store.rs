@@ -50,7 +50,8 @@ impl EncryptedStore {
         identifier: &str,
         value: &T,
     ) -> anyhow::Result<()> {
-        let serialized = serde_json::to_vec(value)?;
+        // Zeroizing 确保序列化缓冲（可能含私钥明文）被释放时零化
+        let serialized = Zeroizing::new(serde_json::to_vec(value)?);
         identity::save_bytes(data_dir, identifier, &serialized, &self.master_key)
     }
 

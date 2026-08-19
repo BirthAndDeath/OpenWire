@@ -139,6 +139,12 @@ pub async fn load_or_generate_complete_identity(
                     &identity_id[..16]
                 );
 
+                let old_key_path = rootcell::identity::PrivateKeyHandle::encrypted_file_path(
+                    &data_dir,
+                    &format!("{}_mldsa", identity_id),
+                );
+                let old_key_bytes = std::fs::read(&old_key_path).ok();
+
                 if let Err(del_err) =
                     storage::delete_identity(pool, &cfg.data_dir, &identity_id).await
                 {
@@ -149,7 +155,19 @@ pub async fn load_or_generate_complete_identity(
                     );
                 }
 
-                generate_complete_identity(cfg).await
+                match generate_complete_identity(cfg).await {
+                    Ok(identity) => Ok(identity),
+                    Err(e) => {
+                        if let Some(bytes) = old_key_bytes {
+                            let _ = std::fs::write(&old_key_path, &bytes);
+                            tracing::warn!(
+                                "Identity rebuild failed, restored old key file for {}: {}",
+                                &identity_id[..16], e
+                            );
+                        }
+                        Err(e)
+                    }
+                }
             }
         }
     } else {

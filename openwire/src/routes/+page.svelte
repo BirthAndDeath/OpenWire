@@ -1,6 +1,6 @@
 <script lang="ts">
   import "../lib/i18n";
-  import { _, locale } from "svelte-i18n";
+  import { _ } from "svelte-i18n";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
@@ -13,6 +13,8 @@
   import AddFriendModal from "./AddFriendModal.svelte";
   import SentFileManager from "./SentFileManager.svelte";
   import ResizablePanel from "$lib/components/ResizablePanel.svelte";
+  import { formatFileSize } from "$lib/format";
+  import type { FileHashInfo } from "$lib/types";
   interface IdentityDto {
     id: number;
     identity_id: string;
@@ -62,14 +64,6 @@
 
   // 主题和语言在layout.svelte 中统一初始化
 
-  // 格式化文件大小
-  function formatFileSize(bytes: number): string {
-    if (bytes === 0) return "0 B";
-    const units = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
-  }
-
   let warning = $state<string>("");
   let onNotif: ((msg: string) => void) | undefined = $state();
   let notifBuffer: string[] = [];
@@ -93,16 +87,6 @@
       notifBuffer = [];
     }
   });
-
-  // 语言选项
-  const languages = [
-    { code: "en", name: "English" },
-    { code: "zh", name: "中文" },
-    { code: "fr", name: "Français" },
-    { code: "es", name: "Español" },
-    { code: "de", name: "Deutsch" },
-    { code: "ja", name: "日本語" },
-  ];
 
   let currentIdentityId = $state<string>("");
 
@@ -147,7 +131,7 @@
   };
 
   // === 状态 ===
-  let msgListRef = $state<ReturnType<typeof Messagelist>>();
+  let msgListRef: ReturnType<typeof Messagelist> | undefined = $state();
   let selectedId = $state<string | null>(null);
   let inputH = $state(150);
 
@@ -183,6 +167,7 @@
     let unlistenDeliveryReceipt: (() => void) | undefined;
     let unlistenOnlineStatus: (() => void) | undefined;
     let unlistenMessageSent: (() => void) | undefined;
+    let unlistenForeground: (() => void) | undefined;
     let pollingTimer: ReturnType<typeof setInterval> | undefined;
 
     (async () => {
@@ -193,6 +178,11 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
         coreReady = true;
         loadContacts();
         loadCurrentIdentity();
+      });
+
+      // 应用从后台恢复前台时，触发发现和拨号，避免好友端因连接超时标记离线
+      unlistenForeground = await listen("tauri://foreground", () => {
+        invoke("on_foreground").catch(console.error);
       });
 
       unlistenCoreInitFailed = await listen<string>("core-init-failed", (e) => {
@@ -216,21 +206,32 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
         // 尝试解析结构化 JSON 消息（FileHash 类型）
         let displayText = e.payload;
         let msgType: "text" | "file_hash" | "file_stream" = "text";
-        let fileHashInfo: any = undefined;
+        let fileHashInfo: FileHashInfo | undefined = undefined;
         let senderPubkey: string | undefined = undefined;
 
         try {
           const parsed = JSON.parse(e.payload);
-          if (parsed.type === "file_hash") {
+          const isHex64 =
+            typeof parsed.file_hash === "string" &&
+            /^[0-9a-fA-F]{64}$/.test(parsed.file_hash);
+          if (
+            parsed.type === "file_hash" &&
+            isHex64 &&
+            typeof parsed.filename === "string" &&
+            parsed.filename.length > 0 &&
+            parsed.filename.length <= 512
+          ) {
             msgType = "file_hash";
-            displayText = `文件分享: ${parsed.filename} (${formatFileSize(parsed.total_size)})`;
+            const filename = parsed.filename;
+            const total_size = typeof parsed.total_size === "number" ? parsed.total_size : 0;
+            const file_hash = parsed.file_hash;
+            displayText = `文件分享: ${filename} (${formatFileSize(total_size)})`;
             fileHashInfo = {
-              filename: parsed.filename,
-              total_size: parsed.total_size,
-              file_hash: parsed.file_hash,
-              file_id: parsed.file_id,
+              filename,
+              total_size,
+              file_hash,
             };
-            senderPubkey = parsed.sender;
+            senderPubkey = typeof parsed.sender === "string" ? parsed.sender : undefined;
           } else if (parsed.type === "text" && parsed.sender) {
             // 结构化文本消息，包含发送方信息
             displayText = parsed.text || displayText;
@@ -324,6 +325,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
       unlistenDeliveryReceipt?.();
       unlistenOnlineStatus?.();
       unlistenMessageSent?.();
+      unlistenForeground?.();
     };
   });
 
@@ -664,7 +666,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     display: flex;
     flex-direction: column;
     height: 100%;
-    background: var(--bg-secondary);
+    background: transparent;
     border-right: 1px solid var(--border-color);
   }
 

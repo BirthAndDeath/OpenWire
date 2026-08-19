@@ -9,32 +9,6 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
-/// 移除字符串中的终端转义序列，防止终端注入攻击
-/// 保留可打印 ASCII 与普通非 ASCII 字符（CJK/emoji 等），剥离：
-/// - C0/C1 控制字符（ESC 等）
-/// - Unicode 格式控制字符（bidi 覆盖/定向符、零宽字符等，General_Category=Cf）
-/// 使用 unicode-properties 的 General_Category API，而非硬编码码位范围，
-/// 随 Unicode 数据表演进自动覆盖新增字符。
-fn strip_escape(s: &str) -> String {
-    use unicode_properties::GeneralCategory;
-    use unicode_properties::UnicodeGeneralCategory;
-    s.chars()
-        .filter(|&c| {
-            if c.is_control() {
-                return false;
-            }
-            let gc = c.general_category();
-            if gc == GeneralCategory::Format
-                || gc == GeneralCategory::LineSeparator
-                || gc == GeneralCategory::ParagraphSeparator
-            {
-                return false;
-            }
-            c.is_ascii_graphic() || c == ' ' || !c.is_ascii()
-        })
-        .collect()
-}
-
 pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
     // 获取对 core 的引用并启动它
     let mut core = app.core.take().ok_or(CliError::CoreNotInitialized)?;
@@ -58,23 +32,26 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                         } else {
                             sender.clone()
                         };
-                        println!("[{}] {}", short_sender, strip_escape(&text));
+println!("[{}] {}", short_sender, crate::strip_escape(&text));
                     }
                     IncomingMessage::FileShare {
                         filename,
-                        file_id,
+                        file_hash,
                         total_size,
                         sender,
                         ..
                     } => {
                         let short_sender = if sender.len() > 16 {
-                            format!("{}...", &sender[..16])
+                            format!("{}...", &sender[..16.min(sender.len())])
                         } else {
                             sender.clone()
                         };
                         println!(
-                            "[文件] {} 向你分享文件: {} ({} bytes, id: {})",
-                            short_sender, strip_escape(&filename), total_size, file_id
+                            "[文件] {} 向你分享文件: {} ({} bytes, hash: {})",
+                            short_sender,
+                            crate::strip_escape(&filename),
+                            total_size,
+                            &file_hash[..16.min(file_hash.len())]
                         );
                     }
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
@@ -99,18 +76,18 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                     }
                 }
                 MessageEvent::Log(data) => {
-                    println!("[日志] {data}");
+                    println!("[日志] {}", crate::strip_escape(&data));
                 }
                 MessageEvent::Warning(data) => {
-                    println!("[警告] {data}");
+                    println!("[警告] {}", crate::strip_escape(&data));
                 }
                 MessageEvent::Error(data) => {
-                    eprintln!("[错误] {data}");
+                    eprintln!("[错误] {}", crate::strip_escape(&data));
                 }
                 MessageEvent::FileTransferProgress(progress) => {
                     println!(
                         "[文件传输] {} ({}/{}) - {}",
-                        strip_escape(&progress.filename),
+                        crate::strip_escape(&progress.filename),
                         progress.received_bytes,
                         progress.total_size,
                         progress.status,
@@ -128,6 +105,7 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
                     let status = if online { "在线" } else { "离线" };
                     println!("[在线状态] {} {}", short, status);
                 }
+                MessageEvent::IdentityChanged { .. } => {}
             }
         }
     });
@@ -215,11 +193,11 @@ pub async fn no_tui_run(app: &mut App) -> Result<(), CliError> {
         Ok::<(), CliError>(())
     });
 
-    // 等待输入处理任务完成（实际上不会完成，直到用户中断）
-    let _ = tokio::join!(message_handler, input_handler);
-
-    // 发送关闭命令
+    // 发送关闭命令，使 message_handler 中 rx.recv() 返回 None 后自然退出
     app.core_handle.shutdown();
+
+    // 等待输入处理任务完成
+    let _ = tokio::join!(message_handler, input_handler);
 
     // 使用 spawn_blocking 等待核心服务结束，避免阻塞 tokio 线程
     let result = tokio::task::spawn_blocking(move || core_joinhandle.join()).await;

@@ -1,4 +1,4 @@
-use crate::{actor::p2p::P2pCommand, command::ChatCommand, core::ChatCore, error::CoreError};
+use crate::{actor::p2p::P2pCommand, command::ChatCommand, core::ChatCore, error::CoreError, message::ChatMessageType};
 
 impl ChatCore {
     /// 处理单个控制命令
@@ -8,13 +8,13 @@ impl ChatCore {
                 mldsa_pubkey_hex,
                 msgtype,
                 data,
-            } => match self.send_text(&mldsa_pubkey_hex, msgtype, data).await {
+            } => match self.send_text(&mldsa_pubkey_hex, msgtype, data, true).await {
                 Ok(message_hash) => {
                     tracing::info!(
                         "{:?} message sent to {}, hash={}..",
                         msgtype,
-                        &mldsa_pubkey_hex[..16],
-                        &message_hash[..16]
+                        &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                        &message_hash[..16.min(message_hash.len())]
                     );
                     // 通知前端消息已发送，附带消息哈希用于匹配送达回执
                     self.send_message_mpsc(crate::command::IncomingMessage::MessageSent {
@@ -32,7 +32,7 @@ impl ChatCore {
                             tracing::info!(
                                 "{:?} message queued for {}: {}",
                                 msgtype,
-                                &mldsa_pubkey_hex[..16],
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
                                 e
                             );
                         }
@@ -66,8 +66,21 @@ impl ChatCore {
                 file_hash,
                 save_path,
             } => {
-                self.handle_file_download_request(&sender_mldsa_pubkey_hex, file_hash, save_path)
-                    .await;
+                let data = match self.file_transfer.try_start_download(file_hash, &save_path) {
+                    Ok((_, data)) => data,
+                    Err(msg) => {
+                        self.send_warning_mpsc(msg).await;
+                        return;
+                    }
+                };
+                let hash_hex = hex::encode(file_hash);
+                if let Err(e) = self
+                    .send_text(&sender_mldsa_pubkey_hex, ChatMessageType::FileDownloadRequest, data, false)
+                    .await
+                {
+                    self.file_transfer.cancel_download(&hash_hex);
+                    self.send_warning_mpsc(format!("文件下载请求发送失败: {e}")).await;
+                }
             }
             ChatCommand::DhtPublishIdentity { mldsa_pubkey_hex } => {
                 self.publish_identity_to_dht(&mldsa_pubkey_hex).await;
@@ -77,11 +90,6 @@ impl ChatCore {
                 name,
             } => {
                 self.discover_contact(&mldsa_pubkey_hex, name).await;
-            }
-            ChatCommand::Shutdown => {
-                tracing::warn!(
-                    "Shutdown command reached handle_command (should be handled in run_inner)"
-                );
             }
             ChatCommand::SetPaidNetworkMode(mode) => {
                 if let Err(e) = self
@@ -134,6 +142,9 @@ impl ChatCore {
                 {
                     tracing::warn!("Failed to send RefreshRoutingTable: {e:?}");
                 }
+            }
+            ChatCommand::TimerScanFileTransfers => {
+                self.file_transfer.scan_timeout_transfers();
             }
             ChatCommand::GetNetworkStatus { resp } => {
                 let (p2p_tx, p2p_rx) = tokio::sync::oneshot::channel();
@@ -204,6 +215,8 @@ impl ChatCore {
                     Err(_) => { let _ = resp.send(serde_json::json!({ "imported": 0, "error": "P2pActor did not respond" }).to_string()); }
                 }
             }
+            // Shutdown 由 run_inner 直接拦截处理，不进入 handle_command
+            ChatCommand::Shutdown => {}
         }
     }
 }

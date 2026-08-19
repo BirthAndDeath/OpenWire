@@ -14,6 +14,30 @@ pub mod notui;
 pub mod tui;
 pub mod use_json;
 
+/// 移除字符串中的终端转义序列，防止终端注入攻击
+/// 保留可打印 ASCII 与普通非 ASCII 字符（CJK/emoji 等），剥离：
+/// - C0/C1 控制字符（ESC 等）
+/// - Unicode 格式控制字符（bidi 覆盖/定向符、零宽字符等）
+pub fn strip_escape(s: &str) -> String {
+    use unicode_properties::GeneralCategory;
+    use unicode_properties::UnicodeGeneralCategory;
+    s.chars()
+        .filter(|&c| {
+            if c.is_control() {
+                return false;
+            }
+            let gc = c.general_category();
+            if gc == GeneralCategory::Format
+                || gc == GeneralCategory::LineSeparator
+                || gc == GeneralCategory::ParagraphSeparator
+            {
+                return false;
+            }
+            c.is_ascii_graphic() || c == ' ' || !c.is_ascii()
+        })
+        .collect()
+}
+
 /// ML-DSA 公钥验证失败的提示文案（CLI 多入口共用，避免漂移）
 pub const MLDSA_PUBKEY_INVALID: &str =
     "ML-DSA 公钥无效（格式或密码学验证失败，应为3904字符的hex编码）";
@@ -68,6 +92,46 @@ pub struct App {
 }
 
 impl App {
+    /// 滚动消息列表到底部
+    pub fn scroll_to_bottom(&mut self) {
+        let msg_count = self.current_messages().len();
+        if msg_count > 0 {
+            self.message_list_state.select(Some(msg_count - 1));
+        }
+    }
+
+    /// 从数据库加载指定联系人的历史消息
+    pub async fn load_messages_for_contact(&mut self, pubkey: &str) {
+        if self.messages_by_contact.contains_key(pubkey) {
+            return;
+        }
+        let Some(pool) = openwire_core::storage::pool() else { return };
+        let owner = openwire_core::storage::get_current_identity(pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Ok(msgs) = openwire_core::storage::get_messages(
+            pool,
+            &owner,
+            pubkey,
+            None,
+            50,
+        )
+        .await else { return };
+        let entry = self.messages_by_contact.entry(pubkey.to_string()).or_default();
+        let shares = self.file_shares_by_contact.entry(pubkey.to_string()).or_default();
+        let contact = self.contacts.iter().find(|c| c.mldsa_pubkey_hex == pubkey);
+        let name = contact.and_then(|c| c.name.as_deref()).unwrap_or("(未命名)");
+        entry.push(format!("--- 与 {} 的聊天记录 ---", name));
+        shares.push(None);
+        for msg in msgs.iter().rev() {
+            let prefix = if msg.is_outgoing == 1 { "[我]" } else { "[对方]" };
+            entry.push(format!("{} {}", prefix, crate::strip_escape(&msg.content)));
+            shares.push(crate::detect_file_share(msg));
+        }
+    }
+
     /// 获取当前选中联系人的消息列表
     pub fn current_messages(&self) -> &[String] {
         let contact_key = self
@@ -128,30 +192,17 @@ impl App {
 }
 
 /// 从数据库消息中检测文件分享并返回 FileShareInfo
-/// 内容格式通过 openwire_core::command::FILE_SHARE_CONTENT_PREFIX / FILE_SHARE_HASH_PREFIX 定义
 pub fn detect_file_share(msg: &openwire_core::storage::Message) -> Option<FileShareInfo> {
-    if let Some(rest) = msg
-        .content
-        .strip_prefix(openwire_core::command::FILE_SHARE_CONTENT_PREFIX)
-    {
-        if let Some(hash_start) = rest.rfind(openwire_core::command::FILE_SHARE_HASH_PREFIX) {
-            let filename = rest[..hash_start].to_string();
-            let hash_start_actual =
-                hash_start + openwire_core::command::FILE_SHARE_HASH_PREFIX.len();
-            if !rest.ends_with(']') {
-                return None;
-            }
-            let hash_hex = &rest[hash_start_actual..rest.len() - 1];
-            if hash_hex.len() == 64 && hex::decode(hash_hex).is_ok() {
-                return Some(FileShareInfo {
-                    file_hash: hash_hex.to_string(),
-                    sender: msg.peer_pubkey_hex.clone(),
-                    filename,
-                });
-            }
-        }
+    if msg.msgtype != openwire_core::ChatMessageType::FileHash as i32 {
+        return None;
     }
-    None
+    let bytes = hex::decode(&msg.content).ok()?;
+    let info = postcard::from_bytes::<openwire_core::message::FileHashInfo>(&bytes).ok()?;
+    Some(FileShareInfo {
+        file_hash: hex::encode(info.file_hash),
+        sender: msg.peer_pubkey_hex.clone(),
+        filename: info.filename,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -232,7 +283,7 @@ impl App {
                     } else {
                         "[对方]"
                     };
-                    let text = format!("{} {}", prefix, msg.content);
+let text = format!("{} {}", prefix, crate::strip_escape(&msg.content));
                     entry.push(text);
                     shares.push(detect_file_share(msg));
                 }
@@ -300,11 +351,10 @@ impl App {
             MessageEvent::ReceiveMessage(msg) => {
                 match msg {
                     IncomingMessage::Text { text, sender } => {
-                        self.push_message_to(&sender, format!("[对方] {}", text));
+                        self.push_message_to(&sender, format!("[对方] {}", strip_escape(&text)));
                     }
                     IncomingMessage::FileShare {
                         filename,
-                        file_id: _,
                         file_hash,
                         total_size: _,
                         sender,
@@ -312,24 +362,17 @@ impl App {
                     } => {
                         self.push_message_to(
                             &sender,
-                            format!(
-                                "{}{} {}{}",
-                                openwire_core::command::FILE_SHARE_CONTENT_PREFIX,
-                                filename,
-                                openwire_core::command::FILE_SHARE_HASH_PREFIX,
-                                &file_hash,
-                            ),
+                            format!("[文件] {} [hash:{}]", strip_escape(&filename), file_hash),
                         );
                         // 更新最后一条消息的 file_shares 条目（由 push_message_to 推入的 None）
-                        if let Some(shares) = self.file_shares_by_contact.get_mut(&sender) {
-                            if let Some(last) = shares.last_mut() {
+                        if let Some(shares) = self.file_shares_by_contact.get_mut(&sender)
+                            && let Some(last) = shares.last_mut() {
                                 *last = Some(FileShareInfo {
                                     file_hash,
                                     sender: sender.clone(),
                                     filename: filename.clone(),
                                 });
                             }
-                        }
                     }
                     IncomingMessage::DeliveryReceipt { peer_id, .. } => {
                         self.push_message_to(&peer_id, "[系统] 消息已送达 ✓".to_string());
@@ -351,7 +394,7 @@ impl App {
             MessageEvent::FileTransferProgress(progress) => {
                 self.push_message(format!(
                     "[文件传输] {} ({}/{}) - {}",
-                    progress.filename,
+                    strip_escape(&progress.filename),
                     progress.received_bytes,
                     progress.total_size,
                     progress.status,
@@ -362,25 +405,28 @@ impl App {
                 }
             }
             MessageEvent::Warning(data) => {
-                self.push_message(format!("[警告] {}", data));
+                self.push_message(format!("[警告] {}", strip_escape(&data)));
             }
             MessageEvent::Log(data) => {
-                self.push_message(format!("[日志] {}", data));
+                self.push_message(format!("[日志] {}", strip_escape(&data)));
             }
             MessageEvent::Error(data) => {
-                self.push_message(format!("[错误] {}", data));
+                self.push_message(format!("[错误] {}", strip_escape(&data)));
             }
             MessageEvent::ContactOnlineStatus {
                 mldsa_pubkey_hex,
                 online,
             } => {
                 let short = if mldsa_pubkey_hex.len() > 16 {
-                    format!("{}...", &mldsa_pubkey_hex[..16])
+                    format!("{}...", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())])
                 } else {
                     mldsa_pubkey_hex.clone()
                 };
                 let status = if online { "在线" } else { "离线" };
                 self.push_message(format!("[在线状态] {} {}", short, status));
+            }
+            MessageEvent::IdentityChanged { .. } => {
+                // CLI 不需要缓存 ML-KEM 公钥，忽略
             }
         }
     }
@@ -392,7 +438,7 @@ impl App {
         prefix: &str,
         msg: &openwire_core::storage::Message,
     ) {
-        let text = format!("{} {}", prefix, msg.content);
+        let text = format!("{} {}", prefix, crate::strip_escape(&msg.content));
         let msgs = self
             .messages_by_contact
             .entry(contact_pubkey.to_string())

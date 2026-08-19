@@ -18,6 +18,7 @@ use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
 use super::P2pActor;
+use crate::command::RelayRole;
 use super::P2pEvent;
 use super::DHT_RELAY_INDEX_KEY;
 
@@ -74,8 +75,8 @@ impl P2pActor {
     /// 向所有 relay 节点发起拨号（NAT 后节点需要中继连接）
     pub(crate) fn dial_relay_nodes(&mut self) {
         // 角色非 client 时不拨号中继
-        if self.relay_role != "client" {
-            tracing::debug!("Relay role is '{}', skipping dial_relay_nodes", self.relay_role);
+        if self.relay_role != RelayRole::Client {
+            tracing::debug!("Relay role is {:?}, skipping dial_relay_nodes", self.relay_role);
             return;
         }
         // 如果 server 意外开着，自动关闭（互斥保证）
@@ -158,7 +159,7 @@ impl P2pActor {
 
         // DHT 查询频率控制：每次 dial_relay_nodes 调用时，
         // 至少间隔 RELAY_DHT_QUERY_INTERVAL_SECS 才发起 get_providers，防止查询风暴。
-        if self.relay_dht_query_cooldown_until.map_or(true, |c| now >= c) {
+        if self.relay_dht_query_cooldown_until.is_none_or(|c| now >= c) {
                 self.relay_dht_query_cooldown_until =
                     Some(now + std::time::Duration::from_secs(RELAY_DHT_QUERY_INTERVAL_SECS));
                 let _ = self
@@ -266,8 +267,8 @@ impl P2pActor {
             if matches!(self.nat_status, libp2p::autonat::NatStatus::Public(_)) {
                 self.relay_server_allowed = true;
                 // 自动迁移旧节点：默认角色 client 升级到 server（用户未显式设置过时）
-                if !self.relay_role_user_configured && self.relay_role == "client" {
-                    self.relay_role = "server".to_string();
+                if !self.relay_role_user_configured && self.relay_role == RelayRole::Client {
+                    self.relay_role = RelayRole::Server;
                     tracing::warn!("公网节点，中继角色已自动升级为 'server'（可在网络监控 UI 中改回 'client'）");
                 }
                 tracing::info!("Auto-authorized relay server: node is on public network");
@@ -282,8 +283,8 @@ impl P2pActor {
             return;
         }
         // 角色非 server 时不启用中继服务（放在自动授权之后，确保迁移在角色检查前完成）
-        if self.relay_role != "server" {
-            tracing::debug!("Relay role is '{}', skipping relay server enable", self.relay_role);
+        if self.relay_role != RelayRole::Server {
+            tracing::debug!("Relay role is {:?}, skipping relay server enable", self.relay_role);
             return;
         }
         // libp2p 0.56 中继服务 behaviour 复用基础 TCP/QUIC 传输，
@@ -328,27 +329,24 @@ impl P2pActor {
         tracing::info!("Relay server disabled (stopped DHT providing + relay behaviour)");
     }
 
-    /// 设置中继角色，强制互斥：server / client / off
-    pub(crate) fn set_relay_role(&mut self, role: &str) {
+    /// 设置中继角色，强制互斥
+    pub(crate) fn set_relay_role(&mut self, role: RelayRole) {
         self.relay_role_user_configured = true;
         match role {
-            "server" => {
+            RelayRole::Server => {
                 self.disable_relay_client();
-                self.relay_role = "server".to_string();
+                self.relay_role = RelayRole::Server;
                 self.try_enable_relay_server();
             }
-            "client" => {
-                self.relay_role = "client".to_string();
+            RelayRole::Client => {
+                self.relay_role = RelayRole::Client;
                 self.disable_relay_server();
                 self.dial_relay_nodes();
             }
-            "off" => {
+            RelayRole::Off => {
                 self.disable_relay_server();
                 self.disable_relay_client();
-                self.relay_role = "off".to_string();
-            }
-            _ => {
-                tracing::warn!("Unknown relay role: {role}");
+                self.relay_role = RelayRole::Off;
             }
         }
     }

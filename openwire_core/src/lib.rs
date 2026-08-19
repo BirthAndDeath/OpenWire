@@ -2,13 +2,7 @@
 //! ✅
 #![warn(missing_docs)]
 
-// ============================================================
-// DHT 存储特性检查：至少启用 mem_dht 或 redb_dht 之一
-// mem_dht 与 redb_dht 可共存（mem_dht 控制 DhtCache 实现，redb_dht 控制 RedbRecordStore）
-// ============================================================
-#[cfg(not(any(feature = "mem_dht", feature = "redb_dht")))]
-compile_error!("必须启用 mem_dht 或 redb_dht 特性之一（请在 Cargo.toml 的 features 中添加 mem_dht 或 redb_dht）");
-// ============================================================
+
 
 /// Actor 模块（P2P 事件循环 Actor 模式）
 pub mod actor;
@@ -34,7 +28,7 @@ mod log;
 /// PeerID 持久化存储
 pub mod peerid_store;
 
-pub use vstd::prelude::*;
+
 /// 消息结构定义
 pub mod message;
 /// P2P 网络模块
@@ -50,7 +44,7 @@ pub mod storage;
 pub mod transfer;
 pub use actor::p2p::{P2pActor, P2pActorBuilder, P2pActorHandle, P2pCommand, P2pEvent};
 pub use actor::RUNTIME;
-pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, NetworkStatusData, PeerInfoDto, TransferProgressStatus};
+pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, NetworkStatusData, PaidNetworkMode, PeerInfoDto, RelayRole, TransferProgressStatus};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{

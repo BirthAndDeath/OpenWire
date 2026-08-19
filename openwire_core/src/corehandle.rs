@@ -87,12 +87,9 @@ impl CoreHandle {
                 return false;
             }
         };
-        let owner_identity_id = match crate::storage::get_current_identity(pool).await {
-            Ok(Some(id)) => id,
-            _ => {
-                tracing::info!("No current identity, cannot delete contact");
-                return false;
-            }
+        let Some(owner_identity_id) = crate::storage::current_identity_id(pool).await else {
+            tracing::info!("No current identity, cannot delete contact");
+            return false;
         };
         match crate::storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex).await {
             Ok(rows) if rows > 0 => {
@@ -160,8 +157,6 @@ impl CoreHandle {
                 return false;
             }
         };
-        let file_id = file_hash;
-
         let metadata = match tokio::fs::metadata(file_path).await {
             Ok(m) => m,
             Err(e) => {
@@ -190,7 +185,7 @@ impl CoreHandle {
                 tracing::warn!("记录已发送文件失败: {e}");
             }
 
-        let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash, file_id);
+        let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash);
         let file_info_bytes = match postcard::to_allocvec(&file_info) {
             Ok(b) => b,
             Err(e) => {

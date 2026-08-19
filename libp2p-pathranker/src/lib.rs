@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol,
@@ -6,7 +7,6 @@ use libp2p::{
     swarm::{FromSwarm, NetworkBehaviour},
 };
 use serde::{Deserialize, Serialize};
-use tracing;
 
 pub mod ranker;
 
@@ -128,6 +128,10 @@ pub struct PathRankerBehaviour {
     pub ranker: BehaviorRanker,
     alert_evaluator: AlertEvaluator,
     last_alert_tick: std::time::Instant,
+    /// 进行中的出站拨号：PeerId → (拨号地址, 开始时间)。
+    /// 用于在成功时测量真实 RTT、在失败时把惩罚归因到真实地址，
+    /// 而非仅用 Multiaddr::empty() 占位（后者使失败永远不会作用于候选地址）。
+    pending_dials: HashMap<PeerId, (Multiaddr, Instant)>,
 }
 
 impl PathRankerBehaviour {
@@ -148,6 +152,7 @@ impl PathRankerBehaviour {
             ranker: BehaviorRanker::new(RankerConfig::default()),
             alert_evaluator: AlertEvaluator::new(),
             last_alert_tick: std::time::Instant::now(),
+            pending_dials: HashMap::new(),
         }
     }
 
@@ -155,8 +160,21 @@ impl PathRankerBehaviour {
         self.local_key.public().to_peer_id()
     }
 
+    /// 记录一次出站拨号尝试（目标地址 + 开始时间）。
+    ///
+    /// 由上层在每次实际发起拨号前调用（含多次地址的逐个尝试）：
+    /// - 连接建立时用其测量真实 RTT 并 feedback 到目标地址；
+    /// - 拨号失败时把失败惩罚归因到真实地址（而非空地址占位）。
+    ///
+    /// 同一 PeerId 的多次尝试会覆盖为最后一次（最后一次尝试决定成败归属）。
+    pub fn note_dial_started(&mut self, peer: &PeerId, addr: &Multiaddr) {
+        self.pending_dials
+            .insert(*peer, (addr.clone(), Instant::now()));
+    }
+
     // ====== 协议方法 ======
 
+    #[allow(dead_code)]
     pub fn send_query(&mut self, peer: &PeerId, target: String) -> OutboundRequestId {
         self.inner.send_request(
             peer,
@@ -195,6 +213,7 @@ impl PathRankerBehaviour {
         }
     }
 
+    #[allow(dead_code)]
     pub fn verify_response(resp: &ScoreResponse) -> bool {
         let pk = match libp2p::identity::PublicKey::try_decode_protobuf(&resp.responder_key) {
             Ok(pk) => pk,
@@ -337,10 +356,16 @@ impl NetworkBehaviour for PathRankerBehaviour {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match &event {
             FromSwarm::ConnectionEstablished(e) => {
+                let remote = e.endpoint.get_remote_address().clone();
+                // 若该 Peer 有记录拨号开始时间，用真实 RTT；否则 latency=0 表示不更新延迟
+                let rtt = self
+                    .pending_dials
+                    .remove(&e.peer_id)
+                    .map(|(_, start)| start.elapsed());
                 self.ranker.feedback(
                     &e.peer_id,
-                    e.endpoint.get_remote_address(),
-                    Duration::from_secs(0),
+                    &remote,
+                    rtt.unwrap_or(Duration::from_secs(0)),
                     true,
                 );
                 self.alert_evaluator.record_connection_event();
@@ -352,12 +377,22 @@ impl NetworkBehaviour for PathRankerBehaviour {
             }
             FromSwarm::DialFailure(e) => {
                 if let Some(peer_id) = e.peer_id {
-                    self.ranker.feedback(
-                        &peer_id,
-                        &Multiaddr::empty(),
-                        Duration::from_secs(2),
-                        false,
-                    );
+                    match self.pending_dials.remove(&peer_id) {
+                        // 归因到真实拨号地址：失败惩罚真正作用于候选地址的评分/信用
+                        Some((addr, start)) => {
+                            self.ranker.feedback(&peer_id, &addr, start.elapsed(), false);
+                        }
+                        // 内部/Kademlia 发起的拨号无地址记录：
+                        // 沿用空地址占位，仅保留 alert 侧的失败率观测
+                        None => {
+                            self.ranker.feedback(
+                                &peer_id,
+                                &Multiaddr::empty(),
+                                Duration::from_secs(2),
+                                false,
+                            );
+                        }
+                    }
                     self.alert_evaluator.record_failure();
                     if self.ranker.consume_mutation_flag() {
                         self.alert_evaluator.record_mutation();

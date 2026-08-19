@@ -11,5 +11,5 @@ pub fn lookup_peerid_by_pubkey(
     cache: &Arc<DhtCache>,
     pubkey_hex: &str,
 ) -> Option<PeerId> {
-    cache.get_peerid_by_pubkey(pubkey_hex).ok().flatten()
+    cache.get_peerid_by_pubkey(pubkey_hex)
 }

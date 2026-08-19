@@ -90,8 +90,6 @@ pub enum TransferStatus {
 /// 文件传输状态管理（接收方侧）
 #[derive(Debug)]
 pub struct FileTransferState {
-    /// 文件唯一标识
-    pub file_id: [u8; 32],
     /// 原始文件名
     pub filename: String,
     /// 文件总大小
@@ -112,12 +110,15 @@ pub struct FileTransferState {
     pub status: TransferStatus,
     /// 开始时间
     pub started_at: std::time::Instant,
+    /// 方向：true=本端发起的下载请求（占用 outbound_file_count），
+    /// false=对端主动推送的分片接收（占用 inbound_file_count）
+    pub is_outbound: bool,
 }
 
 impl FileTransferState {
     /// 计算已接收字节数（最后一个分片可能小于 chunk_size）
     pub fn received_bytes(&self) -> u64 {
-        if self.total_chunks == 0 {
+        if self.total_chunks == 0 || self.chunk_size == 0 {
             return 0;
         }
         let last_chunk_size = if self.total_size.is_multiple_of(self.chunk_size as u64) {

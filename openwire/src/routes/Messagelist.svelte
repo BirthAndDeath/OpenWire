@@ -1,9 +1,11 @@
 <script lang="ts">
-    import { VList } from "virtua/svelte";
+    import { VList, type VListHandle } from "virtua/svelte";
     import { tick } from "svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { save } from "@tauri-apps/plugin-dialog";
     import { fontSizeScale } from "../lib/settings";
+    import { formatFileSize } from "../lib/format";
+    import type { FileHashInfo } from "../lib/types";
 
     let fontSize = $derived($fontSizeScale * 13 + "px");
 
@@ -15,12 +17,7 @@
         // 消息类型: text | file_hash | file_stream
         type: "text" | "file_hash" | "file_stream";
         // FileHash 相关
-        file_hash_info?: {
-            filename: string;
-            total_size: number;
-            file_hash: string; // hex
-            file_id: string; // hex
-        };
+        file_hash_info?: FileHashInfo;
         // 发送方 ML-DSA 公钥 hex（用于点击 FileHash 时发起下载请求）
         sender_mldsa_pubkey_hex?: string;
         // 消息所属联系人的 ML-DSA 公钥 hex
@@ -48,7 +45,7 @@
     } = $props();
 
     let msgs = $state<Msg[]>([]);
-    let vlist: any;
+    let vlist: VListHandle | undefined = $state();
     // 文件传输进度映射：file_id_hex -> progress
     let fileProgress = $state<Record<string, FileTransferProgress>>({});
     // 已加载的消息 ID 集合，用于去重
@@ -56,6 +53,7 @@
 
     // ========== 双向懒加载状态 ==========
     let loading = $state(false);
+    let loadError = $state<string | null>(null);
     let hasMoreOlder = $state(true); // 是否还有更早的历史消息可加载
     const PAGE_SIZE = 50;
     const LOAD_THRESHOLD = 200; // 滚动到距顶部多少 px 时触发加载
@@ -71,12 +69,33 @@
             loadedMsgIds = new Set();
             hasMoreOlder = true;
             oldestCursor = null;
+            loading = false;
+            loadError = null;
             return;
         }
         loadLatest(cid);
     });
 
     // ---------- 消息加载 ----------
+
+    // invoke 超时保护：移动端 IPC 异常时防止 loading 永久卡住
+    function invokeWithTimeout<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(
+                () => reject(new Error(`${cmd} 调用超时`)),
+                15000,
+            );
+            invoke<T>(cmd, args)
+                .then((v) => {
+                    clearTimeout(timer);
+                    resolve(v);
+                })
+                .catch((e) => {
+                    clearTimeout(timer);
+                    reject(e);
+                });
+        });
+    }
 
     // 将后端消息行转换为前端 Msg 格式
     function parseBackend(m: {
@@ -108,7 +127,6 @@
                         filename,
                         total_size: 0,
                         file_hash: fileHash,
-                        file_id: fileHash,
                     };
                 }
             }
@@ -132,7 +150,6 @@
                         filename: parsed.filename,
                         total_size: typeof parsed.total_size === "number" ? parsed.total_size : 0,
                         file_hash: parsed.file_hash,
-                        file_id: typeof parsed.file_id === "string" ? parsed.file_id : parsed.file_hash,
                     };
                 }
             } catch {
@@ -175,7 +192,7 @@
                 is_outgoing: boolean;
                 ts: number;
                 pending: number;
-            }[] = await invoke("load_messages", {
+            }[] = await invokeWithTimeout("load_messages", {
                 mldsaPubkeyHex: peerId,
                 limit: PAGE_SIZE,
             });
@@ -200,7 +217,10 @@
             // 滚动到底部
             await tick();
             vlist?.scrollToIndex(msgs.length - 1, { smooth: false });
+            loadError = null;
         } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            loadError = `历史消息加载失败: ${msg}`;
             console.error("加载消息失败:", e);
         } finally {
             loading = false;
@@ -219,7 +239,7 @@
             return;
         loading = true;
         // 记录当前滚动偏移，用于 prepend 后恢复
-        const scrollPos = vlist?.scrollTop ?? 0;
+        const scrollPos = vlist?.getScrollOffset() ?? 0;
         try {
             const raw: {
                 id: number;
@@ -228,7 +248,7 @@
                 is_outgoing: boolean;
                 ts: number;
                 pending: number;
-            }[] = await invoke("load_messages", {
+            }[] = await invokeWithTimeout("load_messages", {
                 mldsaPubkeyHex: contactId,
                 before: oldestCursor.ts,
                 beforeId: oldestCursor.id,
@@ -380,14 +400,6 @@
                 fileProgress = newProgress;
             }, 3000);
         }
-    }
-
-    // 格式化文件大小
-    function formatFileSize(bytes: number): string {
-        if (bytes === 0) return "0 B";
-        const units = ["B", "KB", "MB", "GB"];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
     }
 
     // 计算进度百分比
@@ -560,6 +572,9 @@
 
 {#if loading}
     <div class="loading-hint">加载中...</div>
+{/if}
+{#if loadError}
+    <div class="load-error-hint">{loadError}</div>
 {/if}
 
 <style>
@@ -785,6 +800,18 @@
         padding: 4px;
         position: absolute;
         top: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        pointer-events: none;
+    }
+
+    .load-error-hint {
+        text-align: center;
+        font-size: 12px;
+        color: #e74c3c;
+        padding: 4px;
+        position: absolute;
+        top: 24px;
         left: 50%;
         transform: translateX(-50%);
         pointer-events: none;

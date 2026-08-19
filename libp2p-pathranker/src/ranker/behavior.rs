@@ -187,13 +187,11 @@ impl PathType {
         let mut has_quic = false;
         let mut has_circuit = false;
         let mut has_webrtc = false;
-        let mut has_ws = false;
         for p in addr.iter() {
             match p {
                 Protocol::P2pCircuit => has_circuit = true,
                 Protocol::Quic | Protocol::QuicV1 => has_quic = true,
                 Protocol::WebRTC | Protocol::WebRTCDirect => has_webrtc = true,
-                Protocol::Ws(_) | Protocol::Wss(_) => has_ws = true,
                 _ => {}
             }
         }
@@ -203,8 +201,6 @@ impl PathType {
             PathType::Direct
         } else if has_quic {
             PathType::Quic
-        } else if has_ws {
-            PathType::Direct
         } else {
             PathType::Direct
         }
@@ -301,7 +297,8 @@ impl BehaviorRanker {
     }
 
     /// 获取某 peer 的地址评分表。如果该 peer 不存在则创建空表。
-    /// 当全局 peer 数达到 `max_peers` 时，LRU 淘汰最近更新最早的 peer。
+    /// 当全局 peer 数达到 `max_peers` 时，淘汰平均评分最低的 peer（保留高分可靠节点），
+    /// 淘汰键为注意评分而非 LRU（不维护 peer 级最近使用时间）。
     pub fn get_or_insert(&mut self, peer: &PeerId) -> &mut HashMap<Multiaddr, ScoreEntry> {
         if self.scores.len() >= self.config.max_peers && !self.scores.contains_key(peer) {
             let evict = self
@@ -768,5 +765,32 @@ mod tests {
             config.exploration_budget_at(AlertLevel::Defensive)
                 < config.exploration_budget_at(AlertLevel::Normal)
         );
+    }
+
+    #[test]
+    fn test_feedback_real_latency_updates_ewma() {
+        let mut ranker = BehaviorRanker::with_default();
+        let peer = PeerId::random();
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/8080".parse().unwrap();
+        ranker.feedback(&peer, &addr, Duration::from_millis(100), true);
+        let entry = ranker.get_entry(&peer, &addr).unwrap();
+        assert!(entry.latency_ewma < 500.0, "latency EWMA should move from initial 500ms");
+    }
+
+    #[test]
+    fn test_failure_punishes_the_real_addr() {
+        let mut ranker = BehaviorRanker::with_default();
+        let peer = PeerId::random();
+        let a: Multiaddr = "/ip4/10.0.0.1/tcp/8080".parse().unwrap();
+        let b: Multiaddr = "/ip4/10.0.0.2/tcp/8080".parse().unwrap();
+        // 地址 a 成功建立过一次，地址 b 一直失败
+        ranker.feedback(&peer, &a, Duration::from_millis(50), true);
+        for _ in 0..4 {
+            ranker.feedback(&peer, &b, Duration::from_millis(800), false);
+        }
+        let ranked = ranker.rank(&peer, vec![a.clone(), b.clone()]);
+        assert_eq!(ranked[0], a, "healthy addr should outrank the failing one");
+        let credit_b = ranker.get_entry(&peer, &b).unwrap().credit;
+        assert!(credit_b < 50.0, "failing addr credit should drop: {credit_b}");
     }
 }

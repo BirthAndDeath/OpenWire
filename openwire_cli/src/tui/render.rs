@@ -25,7 +25,7 @@ fn getcontacts(app: &App, contacts_list: &mut Vec<ListItem>) {
         .map(|c| {
             let name = c.name.as_deref().unwrap_or("(未命名)");
             let short_pk = if c.mldsa_pubkey_hex.len() > 16 {
-                format!("{}...", &c.mldsa_pubkey_hex[..16])
+                format!("{}...", &c.mldsa_pubkey_hex[..16.min(c.mldsa_pubkey_hex.len())])
             } else {
                 c.mldsa_pubkey_hex.clone()
             };
@@ -47,7 +47,7 @@ fn get_identity_items(app: &App) -> Vec<ListItem<'static>> {
         .iter()
         .map(|id| {
             let short_id = if id.identity_id.len() > 16 {
-                format!("{}...", &id.identity_id[..16])
+                format!("{}...", &id.identity_id[..16.min(id.identity_id.len())])
             } else {
                 id.identity_id.clone()
             };
@@ -261,7 +261,7 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
     // 渲染状态栏
     let current_identity_short = app.current_identity().map(|current| {
         if current.identity_id.len() > 16 {
-            format!("{}...", &current.identity_id[..16])
+            format!("{}...", &current.identity_id[..16.min(current.identity_id.len())])
         } else {
             current.identity_id.clone()
         }
@@ -333,12 +333,12 @@ pub fn tui_render(frame: &mut Frame, app: &mut App) {
                 " 下载文件 ",
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::raw(format!(" 文件: {}", info.filename))),
+            Line::from(Span::raw(format!(" 文件: {}", crate::strip_escape(&info.filename)))),
             Line::from(Span::raw(format!(" 保存路径: {}", app.input))),
             Line::from(Span::raw(format!(
                 " 默认: {}/downloads/{} (留空按 Enter)",
                 app.data_dir.display(),
-                info.filename
+                crate::strip_escape(&info.filename)
             ))),
             Line::from(Span::raw("")),
             Line::from(Span::styled(

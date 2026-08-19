@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { _ } from "svelte-i18n";
   import { VList } from "virtua/svelte";
+  import { formatFileSize } from "../lib/format";
 
   let { show = $bindable(false) }: { show?: boolean } = $props();
 
@@ -33,13 +34,6 @@
     } catch (e) {
       console.error("撤销失败:", e);
     }
-  };
-
-  const fmtSize = (bytes: number) => {
-    if (bytes === 0) return "0 B";
-    const u = ["B", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return (bytes / Math.pow(1024, i)).toFixed(1) + " " + u[i];
   };
 
   const fmtDate = (ts: number) => {
@@ -75,7 +69,7 @@
             {#snippet children(f: SentFile)}
               <div class="row">
                 <span class="col-name" title={f.filename}>{f.filename}</span>
-                <span class="col-size">{fmtSize(f.total_size)}</span>
+                <span class="col-size">{formatFileSize(f.total_size)}</span>
                 <span class="col-date">{fmtDate(f.sent_at)}</span>
                 <span class="col-action">
                   <button class="revoke" onclick={() => revoke(f)} aria-label={$_("revoke")}>

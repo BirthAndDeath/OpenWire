@@ -42,15 +42,24 @@ pub async fn get_current_identity(pool: &Pool<Sqlite>) -> StorageResult<Option<S
     Ok(row)
 }
 
+/// 获取当前身份 ID（查询失败时返回 None）
+///
+/// 用于「无身份则跳过」的场景（如收消息、在线状态），无需区分数据库错误。
+pub async fn current_identity_id(pool: &Pool<Sqlite>) -> Option<String> {
+    get_current_identity(pool).await.ok().flatten()
+}
+
 /// 设置当前身份
 pub async fn set_current_identity(pool: &Pool<Sqlite>, identity_id: &str) -> StorageResult<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE identities SET is_current = 0")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE identities SET is_current = 1 WHERE identity_id = ?")
         .bind(identity_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -72,18 +81,21 @@ pub async fn delete_identity(
 ) -> StorageResult<u64> {
     let data_dir_str = data_dir.to_string_lossy();
 
-    // 1. 删除加密的私钥文件
-    rootcell::identity::PrivateKeyHandle::delete_encrypted_private_key(
-        &data_dir_str,
-        &format!("{}_mldsa", identity_id),
-    );
-
-    // 2. 删除数据库记录
+    // 1. 先删除数据库记录：若身份不存在（0 rows），不删除密钥文件，
+    //    避免误删其他身份对应的密钥
     let rows = sqlx::query("DELETE FROM identities WHERE identity_id = ?")
         .bind(identity_id)
         .execute(pool)
         .await?
         .rows_affected();
+
+    // 2. 仅当 DB 记录存在时删除加密的私钥文件
+    if rows > 0 {
+        rootcell::identity::PrivateKeyHandle::delete_encrypted_private_key(
+            &data_dir_str,
+            &format!("{}_mldsa", identity_id),
+        );
+    }
 
     tracing::info!(
         "Deleted identity {}: removed encrypted key files, DHT records, and DB ({} rows affected)",

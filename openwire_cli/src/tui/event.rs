@@ -40,57 +40,9 @@ async fn handle_sidebar_area_focus(app: &mut App, key_code: KeyCode) {
             if let Some(i) = app.contact_list_state.selected()
                 && let Some(contact) = app.contacts.get(i)
             {
-                // 切换到输入框前，确保该联系人的最新消息已加载到内存
-                if !app
-                    .messages_by_contact
-                    .contains_key(&contact.mldsa_pubkey_hex)
-                {
-                    if let Some(pool) = openwire_core::storage::pool() {
-                        let owner = openwire_core::storage::get_current_identity(pool)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        if let Ok(msgs) = openwire_core::storage::get_messages(
-                            pool,
-                            &owner,
-                            &contact.mldsa_pubkey_hex,
-                            None,
-                            50,
-                        )
-                        .await
-                        {
-                            let entry = app
-                                .messages_by_contact
-                                .entry(contact.mldsa_pubkey_hex.clone())
-                                .or_default();
-                            let shares = app
-                                .file_shares_by_contact
-                                .entry(contact.mldsa_pubkey_hex.clone())
-                                .or_default();
-                            let name = contact.name.as_deref().unwrap_or("(未命名)");
-                            entry.push(format!("--- 与 {} 的聊天记录 ---", name));
-                            shares.push(None);
-                            for msg in msgs.iter().rev() {
-                                let prefix = if msg.is_outgoing == 1 {
-                                    "[我]"
-                                } else {
-                                    "[对方]"
-                                };
-                                let text = format!("{} {}", prefix, msg.content);
-                                entry.push(text);
-                                shares.push(crate::detect_file_share(&msg));
-                            }
-                        }
-                    }
-                }
-                // 每次切换联系人都滚动到最新消息
-                if let Some(msgs) = app.messages_by_contact.get(&contact.mldsa_pubkey_hex) {
-                    let msg_count = msgs.len();
-                    if msg_count > 0 {
-                        app.message_list_state.select(Some(msg_count - 1));
-                    }
-                }
+                let pubkey = contact.mldsa_pubkey_hex.clone();
+                app.load_messages_for_contact(&pubkey).await;
+                app.scroll_to_bottom();
                 app.current_focus = Focus::Input;
             }
         }
@@ -172,9 +124,9 @@ async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
                     .selected()
                     .and_then(|ci| app.contacts.get(ci))
                     .map(|c| c.mldsa_pubkey_hex.clone());
-                if let Some(pk) = contact_pk {
-                    if let Some(shares) = app.file_shares_by_contact.get(&pk) {
-                        if let Some(Some(info)) = shares.get(i) {
+                if let Some(pk) = contact_pk
+                    && let Some(shares) = app.file_shares_by_contact.get(&pk)
+                        && let Some(Some(info)) = shares.get(i) {
                             app.download_dialog = Some(info.clone());
                             // 预填默认下载路径，用户可编辑修改
                             let default_dir = app.data_dir.join("downloads");
@@ -182,13 +134,8 @@ async fn handle_messages_focus(app: &mut App, key_code: KeyCode) {
                                 .join(&info.filename)
                                 .to_string_lossy()
                                 .to_string();
-                            app.push_message(format!(
-                                "按 Enter 下载到默认目录，或编辑路径后按 Enter"
-                            ));
-                            return;
+                            app.push_message("按 Enter 下载到默认目录，或编辑路径后按 Enter".to_string());
                         }
-                    }
-                }
             }
         }
         _ => {}
@@ -202,18 +149,19 @@ async fn handle_download_dialog(app: &mut App, key: KeyEvent) {
             let info = app.download_dialog.take().unwrap();
             let save_path = app.input.trim().to_string();
             app.input.clear();
-            let file_hash_bytes = match hex::decode(&info.file_hash) {
-                Ok(b) if b.len() == 32 => b,
+            let file_hash: [u8; 32] = match hex::decode(&info.file_hash) {
+                Ok(b) => match b.try_into() {
+                    Ok(h) => h,
+                    Err(_) => {
+                        app.push_message("错误：文件哈希无效".to_string());
+                        return;
+                    }
+                },
                 _ => {
                     app.push_message("错误：文件哈希无效".to_string());
                     return;
                 }
             };
-            let mut file_hash = [0u8; 32];
-            file_hash_bytes
-                .iter()
-                .enumerate()
-                .for_each(|(i, &b)| file_hash[i] = b);
             app.push_message(format!("正在下载到: {}", save_path));
             let ok = app
                 .core_handle
@@ -228,10 +176,7 @@ async fn handle_download_dialog(app: &mut App, key: KeyEvent) {
             } else {
                 app.push_message("❌ 下载请求失败".to_string());
             }
-            let msg_count = app.current_messages().len();
-            if msg_count > 0 {
-                app.message_list_state.select(Some(msg_count - 1));
-            }
+            app.scroll_to_bottom();
         }
         // Esc 取消下载（主循环已确保 Esc 不会误退出程序）
         KeyCode::Esc => {
@@ -290,10 +235,7 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
                     app.input.clear();
                     app.add_contact_mode = false;
                     app.status_message.clear();
-                    let msg_count = app.current_messages().len();
-                    if msg_count > 0 {
-                        app.message_list_state.select(Some(msg_count - 1));
-                    }
+                    app.scroll_to_bottom();
                 }
                 return;
             }
@@ -325,10 +267,7 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
                 app.file_send_mode = false;
                 app.status_message.clear();
                 app.input.clear();
-                let msg_count = app.current_messages().len();
-                if msg_count > 0 {
-                    app.message_list_state.select(Some(msg_count - 1));
-                }
+                app.scroll_to_bottom();
                 return;
             }
 
@@ -351,10 +290,7 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
             }
 
             app.input.clear();
-            let msg_count = app.current_messages().len();
-            if msg_count > 0 {
-                app.message_list_state.select(Some(msg_count - 1));
-            }
+            app.scroll_to_bottom();
         }
         // Ctrl+F: 发送文件（打开文件选择对话框）
         KeyCode::Char('f') if is_ctrl => {
@@ -369,17 +305,11 @@ async fn handle_input_focus(app: &mut App, key_event: KeyEvent) {
             } else {
                 app.push_message("错误: 未选择联系人".to_string());
             }
-            let msg_count = app.current_messages().len();
-            if msg_count > 0 {
-                app.message_list_state.select(Some(msg_count - 1));
-            }
+            app.scroll_to_bottom();
         }
         // Esc: 取消添加联系人/文件发送模式，或退出输入框
         KeyCode::Esc => {
-            if app.download_dialog.is_some() {
-                app.download_dialog = None;
-                app.input.clear();
-            } else if app.add_contact_mode {
+            if app.add_contact_mode {
                 app.add_contact_mode = false;
                 app.status_message = "已取消添加联系人".to_string();
             } else if app.file_send_mode {
@@ -405,13 +335,11 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
         KeyCode::Up if list_len > 0 => {
             let i = app.identity_list_state.selected().unwrap_or(0);
             app.identity_list_state.select(Some(i.saturating_sub(1)));
-            app.status_message.clear();
         }
         KeyCode::Down if list_len > 0 => {
             let i = app.identity_list_state.selected().unwrap_or(0);
             app.identity_list_state
                 .select(Some((i + 1).min(list_len - 1)));
-            app.status_message.clear();
         }
         // Enter 切换身份
         KeyCode::Enter => {
@@ -433,46 +361,8 @@ async fn handle_identity_area_focus(app: &mut App, key_code: KeyCode) {
                         app.refresh_identities().await;
                         app.messages_by_contact.clear();
                         app.file_shares_by_contact.clear();
-                        // 重新加载历史消息
-                        if let Some(pool) = openwire_core::storage::pool() {
-                            let owner = openwire_core::storage::get_current_identity(pool)
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            for contact in &app.contacts.clone() {
-                                if let Ok(msgs) = openwire_core::storage::get_messages(
-                                    pool,
-                                    &owner,
-                                    &contact.mldsa_pubkey_hex,
-                                    None,
-                                    50,
-                                )
-                                .await
-                                {
-                                    let entry = app
-                                        .messages_by_contact
-                                        .entry(contact.mldsa_pubkey_hex.clone())
-                                        .or_default();
-                                    let shares = app
-                                        .file_shares_by_contact
-                                        .entry(contact.mldsa_pubkey_hex.clone())
-                                        .or_default();
-                                    let name = contact.name.as_deref().unwrap_or("(未命名)");
-                                    entry.push(format!("--- 与 {} 的聊天记录 ---", name));
-                                    shares.push(None);
-                                    for msg in msgs.iter().rev() {
-                                        let prefix = if msg.is_outgoing == 1 {
-                                            "[我]"
-                                        } else {
-                                            "[对方]"
-                                        };
-                                        let text = format!("{} {}", prefix, msg.content);
-                                        entry.push(text);
-                                        shares.push(crate::detect_file_share(&msg));
-                                    }
-                                }
-                            }
+                        for contact in app.contacts.clone() {
+                            app.load_messages_for_contact(&contact.mldsa_pubkey_hex).await;
                         }
                     } else {
                         app.status_message = "错误: 切换身份失败".to_string();

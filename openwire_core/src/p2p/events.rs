@@ -30,6 +30,7 @@ pub async fn handle_incoming_request(
         Some(pool) => pool,
         None => {
             tracing::warn!("数据库连接不可用，无法处理消息");
+            send_response(core, channel, None).await;
             return;
         }
     };
@@ -38,13 +39,10 @@ pub async fn handle_incoming_request(
     let sender_mldsa_pubkey_hex = hex::encode(&request.sender_public_key);
 
     // 获取当前身份的 identity_id
-    let owner_identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
-        Some(id) => id,
-        None => {
-            tracing::warn!("未找到当前身份，无法处理入站消息");
-            send_response(core, channel, None).await;
-            return;
-        }
+    let Some(owner_identity_id) = storage::current_identity_id(pool).await else {
+        tracing::warn!("未找到当前身份，无法处理入站消息");
+        send_response(core, channel, None).await;
+        return;
     };
 
     // 先验证消息签名（轻量操作，无需数据库），防止非联系人消耗数据库资源
@@ -68,8 +66,8 @@ pub async fn handle_incoming_request(
     // 签名验证已确认发送者持有该公钥对应私钥，因此绑定漂移只可能是同一身份
     // 经多个 PeerID 使用（多设备 / 轮换重叠），故仅告警，不阻断消息处理。
     let store = core.get_dht_store();
-    if let Ok(Some(existing_peer)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
-        if existing_peer != peer && core.connected_peers.contains_key(&existing_peer) {
+    if let Some(existing_peer) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex)
+        && existing_peer != peer && core.connected_peers.contains_key(&existing_peer) {
             tracing::warn!(
                 "身份绑定漂移: sender={}.. 声称 peer={}, 但缓存中为 {}（仍在线），更新绑定",
                 &sender_mldsa_pubkey_hex[..16],
@@ -77,10 +75,9 @@ pub async fn handle_incoming_request(
                 existing_peer
             );
         }
-    }
 
     // 缓存发送方 (ML-DSA 公钥 → PeerID) 映射，用于后续回复消息时直接查找
-    let _ = store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
+    store.set_pubkey_peerid(&sender_mldsa_pubkey_hex, &peer);
     // 同步更新内存缓存，如果该 PeerID 已连接则触发在线状态刷新
     core.update_peerid_pubkey_mapping(peer, sender_mldsa_pubkey_hex.clone())
         .await;
@@ -106,9 +103,9 @@ pub async fn handle_incoming_request(
 
         // 通过 peerid_to_mlkem 查找发送方的 ML-KEM 公钥，并发回加密的回执
         let store = core.get_dht_store();
-        if let Ok(Some(sender_peer_id)) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
+        if let Some(sender_peer_id) = store.get_peerid_by_pubkey(&sender_mldsa_pubkey_hex) {
             // 获取发送方的 ML-KEM 公钥（从 FriendOnline 缓存获取，无需 DHT）
-            let sender_mlkem_pubkey = match core.peerid_to_mlkem.get(&sender_peer_id) {
+            let sender_mlkem_pubkey = match core.peer_cache.peerid_to_mlkem.get(&sender_peer_id) {
                 Some(hex_str) if !hex_str.is_empty() => match hex::decode(hex_str) {
                     Ok(key) => key,
                     Err(e) => {
@@ -212,19 +209,15 @@ async fn handle_decrypted_message(
     request: &ChatMessage,
     sender_mldsa_pubkey_hex: &str,
 ) -> bool {
-    // 获取当前身份的 identity_id（保留用于后续可能的用途）
-    let _identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
-        Some(id) => id,
-        None => {
-            tracing::warn!("未找到当前身份");
-            return false;
-        }
-    };
+    // 确认当前身份存在（解密需要当前身份的 ML-KEM 私钥）
+    if storage::current_identity_id(pool).await.is_none() {
+        tracing::warn!("未找到当前身份");
+        return false;
+    }
 
     // 使用 ChatCore 中缓存的 DecapsulationKey 对象解密消息
-    // 注意：不能通过序列化/反序列化私钥字节来重建 DecapsulationKey，
-    // 因为 aws-lc-rs 的 key_bytes() 输出格式与 DecapsulationKey::new() 输入格式不兼容。
-    // 解决方案是在 ChatCore 中缓存 DecapsulationKey 对象，直接传入引用。
+    // key_bytes() → new() 的 round-trip 在 aws-lc-rs 1.18+ 已验证可用；
+    // 缓存对象仅为性能优化，避免每次解密时重建。
     let decap_key = match &core.mlkem_decap_key {
         Some(key) => key,
         None => {
@@ -281,6 +274,9 @@ async fn handle_decrypted_message(
             // OnlineStatus 消息通过 gossipsub 协议传输，不会通过 request-response 到达这里
             tracing::debug!("OnlineStatus 消息通过 request-response 到达，忽略");
         }
+        ChatMessageType::Unknown => {
+            tracing::warn!("收到未知类型消息，忽略");
+        }
     }
 
     true
@@ -301,12 +297,9 @@ async fn handle_text_message(
             let message_hash = hex::encode(request_hash);
 
             // 获取当前身份的 identity_id
-            let owner_identity_id = match storage::get_current_identity(pool).await.ok().flatten() {
-                Some(id) => id,
-                None => {
-                    tracing::warn!("未找到当前身份，无法保存接收的消息");
-                    return;
-                }
+            let Some(owner_identity_id) = storage::current_identity_id(pool).await else {
+                tracing::warn!("未找到当前身份，无法保存接收的消息");
+                return;
             };
 
             match storage::add_message_with_hash(
@@ -357,8 +350,7 @@ async fn handle_file_hash_message(
     match postcard::from_bytes::<crate::message::FileHashInfo>(&data) {
         Ok(file_info) => {
             tracing::info!(
-                "收到文件哈希分享: file_id={:?}, filename={}, size={}, hash={:?}",
-                file_info.file_id,
+                "收到文件哈希分享: filename={}, size={}, hash={:?}",
                 file_info.filename,
                 file_info.total_size,
                 file_info.file_hash,
@@ -367,25 +359,16 @@ async fn handle_file_hash_message(
             let file_hash_hex = hex::encode(file_info.file_hash);
 
             // 存入数据库，使重启后仍在历史中可见
-            let owner_identity_id =
-                match storage::get_current_identity(pool).await.ok().flatten() {
-                    Some(id) => id,
-                    None => {
-                        tracing::warn!("未找到当前身份，无法保存收到的文件消息");
-                        return;
-                    }
-                };
-            let display_content = format!("{}{} {}{}",
-                crate::command::FILE_SHARE_CONTENT_PREFIX,
-                file_info.filename,
-                crate::command::FILE_SHARE_HASH_PREFIX,
-                file_hash_hex,
-            );
+            let Some(owner_identity_id) = storage::current_identity_id(pool).await else {
+                tracing::warn!("未找到当前身份，无法保存收到的文件消息");
+                return;
+            };
+            let content_hex = hex::encode(&data);
             let _ = storage::add_message_with_hash(
                 pool,
                 &owner_identity_id,
                 sender_mldsa_pubkey_hex,
-                &display_content,
+                &content_hex,
                 false,
                 false,
                 "", // 文件消息不需要去重哈希
@@ -393,10 +376,8 @@ async fn handle_file_hash_message(
             )
             .await;
 
-            let file_id_hex = hex::encode(file_info.file_id);
             core.send_message_mpsc(crate::command::IncomingMessage::FileShare {
                 filename: file_info.filename,
-                file_id: file_id_hex,
                 file_hash: file_hash_hex,
                 total_size: file_info.total_size,
                 sender: sender_mldsa_pubkey_hex.to_string(),
@@ -411,21 +392,20 @@ async fn handle_file_hash_message(
 
 /// 处理文件流消息：解析 FileStreamChunk → 写入文件
 ///
-/// 注意：data 是序列化后的 FileStreamChunk（未压缩），
-/// 内部 chunk_data 字段已在 from_file() 中压缩，
-/// 解压缩由 FileStreamChunk::decompress_to_file() 处理
+/// 注意：data 是序列化后的 FileStreamChunk，chunk_data 已在 from_file() 中压缩，
+/// 解压缩与哈希校验在 handle_file_stream_chunk 中完成
 async fn handle_file_stream_message(core: &mut ChatCore, data: Vec<u8>) {
     match postcard::from_bytes::<crate::message::FileStreamChunk>(&data) {
         Ok(chunk) => {
             tracing::info!(
                 "收到文件分片: file_id={:?}, chunk={}/{}, filename={}",
-                chunk.file_id,
+                chunk.file_hash,
                 chunk.chunk_index,
                 chunk.total_chunks,
                 chunk.filename,
             );
             // 写入文件
-            if let Err(e) = core.handle_file_stream_chunk(chunk).await {
+            if let Err(e) = core.file_transfer.handle_file_stream_chunk(chunk).await {
                 tracing::warn!("写入文件分片失败: {}", e);
             }
         }
@@ -539,6 +519,7 @@ async fn handle_file_download_request(
             sender_mldsa_pubkey_hex,
             ChatMessageType::FileDownloadResponse,
             response_data,
+            false,
         )
         .await
     {
@@ -548,8 +529,8 @@ async fn handle_file_download_request(
 
     // === 直连协商 ===
     let store = core.get_dht_store();
-    if let Ok(Some(recipient_peer_id)) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex)
-        && let Ok(addrs) = store.get_multiaddrs(&recipient_peer_id)
+    if let Some(recipient_peer_id) = store.get_peerid_by_pubkey(sender_mldsa_pubkey_hex)
+        && let addrs = store.get_multiaddrs(&recipient_peer_id)
         && !addrs.is_empty()
     {
         tracing::info!(
@@ -588,14 +569,13 @@ async fn handle_file_download_request(
     for chunk_index in 0..total_chunks {
         let offset = chunk_index as u64 * chunk_size as u64;
         let config = crate::message::ChunkReadConfig {
-            file_id: file_hash,
+            file_hash,
             filename: filename.clone(),
             total_size: file_size,
             total_chunks,
             chunk_size,
             chunk_index,
             offset,
-            file_hash,
         };
 
         let (chunk, _bytes_read) =
@@ -627,6 +607,7 @@ async fn handle_file_download_request(
                     sender_mldsa_pubkey_hex,
                     ChatMessageType::FileStream,
                     chunk_data.clone(),
+                    false,
                 )
                 .await
             {
@@ -658,7 +639,7 @@ async fn handle_file_download_request(
             break;
         }
         // 每发送 10 个分片主动让出控制权，让事件循环处理其他消息
-        if sent_count % 10 == 0 {
+        if sent_count.is_multiple_of(10) {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -694,6 +675,7 @@ async fn send_reject_response(
                 sender_mldsa_pubkey_hex,
                 ChatMessageType::FileDownloadResponse,
                 data,
+                false,
             )
             .await;
     }
@@ -709,11 +691,6 @@ async fn handle_file_download_response(core: &mut ChatCore, data: Vec<u8>) {
         }
     };
 
-    fallback_handle_download_response(core, response).await;
-}
-
-/// 直接处理下载响应（无 actor 时的回退路径）
-async fn fallback_handle_download_response(core: &mut ChatCore, response: crate::message::DownloadResponse) {
     if !response.accepted {
         let file_hash_hex = hex::encode(response.file_hash);
         let reason = response.error_reason.unwrap_or_else(|| "未知原因".to_string());
@@ -721,6 +698,8 @@ async fn fallback_handle_download_response(core: &mut ChatCore, response: crate:
             "发送方拒绝了下载请求: file_hash={}.., reason={reason}",
             &file_hash_hex[..16]
         );
+        // 释放状态与并发传输槽位，避免恶意对端长期占用 MAX_CONCURRENT_TRANSFERS
+        core.file_transfer.cancel_download(&file_hash_hex);
         core.send_warning_mpsc(format!("下载被拒绝: {reason}")).await;
         return;
     }
@@ -733,7 +712,7 @@ async fn fallback_handle_download_response(core: &mut ChatCore, response: crate:
         response.total_chunks.unwrap_or(0),
     );
 
-    let _ = core.handle_file_download_response(response).await;
+    core.file_transfer.handle_download_response(response).await;
 }
 
 /// 发送签名响应确认
@@ -785,53 +764,33 @@ async fn handle_delivery_receipt(
         Ok(receipt_msg_hash) => {
             tracing::info!("收到送达回执，消息哈希: {}", &receipt_msg_hash[..16.min(receipt_msg_hash.len())]);
 
-            // 先查找 pending 消息（首次发送尚未标记已发送的情况）
-            match storage::list_pending(pool).await {
-                Ok(pending_msgs) => {
-                    for msg in &pending_msgs {
-                        if let Some(ref hash) = msg.message_hash
-                            && crypto::constant_time_compare(hash.as_bytes(), receipt_msg_hash.as_bytes())
-                        {
-                            if let Err(e) = storage::mark_sent(pool, msg.id).await {
-                                tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
-                            } else {
-                                tracing::info!("消息 {} 已通过送达回执标记为已发送", msg.id);
-                            }
-                            core.send_message_mpsc(
-                                crate::command::IncomingMessage::DeliveryReceipt {
-                                    message_hash: receipt_msg_hash.clone(),
-                                    peer_id: msg.peer_pubkey_hex.clone(),
-                                },
-                            )
-                            .await;
-                            return;
+            // 直接按哈希查询（索引命中），避免遍历全部 pending 消息
+            match storage::get_message_by_hash(pool, &receipt_msg_hash).await {
+                Ok(Some(msg)) => {
+                    if msg.pending != 0 {
+                        if let Err(e) = storage::mark_sent(pool, msg.id).await {
+                            tracing::warn!("标记消息 {} 为已发送失败: {}", msg.id, e);
+                        } else {
+                            tracing::info!("消息 {} 已通过送达回执标记为已发送", msg.id);
                         }
                     }
+                    core.send_message_mpsc(crate::command::IncomingMessage::DeliveryReceipt {
+                        message_hash: receipt_msg_hash.clone(),
+                        peer_id: msg.peer_pubkey_hex.clone(),
+                    })
+                    .await;
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "未找到哈希 {} 对应的消息，送达回执无法匹配",
+                        &receipt_msg_hash[..16.min(receipt_msg_hash.len())]
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("查询待发送消息列表失败: {}", e);
                 }
             }
-
-            // 如果 pending 中未找到，可能是已通过 mark_sent_by_hash 标记为已发送
-            // 仍然通知 UI 已送达
-            if let Ok(Some(msg)) = storage::get_message_by_hash(pool, &receipt_msg_hash).await {
-                tracing::info!(
-                    "消息 {} 已通过 mark_sent_by_hash 标记为已发送，仅通知 UI",
-                    msg.id
-                );
-                core.send_message_mpsc(crate::command::IncomingMessage::DeliveryReceipt {
-                    message_hash: receipt_msg_hash.clone(),
-                    peer_id: msg.peer_pubkey_hex.clone(),
-                })
-                .await;
-            } else {
-                tracing::warn!(
-                    "未找到哈希 {} 对应的消息，送达回执无法匹配",
-                    &receipt_msg_hash[..16.min(receipt_msg_hash.len())]
-                );
             }
-        }
         Err(e) => {
             tracing::warn!("送达回执数据不是合法 UTF-8: {}", e);
         }

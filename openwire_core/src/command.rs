@@ -2,12 +2,33 @@ use crate::message::ChatMessageType;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-/// 文件分享消息在数据库 content 字段中的存储格式前缀
-/// 格式: "[文件] {filename} [hash:{64-hex-chars}]"
-/// 解析方通过此格式反序列化出文件元信息。
-pub const FILE_SHARE_CONTENT_PREFIX: &str = "[文件] ";
-/// 文件分享消息在数据库 content 字段中 hash 部分的前缀标记
-pub const FILE_SHARE_HASH_PREFIX: &str = " [hash:";
+/// 中继角色
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayRole {
+    /// 中继服务端（公网节点）
+    Server,
+    /// 中继客户端（NAT 后节点）
+    Client,
+    /// 关闭中继
+    Off,
+}
+
+/// 计费网络检测模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PaidNetworkMode {
+    /// 免费网络
+    #[serde(rename = "free")]
+    Free,
+    /// 计费网络（如移动热点）
+    #[serde(rename = "paid")]
+    Metered,
+    /// 禁用中继
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
+
 
 /// 文件传输进度状态
 #[derive(Debug, Clone, serde::Serialize)]
@@ -131,11 +152,10 @@ pub enum ChatCommand {
     /// 优雅关闭核心
     Shutdown,
 
-    /// 设置计费网络检测模式：free（非计费）/ paid（计费）/ disabled（禁用）
-    /// 禁用时中继始终关闭，优先于 API 自动检测与用户手动选择
-    SetPaidNetworkMode(String),
-    /// 设置中继角色："server" / "client" / "off"（互斥，server 与 client 不能同时启用）
-    SetRelayRole(String),
+    /// 设置计费网络检测模式
+    SetPaidNetworkMode(PaidNetworkMode),
+    /// 设置中继角色（互斥，server 与 client 不能同时启用）
+    SetRelayRole(RelayRole),
 
     /// 查询网络状态（用于前端网络监控组件）
     GetNetworkStatus {
@@ -175,6 +195,8 @@ pub enum ChatCommand {
     TimerPublishIdentity,
     /// 定时器：随机刷新路由表（随机桶查询，扩展路由表覆盖）
     TimerRefreshRoutingTable,
+    /// 定时器：扫描并清理超时文件传输
+    TimerScanFileTransfers,
 }
 
 /// 收到的消息类型：chat_core 向上层传递的结构化数据
@@ -201,8 +223,6 @@ pub enum IncomingMessage {
     FileShare {
         /// 文件名
         filename: String,
-        /// 文件唯一标识（hex）
-        file_id: String,
         /// 文件哈希（hex）
         file_hash: String,
         /// 文件总大小
@@ -250,6 +270,11 @@ pub enum MessageEvent {
         mldsa_pubkey_hex: String,
         /// 是否在线
         online: bool,
+    },
+    /// 当前身份已切换，携带新的 ML-KEM 公钥（上层更新缓存的公钥）
+    IdentityChanged {
+        /// 新当前身份的 ML-KEM 公钥 hex
+        mlkem_pubkey_hex: Option<String>,
     },
     /// 发生错误
     Error(String),
@@ -332,12 +357,12 @@ pub struct NetworkStatusData {
     pub online: bool,
     /// 是否为计费网络（如移动热点）
     pub is_paid_network: bool,
-    /// 计费网络检测模式："free" / "paid" / "disabled"
-    pub paid_network_mode: String,
+    /// 计费网络检测模式
+    pub paid_network_mode: PaidNetworkMode,
     /// 中继服务是否已启用
     pub relay_enabled: bool,
-    /// 中继角色："server" / "client" / "off"（互斥）
-    pub relay_role: String,
+    /// 中继角色（互斥）
+    pub relay_role: RelayRole,
     /// NAT 状态："Public", "Private", "Unknown"
     pub nat_status: String,
     /// UPnP 状态："Enabled", "Disabled", "Unknown"
@@ -407,3 +432,5 @@ impl NetworkStatusData {
         }).to_string()
     }
 }
+
+

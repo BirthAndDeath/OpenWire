@@ -5,6 +5,7 @@ use aes_gcm::{
 use aws_lc_rs::kem::{DecapsulationKey, EncapsulationKey, ML_KEM_768};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 /// ML-KEM-768 公钥大小（字节）
 ///
@@ -22,19 +23,7 @@ pub const MLKEM768_SECRET_KEY_SIZE: usize = 2400;
 /// ciphertext，大小为 1088 字节。
 pub const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 
-/// 当前加密协议版本
-///
-/// 此版本号在 encrypt_message() 中写入加密载荷的第一个字节，
-/// 在 decrypt_message() 中根据版本选择对应 KDF 派生密钥。
-///
-/// 版本历史：
-/// - v1 (0.1.x): BLAKE3 XOF 派生 AES-256 密钥（已移除，不再支持）
-/// - v2 (0.2.0+): HKDF-SHA256 派生 AES-256 密钥
-///
-/// 注意：此版本号仅用于加密协议（ML-KEM + AES-GCM）的兼容性管理，
-/// 不用于 ChatMessage 结构体的序列化格式版本管理。
-/// 若需支持消息序列化格式的向前兼容，应在 ChatMessage 结构体中
-/// 添加独立的 version 字段。
+/// 当前加密协议版本（v2: HKDF-SHA256 派生 AES-256 密钥）
 const CURRENT_ENCRYPTION_VERSION: u8 = 2;
 
 /// 使用 ML-KEM/Kyber + AES-GCM 进行混合加密
@@ -69,7 +58,7 @@ pub fn encrypt_message(
         .map_err(crate::error::CryptoError::KemEncapsulationFailed)?;
 
     // 2. 从共享密钥派生 AES-256 密钥（使用当前版本 KDF）
-    let aes_key = derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref());
+    let aes_key = Zeroizing::new(derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref()));
 
     // 3. 生成随机 nonce
     let nonce_bytes: [u8; 12] = rand::random();
@@ -77,7 +66,7 @@ pub fn encrypt_message(
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     // 4. 使用 AES-GCM 加密数据（版本字节作为 AAD 防降级攻击）
-    let cipher = Aes256Gcm::new(&aes_key.into());
+    let cipher = Aes256Gcm::new(&(*aes_key).into());
     let version_aad = [CURRENT_ENCRYPTION_VERSION];
     let payload = Payload { msg: data, aad: &version_aad };
     let ciphertext = cipher
@@ -109,11 +98,11 @@ pub fn encrypt_message(
 /// - `decap_key`: ML-KEM 解封装密钥对象（由 ChatCore 缓存，避免序列化/反序列化问题）
 ///
 /// # 设计说明
-/// 注意：此函数接受 `&DecapsulationKey` 而非 `&[u8]` 私钥字节。
-/// 这是因为 aws-lc-rs 的 `DecapsulationKey::key_bytes()` 输出格式与
-/// `DecapsulationKey::new()` 输入格式不兼容（已知的库限制），
-/// 因此无法通过序列化/反序列化私钥字节来重建 DecapsulationKey。
-/// 解决方案是在 ChatCore 中缓存 DecapsulationKey 对象，直接传入引用。
+/// 此函数接受 `&DecapsulationKey` 而非 `&[u8]` 私钥字节。
+/// `DecapsulationKey::key_bytes()` 的输出可直接经 `DecapsulationKey::new()` 重建
+/// （aws-lc-rs 1.18+ 已验证 round-trip），但重建对象无法再调用 `encapsulation_key()`
+/// 导出公钥。由于 ML-KEM 公钥已通过 FriendOnline 独立分发，此处缓存对象仅为
+/// 避免每次解密时重建，属性能优化而非功能依赖。
 ///
 /// # 流程
 /// 1. 提取 Kyber 封装的密文
@@ -148,17 +137,14 @@ pub fn decrypt_message(
         .decapsulate(ciphertext)
         .map_err(crate::error::CryptoError::KemDecapsulationFailed)?;
 
-    // 4. 根据版本选择对应的 KDF 派生 AES-256 密钥
-    let aes_key = match version {
-        1 => derive_aes_key_from_mlkem_v1_blake3(shared_secret.as_ref()),
-        2 => derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref()),
-        _ => {
-            return Err(crate::error::CryptoError::UnsupportedEncryptionVersion {
-                version,
-                current: CURRENT_ENCRYPTION_VERSION,
-            });
-        }
-    };
+    // 4. 派生 AES-256 密钥
+    if version != CURRENT_ENCRYPTION_VERSION {
+        return Err(crate::error::CryptoError::UnsupportedEncryptionVersion {
+            version,
+            current: CURRENT_ENCRYPTION_VERSION,
+        });
+    }
+    let aes_key = Zeroizing::new(derive_aes_key_from_mlkem_v2_hkdf(shared_secret.as_ref()));
 
     // 5. 分离 nonce 和 ciphertext
     if rest.len() < 12 {
@@ -169,7 +155,7 @@ pub fn decrypt_message(
     let nonce = Nonce::from_slice(nonce_bytes);
 
     // 6. 使用 AES-GCM 解密（版本字节作为 AAD 防降级攻击）
-    let cipher = Aes256Gcm::new(&aes_key.into());
+    let cipher = Aes256Gcm::new(&(*aes_key).into());
     let version_aad = [version];
     let payload = Payload { msg: ciphertext, aad: &version_aad };
     let plaintext = cipher
@@ -181,19 +167,7 @@ pub fn decrypt_message(
 
 // ========== 内部辅助函数 ==========
 
-/// 从 ML-KEM 共享密钥派生 AES-256 密钥（v1, BLAKE3 XOF）
-///
-/// 仅用于解密旧版本消息（解密回退），新消息使用 v2 HKDF 派生。
-fn derive_aes_key_from_mlkem_v1_blake3(shared_secret: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ChatCore-AES-256-Key-Derivation-v1");
-    hasher.update(shared_secret);
-    hasher.finalize_xof().fill(&mut key);
-    key
-}
-
-/// 从 ML-KEM 共享密钥派生 AES-256 密钥（v2, HKDF-SHA256）
+/// 从 ML-KEM 共享密钥派生 AES-256 密钥（HKDF-SHA256）
 ///
 /// 使用 HKDF-SHA256 提取-扩展范式，添加上下文信息以防止密钥误用。
 /// 用于 CURRENT_ENCRYPTION_VERSION >= 2 的新加密消息。
@@ -329,6 +303,42 @@ mod tests {
         assert_eq!(
             decrypt_message(&encrypted1, &decap_key).unwrap(),
             decrypt_message(&encrypted2, &decap_key).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_mlkem_decap_key_bytes_roundtrip() {
+        // 验证 key_bytes() → new() round-trip：重建的 key 应能解密原 key 加密的数据
+        let decap_key =
+            DecapsulationKey::generate(&ML_KEM_768).expect("生成 DecapsulationKey 失败");
+        let encap_key = decap_key
+            .encapsulation_key()
+            .expect("获取 EncapsulationKey 失败");
+        let pk_bytes = encap_key.key_bytes().expect("获取公钥字节失败");
+
+        let plaintext = b"serialization roundtrip test data";
+        let encrypted = encrypt_message(plaintext, pk_bytes.as_ref()).unwrap();
+
+        // 使用 key_bytes() 序列化私钥
+        let priv_key_bytes = decap_key
+            .key_bytes()
+            .expect("获取 DecapsulationKey 私钥字节失败");
+        println!("DecapsulationKey priv bytes len: {}", priv_key_bytes.as_ref().len());
+
+        // 通过 new() 重建
+        let rebuilt = DecapsulationKey::new(&ML_KEM_768, priv_key_bytes.as_ref())
+            .expect("从私钥字节重建 DecapsulationKey 失败");
+
+        // 重建的 key 应能解密
+        let decrypted = decrypt_message(&encrypted, &rebuilt).unwrap();
+        assert_eq!(decrypted, plaintext);
+
+        // 序列化稳定性：重建后的 key_bytes 应与原 key 一致
+        let rebuilt_bytes = rebuilt.key_bytes().unwrap();
+        assert_eq!(
+            priv_key_bytes.as_ref(),
+            rebuilt_bytes.as_ref(),
+            "key_bytes() 序列化应稳定"
         );
     }
 }

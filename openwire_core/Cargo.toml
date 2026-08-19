@@ -3,13 +3,7 @@ name = "openwire_core"
 version = "0.1.0"
 edition = "2024"
 [features]
-
-default = ["mem_dht", "sqlite_history_storage", "pathranker"]
-sqlite_history_storage = []
-mem_dht = ["dashmap"]
 redb_dht = ["redb"]
-
-pathranker = ["libp2p-pathranker"]
 [dependencies]
 thiserror = "2"
 libp2p = { workspace = true }
@@ -31,19 +25,16 @@ aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
 
 
 hex = "0.4.3"
-blake3 = "1.8.6"
 subtle = "2"
 rand = "0.10.2"
 lru = "0.18.2"
 
-dashmap = { version = "6", optional = true }
+dashmap = "6"
 redb = { version = "4.1.0", optional = true }
 zeroize = { version = "1.9.0", features = ["zeroize_derive", "serde"] }
 async-compression = { version = "0.4.43", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
-async-trait = "0.1.91"
-vstd = "0.0.0-2026-08-02-0125"
-libp2p-pathranker = { path = "../libp2p-pathranker", optional = true }
+libp2p-pathranker = { path = "../libp2p-pathranker" }
 serde_json = "1"
 
 

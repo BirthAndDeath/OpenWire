@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { VList } from "virtua/svelte";
+    import { VList, type VListHandle } from "virtua/svelte";
     import { invoke } from "@tauri-apps/api/core";
 
     interface Contact {
@@ -17,18 +17,16 @@
         contacts = [],
         selectedId = null,
         onselect,
-        onctx,
         ondelete,
     }: {
         contacts: Contact[];
         selectedId: string | null;
         onselect?: (id: string) => void;
-        onctx?: (e: MouseEvent, id: string) => void;
         ondelete?: (id: string) => void;
     } = $props();
 
     let q = $state("");
-    let list = $state<any>(undefined);
+    let list: VListHandle | undefined = $state(undefined);
 
     // 右键菜单状态
     let contextMenu = $state<{
@@ -62,7 +60,6 @@
     const handleContextMenu = (e: MouseEvent, id: string) => {
         e.preventDefault();
         contextMenu = { x: e.clientX, y: e.clientY, contactId: id };
-        onctx?.(e, id);
     };
 
     // 关闭右键菜单
@@ -255,8 +252,7 @@
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: color-mix(in srgb, var(--bg-primary) 70%, transparent);
-        backdrop-filter: blur(10px);
+        background: transparent;
     }
 
     .search {

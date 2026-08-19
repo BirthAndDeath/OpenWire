@@ -37,19 +37,18 @@ impl ChatCore {
                     &mlkem_id[..16]
                 );
 
-                self.peerid_to_mlkem.clear();
+                self.peer_cache.peerid_to_mlkem.clear();
                 self.mldsa_pubkey_hex = Some(mldsa_id.clone());
                 self.mldsa_identity_id = Some(mldsa_id.clone());
                 self.mlkem_pubkey_hex = Some(mlkem_id.clone());
                 self.mlkem_decap_key = Some(identity.mlkem_decap_key);
-
-                self.cache_mldsa_private_key(&mldsa_id);
+                self.mldsa_private_key = Some(identity.mldsa_private_key);
 
                 self.reinitialize_swarm().await;
 
                 let store = self.get_dht_store();
                 if let Some(peer_id) = self.current_peer_id {
-                    let _ = store.set_pubkey_peerid(&mldsa_id, &peer_id);
+                    store.set_pubkey_peerid(&mldsa_id, &peer_id);
                 }
 
                 if let Some(pool) = storage::pool() {
@@ -58,6 +57,9 @@ impl ChatCore {
 
                 let msg = format!("已生成并切换到新身份: {}..", &mldsa_id[..16]);
                 self.send_log_mpsc(msg).await;
+                let _ = self.tx_message.try_send(crate::command::MessageEvent::IdentityChanged {
+                    mlkem_pubkey_hex: Some(mlkem_id.clone()),
+                });
             }
             Err(e) => {
                 tracing::error!("Failed to generate identity: {e}");
@@ -157,7 +159,7 @@ impl ChatCore {
             return;
         }
 
-        self.peerid_to_mlkem.clear();
+        self.peer_cache.peerid_to_mlkem.clear();
         self.mldsa_pubkey_hex = Some(mldsa_pubkey_hex.clone());
         self.current_peer_id = Some(peer_id);
         self.mldsa_identity_id = Some(identity_id.clone());
@@ -166,7 +168,7 @@ impl ChatCore {
         self.mldsa_private_key = Some(Zeroizing::new(mldsa_handle.get_private_key().to_vec()));
 
         let store = self.get_dht_store();
-        let _ = store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
+        store.set_pubkey_peerid(&mldsa_pubkey_hex, &peer_id);
 
         tracing::info!(
             "Runtime identity switch complete: ML-DSA={}, ML-KEM={}, PeerID={}",
@@ -176,6 +178,9 @@ impl ChatCore {
         );
         let msg = format!("已切换到身份: {}..", &identity_id[..16]);
         self.send_log_mpsc(msg).await;
+        let _ = self.tx_message.try_send(crate::command::MessageEvent::IdentityChanged {
+            mlkem_pubkey_hex: Some(mlkem_pubkey_hex.clone()),
+        });
     }
 
     /// 删除指定身份
@@ -186,7 +191,7 @@ impl ChatCore {
                     tracing::info!("Deleted identity: {}", identity_id);
 
                     let store = self.get_dht_store();
-                    let _ = store.remove_pubkey_peerid(&identity_id);
+                    store.remove_pubkey_peerid(&identity_id);
 
                     self.stop_dht_providing(&identity_id).await;
 
@@ -196,7 +201,7 @@ impl ChatCore {
                         self.mlkem_pubkey_hex = None;
                         self.mldsa_private_key = None;
                         self.current_peer_id = None;
-                        self.peerid_to_mlkem.clear();
+                        self.peer_cache.peerid_to_mlkem.clear();
                     }
                 }
                 Err(e) => {
@@ -206,28 +211,13 @@ impl ChatCore {
         }
     }
 
-    fn cache_mldsa_private_key(&mut self, identity_id: &str) {
-        match rootcell::identity::PrivateKeyHandle::load(
-            &self.data_dir.to_string_lossy(),
-            &format!("{}_mldsa", identity_id),
-        ) {
-            Ok(handle) => {
-                self.mldsa_private_key = Some(Zeroizing::new(handle.get_private_key().to_vec()));
-            }
-            Err(e) => {
-                tracing::error!("Failed to cache ML-DSA private key for new identity: {e}");
-            }
-        }
-    }
-
     async fn rebuild_p2p_stack(&mut self, keypair: libp2p::identity::Keypair) -> Result<(), String> {
         let swarm = p2p::swarm_init(&self.data_dir, keypair.clone(), &self.bootstrap_nodes, self.peerid_config.as_ref())
             .map_err(|e| format!("Failed to reinitialize swarm: {}", e))?;
-        self.identity_keypair = keypair;
         self.current_peer_id = Some(*swarm.local_peer_id());
         let (p2p_handle, rx_p2p_event) = P2pActorBuilder::new()
             .swarm(swarm)
-            .dht_cache(self.dht_cache.clone())
+            .dht_cache(self.peer_cache.dht.clone())
             .data_dir(self.data_dir.clone())
             .relay_nodes(self.relay_nodes.clone())
             .bootstrap_nodes(self.bootstrap_nodes.clone())
@@ -246,7 +236,11 @@ impl ChatCore {
                 Ok(kp) => Ok((kp, config)),
                 Err(e) => {
                     tracing::warn!("Failed to restore PeerID from config, deleting corrupted entry: {e}");
-                    crate::identity::load_or_create_peerid(&self.data_dir)
+                    let result = crate::identity::load_or_create_peerid(&self.data_dir);
+                    if result.is_err() {
+                        self.peerid_config = Some(config);
+                    }
+                    result
                 }
             },
             None => crate::identity::load_or_create_peerid(&self.data_dir),

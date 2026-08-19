@@ -38,7 +38,6 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                     }
                     IncomingMessage::FileShare {
                         filename,
-                        file_id,
                         file_hash,
                         total_size,
                         sender,
@@ -48,7 +47,6 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             "subtype": "file_share",
                             "data": {
                                 "filename": filename,
-                                "file_id": file_id,
                                 "file_hash": file_hash,
                                 "total_size": total_size,
                                 "sender": sender,
@@ -140,6 +138,12 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                             "mldsa_pubkey_hex": mldsa_pubkey_hex,
                             "online": online,
                         },
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    })
+                }
+                MessageEvent::IdentityChanged { .. } => {
+                    json!({
+                        "type": "identity_changed",
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     })
                 }

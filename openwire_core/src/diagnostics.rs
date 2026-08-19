@@ -188,29 +188,17 @@ fn diagnose_dht_records(report: &mut DiagnosticReport, dht_cache: Option<Arc<Dht
     };
 
     // 查询 pubkey->peerid 映射数
-    match store.get_all_pubkeys() {
-        Ok(pubkeys) => {
-            let count = pubkeys.len();
-            report.add(DiagnosticItem {
-                name: "DHT 身份注册",
-                passed: true,
-                detail: format!("本地 DHT 缓存中已注册 {} 个 ML-DSA 公钥", count),
-                suggestion: if count == 0 {
-                    Some("尚未注册任何身份到 DHT，请先添加联系人或启动程序".to_string())
-                } else {
-                    None
-                },
-            });
-        }
-        Err(e) => {
-            report.add(DiagnosticItem {
-                name: "DHT 身份注册",
-                passed: false,
-                detail: format!("查询 DHT 身份注册失败: {}", e),
-                suggestion: Some("检查 DHT 数据库是否损坏".to_string()),
-            });
-        }
-    }
+    let count = store.get_all_pubkeys().len();
+    report.add(DiagnosticItem {
+        name: "DHT 身份注册",
+        passed: true,
+        detail: format!("本地 DHT 缓存中已注册 {} 个 ML-DSA 公钥", count),
+        suggestion: if count == 0 {
+            Some("尚未注册任何身份到 DHT，请先添加联系人或启动程序".to_string())
+        } else {
+            None
+        },
+    });
 }
 
 // ============================================================================

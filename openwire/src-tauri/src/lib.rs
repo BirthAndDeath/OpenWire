@@ -8,6 +8,49 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
+/// ML-DSA 公钥 hex 最大长度（1952 字节原始公钥 × 2）
+const MAX_PUBKEY_HEX_LEN: usize = 3904;
+/// ML-KEM 公钥 hex 最大长度（768 字节原始公钥 × 2）
+const MAX_MLKEM_HEX_LEN: usize = 1568;
+
+/// 获取核心命令通道（未初始化时返回错误）
+async fn require_cmd_tx(
+    state: &tauri::State<'_, AppData>,
+) -> Result<mpsc::Sender<ChatCommand>, String> {
+    let inner = state.inner.read().await;
+    inner
+        .cmd_tx
+        .clone()
+        .ok_or_else(|| "核心尚未初始化".to_string())
+}
+
+/// 读取应用数据目录
+async fn app_data_dir(state: &tauri::State<'_, AppData>) -> std::path::PathBuf {
+    let inner = state.inner.read().await;
+    inner.data_dir.clone()
+}
+
+/// 查询当前身份 ID（未选择身份时返回 Ok(None)）
+async fn current_identity() -> Result<Option<String>, String> {
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    storage::get_current_identity(pool)
+        .await
+        .map_err(|e| format!("获取当前身份失败: {e}"))
+}
+
+/// 校验联系人 ML-DSA 公钥 hex 格式
+fn validate_pubkey_hex(hex_str: &str) -> Result<(), String> {
+    if hex_str.is_empty() {
+        return Err("联系人标识不能为空".to_string());
+    }
+    if hex_str.len() > MAX_PUBKEY_HEX_LEN {
+        return Err(format!("联系人标识过长（最大 {MAX_PUBKEY_HEX_LEN} 字符）"));
+    }
+    hex::decode(hex_str)
+        .map(|_| ())
+        .map_err(|e| format!("无效的 pubkey 格式: {e}"))
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SentFileDto {
     file_hash: String,
@@ -16,54 +59,38 @@ struct SentFileDto {
     sent_at: i64,
 }
 
-/// 将 `[N] hex` 格式的消息内容转换为用于前端显示的 JSON 字符串
-fn decode_message_content(content: &str) -> String {
-    // 尝试解析 `[N] hex` 格式（FileHash, FileStream, FileDownloadRequest 等）
-    if let Some(stripped) = content.strip_prefix('[') {
-        if let Some(rest) = stripped.split(']').next() {
-            if let Ok(msgtype) = rest.parse::<u8>() {
-                let hex_part = content.find(']').map_or(content, |i| &content[i + 1..]).trim();
-                if msgtype == ChatMessageType::FileHash as u8 {
-                    // 尝试解析 FileHashInfo
-                    if let Ok(bytes) = hex::decode(hex_part) {
-                        if let Ok(info) =
-                            postcard::from_bytes::<openwire_core::message::FileHashInfo>(&bytes)
-                        {
-                            if let Ok(json) = serde_json::to_string(&serde_json::json!({
-                                "file_hash": hex::encode(info.file_hash),
-                                "file_id": hex::encode(info.file_id),
-                                "filename": info.filename,
-                                "total_size": info.total_size,
-                            })) {
-                                return json;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+/// 将消息内容转换为前端显示格式。
+/// FileHash 消息存储为 hex 编码的 postcard 字节，需解码为 JSON。
+/// 其他类型原样返回。
+fn decode_message_content(content: &str, msgtype: i32) -> String {
+    if msgtype != ChatMessageType::FileHash as i32 {
+        return content.to_string();
     }
-    content.to_string()
+    match hex::decode(content) {
+        Ok(bytes) => match postcard::from_bytes::<openwire_core::message::FileHashInfo>(&bytes) {
+            Ok(info) => serde_json::to_string(&serde_json::json!({
+                "file_hash": hex::encode(info.file_hash),
+                "file_id": hex::encode(info.file_hash),
+                "filename": info.filename,
+                "total_size": info.total_size,
+            })).unwrap_or_else(|_| content.to_string()),
+            Err(_) => content.to_string(),
+        },
+        Err(_) => content.to_string(),
+    }
 }
 
 /// 验证联系人存在性：检查 hex 格式 + 数据库中的联系人记录
 async fn validate_contact(mldsa_pubkey_hex: &str) -> Result<(), String> {
-    if mldsa_pubkey_hex.is_empty() {
-        return Err("联系人标识不能为空".to_string());
-    }
-    let _ = hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
-    let pool = storage::pool().ok_or_else(|| "数据库不可用，无法验证联系人".to_string())?;
-    let owner_identity_id = storage::get_current_identity(pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if !owner_identity_id.is_empty() {
-        match storage::is_contact_exists(pool, &owner_identity_id, mldsa_pubkey_hex).await {
-            Ok(false) => return Err("该联系人不存在，请先添加联系人".to_string()),
-            Err(e) => return Err(format!("检查联系人存在性失败: {}", e)),
-            _ => {}
-        }
+    validate_pubkey_hex(mldsa_pubkey_hex)?;
+    let Some(owner_identity_id) = current_identity().await? else {
+        return Ok(());
+    };
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    match storage::is_contact_exists(pool, &owner_identity_id, mldsa_pubkey_hex).await {
+        Ok(false) => return Err("该联系人不存在，请先添加联系人".to_string()),
+        Err(e) => return Err(format!("检查联系人存在性失败: {}", e)),
+        _ => {}
     }
     Ok(())
 }
@@ -76,12 +103,7 @@ async fn send(
 ) -> Result<bool, String> {
     validate_contact(mldsa_pubkey_hex).await?;
 
-    let inner = state.inner.read().await;
-    let cmd_tx = inner
-        .cmd_tx
-        .clone()
-        .ok_or_else(|| "核心尚未初始化".to_string())?;
-    drop(inner);
+    let cmd_tx = require_cmd_tx(&state).await?;
 
     let data = message.as_bytes();
     if data.len() > 65536 {
@@ -116,22 +138,38 @@ async fn send_file(
         return Err(format!("文件不存在: {}", file_path));
     }
     // 限制只允许发送下载目录内的文件，防止路径遍历
-    let data_dir = {
-        let inner = state.inner.read().await;
-        inner.data_dir.clone()
-    };
+    let data_dir = app_data_dir(&state).await;
     let downloads_dir = data_dir.join("downloads");
     let downloads_canon = downloads_dir.canonicalize().unwrap_or(downloads_dir);
     if !canon.starts_with(&downloads_canon) {
         return Err("只能发送下载目录内的文件".to_string());
+    }
+    // 拒绝下载目录内任何 symlink 路径组件：防御纵深，防止指向任意文件的
+    // 符号链接被当作站内文件读取并发送。
+    // 先补全为绝对路径，确保相对路径/含 .. 的路径也能匹配到下载目录前缀。
+    let abs_path = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or_else(|_| path.clone())
+    };
+    if let Ok(rel) = abs_path.strip_prefix(&downloads_canon) {
+        let mut current = downloads_canon.clone();
+        for seg in rel.iter() {
+            current.push(seg);
+            if let Ok(md) = std::fs::symlink_metadata(&current) {
+                if md.file_type().is_symlink() {
+                    return Err("不允许发送符号链接指向的文件".to_string());
+                }
+            }
+        }
     }
     drop(data_dir);
 
     let file_hash = openwire_core::transfer::compute_file_hash(&path)
         .await
         .map_err(|e| format!("计算文件 hash 失败: {}", e))?;
-
-    let file_id = file_hash;
 
     let metadata = std::fs::metadata(&path).map_err(|e| format!("获取文件信息失败: {}", e))?;
     let total_size = metadata.len();
@@ -142,7 +180,7 @@ async fn send_file(
         .to_string();
 
     let file_info =
-        openwire_core::message::FileHashInfo::new(filename.clone(), total_size, file_hash, file_id);
+        openwire_core::message::FileHashInfo::new(filename.clone(), total_size, file_hash);
     let file_info_bytes = postcard::to_allocvec(&file_info)
         .map_err(|e| format!("序列化 FileHashInfo 失败: {}", e))?;
 
@@ -181,7 +219,6 @@ async fn send_file(
         Err(e) => Err(format!("发送文件消息失败: {}", e)),
     }
 }
-
 #[derive(Serialize)]
 struct ContactDto {
     mldsa_pubkey_hex: String,
@@ -191,14 +228,10 @@ struct ContactDto {
 
 #[tauri::command]
 async fn list_contacts() -> Result<Vec<ContactDto>, String> {
-    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let owner_identity_id = match storage::get_current_identity(pool).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Ok(Vec::new());
-        }
-        Err(e) => return Err(format!("获取当前身份失败: {}", e)),
+    let Some(owner_identity_id) = current_identity().await? else {
+        return Ok(Vec::new());
     };
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
     let contacts = storage::list_contacts(pool, &owner_identity_id)
         .await
         .map_err(|e| format!("加载联系人失败: {}", e))?
@@ -233,37 +266,54 @@ async fn load_messages(
     after_id: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<MessageDto>, String> {
-    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let owner_identity_id = match storage::get_current_identity(pool).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Ok(Vec::new());
-        }
-        Err(e) => return Err(format!("获取当前身份失败: {}", e)),
+    let short = if mldsa_pubkey_hex.len() > 16 {
+        &mldsa_pubkey_hex[..16]
+    } else {
+        mldsa_pubkey_hex
     };
-    let msgs = storage::get_messages_range(
-        pool,
-        &owner_identity_id,
-        mldsa_pubkey_hex,
-        before,
-        before_id,
-        after,
-        after_id,
-        limit.map(|l| l.clamp(0, openwire_core::storage::MAX_MESSAGE_PAGE_SIZE)).unwrap_or(50),
-    )
-    .await
-    .map_err(|e| format!("加载消息失败: {}", e))?
-    .into_iter()
-    .map(|msg| MessageDto {
-        id: msg.id,
-        mldsa_pubkey_hex: msg.peer_pubkey_hex,
-        content: decode_message_content(&msg.content),
-        is_outgoing: msg.is_outgoing != 0,
-        ts: msg.ts,
-        pending: msg.pending,
-    })
-    .collect();
-    Ok(msgs)
+    tracing::info!(
+        "load_messages called: peer={}.. before={before:?} before_id={before_id:?} after={after:?} after_id={after_id:?} limit={limit:?}",
+        short
+    );
+    let result: Result<Vec<MessageDto>, String> = async {
+        let Some(owner_identity_id) = current_identity().await? else {
+            return Ok(Vec::new());
+        };
+        let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+        let msgs = storage::get_messages_range(
+            pool,
+            &owner_identity_id,
+            mldsa_pubkey_hex,
+            before,
+            before_id,
+            after,
+            after_id,
+            limit.map(|l| l.clamp(0, openwire_core::storage::MAX_MESSAGE_PAGE_SIZE)).unwrap_or(50),
+        )
+        .await
+        .map_err(|e| format!("加载消息失败: {}", e))?
+        .into_iter()
+        .map(|msg| MessageDto {
+            id: msg.id,
+            mldsa_pubkey_hex: msg.peer_pubkey_hex,
+            content: decode_message_content(&msg.content, msg.msgtype),
+            is_outgoing: msg.is_outgoing != 0,
+            ts: msg.ts,
+            pending: msg.pending,
+        })
+        .collect();
+        Ok(msgs)
+    }
+    .await;
+    match &result {
+        Ok(msgs) => tracing::info!(
+            "load_messages ok: peer={}.. count={}",
+            short,
+            msgs.len()
+        ),
+        Err(e) => tracing::error!("load_messages failed: peer={}.. err={}", short, e),
+    }
+    result
 }
 
 #[derive(Serialize)]
@@ -276,10 +326,8 @@ struct IdentityDto {
 
 #[tauri::command]
 async fn get_identity_qr_data(_state: tauri::State<'_, AppData>) -> Result<Vec<u8>, String> {
-    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
-    let identity_id = storage::get_current_identity(pool)
-        .await
-        .map_err(|e| format!("获取当前身份失败: {}", e))?
+    let identity_id = current_identity()
+        .await?
         .ok_or_else(|| "未选择身份".to_string())?;
 
     hex::decode(&identity_id).map_err(|e| format!("解码公钥失败: {}", e))
@@ -321,6 +369,9 @@ async fn select_identity(
     state: tauri::State<'_, AppData>,
     identity_id: &str,
 ) -> Result<(), String> {
+    if identity_id.len() > MAX_PUBKEY_HEX_LEN {
+        return Err(format!("身份标识过长（最大 {MAX_PUBKEY_HEX_LEN} 字符）"));
+    }
     let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
     let identities = storage::list_identities(pool)
         .await
@@ -336,11 +387,8 @@ async fn select_identity(
         return Ok(());
     }
 
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx
         .send(ChatCommand::SelectIdentity {
             identity_id: identity_id.to_string(),
         })
@@ -370,11 +418,8 @@ async fn delete_identity(
         _ => {}
     }
 
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx
         .send(ChatCommand::DeleteIdentity {
             identity_id: identity_id.to_string(),
         })
@@ -392,12 +437,13 @@ async fn add_contact(
     name: Option<String>,
     mlkem_pubkey_hex: Option<String>,
 ) -> Result<bool, String> {
-    if mldsa_pubkey_hex.is_empty() {
-        return Err("联系人标识不能为空".to_string());
-    }
+    validate_pubkey_hex(mldsa_pubkey_hex)?;
 
-    let _mldsa_public_key =
-        hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
+    if let Some(hex_str) = &mlkem_pubkey_hex {
+        if !hex_str.is_empty() && hex_str.len() > MAX_MLKEM_HEX_LEN {
+            return Err(format!("ML-KEM 公钥过长（最大 {MAX_MLKEM_HEX_LEN} 字符）"));
+        }
+    }
 
     let mlkem_public_key = if let Some(hex_str) = mlkem_pubkey_hex {
         if hex_str.is_empty() {
@@ -410,11 +456,8 @@ async fn add_contact(
     };
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx
         .send(ChatCommand::AddContact {
             mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
             mlkem_public_key,
@@ -438,14 +481,9 @@ async fn discover_contact(
     mldsa_pubkey_hex: &str,
     name: Option<String>,
 ) -> Result<bool, String> {
-    if mldsa_pubkey_hex.is_empty() {
-        return Err("联系人标识不能为空".to_string());
-    }
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
+    validate_pubkey_hex(mldsa_pubkey_hex)?;
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx
         .send(ChatCommand::DiscoverContact {
             mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
             name,
@@ -463,11 +501,7 @@ async fn delete_contact(
     _state: tauri::State<'_, AppData>,
     mldsa_pubkey_hex: &str,
 ) -> Result<bool, String> {
-    if mldsa_pubkey_hex.is_empty() {
-        return Err("联系人标识不能为空".to_string());
-    }
-
-    hex::decode(mldsa_pubkey_hex).map_err(|e| format!("无效的 pubkey 格式: {}", e))?;
+    validate_pubkey_hex(mldsa_pubkey_hex)?;
 
     let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
     app_handle
@@ -490,12 +524,18 @@ async fn delete_contact(
         return Err("用户取消了操作".to_string());
     }
 
-    let pool = storage::pool().ok_or_else(|| "数据库连接不可用".to_string())?;
-    let owner_identity_id = storage::get_current_identity(pool)
-        .await
-        .ok()
-        .flatten()
+    let owner_identity_id = current_identity()
+        .await?
         .ok_or_else(|| "未选择身份，无法删除联系人".to_string())?;
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+
+    // 先确认联系人存在，避免删除聊天记录后才发现联系人不存在（部分失败）
+    if !storage::is_contact_exists(pool, &owner_identity_id, mldsa_pubkey_hex)
+        .await
+        .unwrap_or(false)
+    {
+        return Err("未找到该联系人".to_string());
+    }
 
     let deleted_msgs = storage::delete_messages_by_peer(pool, &owner_identity_id, mldsa_pubkey_hex)
         .await
@@ -506,31 +546,20 @@ async fn delete_contact(
         &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
     );
 
-    match storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex).await {
-        Ok(affected) => {
-            if affected > 0 {
-                tracing::info!("已删除联系人 {}", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]);
-                Ok(true)
-            } else {
-                Err("未找到该联系人".to_string())
-            }
-        }
-        Err(e) => {
-            tracing::error!("删除联系人失败: {}", e);
-            Err(format!("删除联系人失败: {}", e))
-        }
-    }
+    storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex)
+        .await
+        .map_err(|e| format!("删除联系人失败: {}", e))?;
+    tracing::info!("已删除联系人 {}", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]);
+    Ok(true)
 }
 
 #[tauri::command]
 async fn delete_message(message_id: i64) -> Result<bool, String> {
-    let pool = storage::pool().ok_or_else(|| "数据库连接不可用".to_string())?;
     // 验证消息属于当前用户
-    let owner_identity_id = storage::get_current_identity(pool)
-        .await
-        .ok()
-        .flatten()
+    let owner_identity_id = current_identity()
+        .await?
         .ok_or_else(|| "未选择身份，无法删除消息".to_string())?;
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
     let msg = storage::get_message(pool, message_id)
         .await
         .map_err(|e| format!("查找消息失败: {}", e))?
@@ -556,13 +585,8 @@ async fn delete_message(message_id: i64) -> Result<bool, String> {
 
 #[tauri::command]
 async fn generate_identity(state: tauri::State<'_, AppData>) -> Result<bool, String> {
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
-        .send(ChatCommand::GenerateIdentity)
-        .await;
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx.send(ChatCommand::GenerateIdentity).await;
     match result {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("生成身份失败: {}", e)),
@@ -589,10 +613,7 @@ async fn request_file_download(
     }
 
     // 限制保存路径必须在下载目录内，防止路径遍历
-    let data_dir = {
-        let inner = state.inner.read().await;
-        inner.data_dir.clone()
-    };
+    let data_dir = app_data_dir(&state).await;
     let downloads_dir = data_dir.join("downloads");
     let save_canon = {
         let parent = std::path::Path::new(&save_path).parent().unwrap_or(std::path::Path::new(""));
@@ -606,13 +627,9 @@ async fn request_file_download(
     if !save_canon.starts_with(&downloads_canon) {
         return Err("保存路径必须在下载目录内".to_string());
     }
-    drop(data_dir);
 
-    let inner = state.inner.read().await;
-    let result = inner
-        .cmd_tx
-        .as_ref()
-        .ok_or_else(|| "核心尚未初始化".to_string())?
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let result = cmd_tx
         .send(ChatCommand::RequestFileDownload {
             sender_mldsa_pubkey_hex: sender_mldsa_pubkey_hex.to_string(),
             file_hash,
@@ -664,13 +681,19 @@ async fn delete_sent_file(file_hash_hex: &str) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_nodes_config(state: tauri::State<'_, AppData>) -> Result<String, String> {
-    let inner = state.inner.read().await;
-    let data_dir = inner.data_dir.clone();
-    drop(inner);
-
+    let data_dir = app_data_dir(&state).await;
     let nodes_config = openwire_core::p2p::nodes::NodesConfig::load(&data_dir);
-    let json = nodes_config.to_json_string();
-    Ok(json)
+    Ok(nodes_config.to_json_string())
+}
+
+/// 解析单个节点配置项 `[peer_id, multiaddr]`，校验 multiaddr 格式
+fn parse_node(v: Vec<String>) -> Result<[String; 2], String> {
+    if v.len() != 2 {
+        return Err("每个节点必须包含 peer_id 和 multiaddr".to_string());
+    }
+    v[1].parse::<libp2p::Multiaddr>()
+        .map_err(|_| format!("无效的 multiaddr 格式: {}", v[1]))?;
+    Ok([v[0].clone(), v[1].clone()])
 }
 
 #[tauri::command]
@@ -679,35 +702,9 @@ async fn save_nodes_config(
     relay_nodes: Vec<Vec<String>>,
     bootstrap_nodes: Vec<Vec<String>>,
 ) -> Result<(), String> {
-    let inner = state.inner.read().await;
-    let data_dir = inner.data_dir.clone();
-    drop(inner);
-
-    let relay: Vec<[String; 2]> = relay_nodes
-        .into_iter()
-        .map(|v| {
-            if v.len() != 2 {
-                return Err("每个 relay 节点必须包含 peer_id 和 multiaddr".to_string());
-            }
-            // 验证 multiaddr 格式
-            v[1].parse::<libp2p::Multiaddr>()
-                .map_err(|_| format!("无效的 multiaddr 格式: {}", v[1]))?;
-            Ok([v[0].clone(), v[1].clone()])
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let bootstrap: Vec<[String; 2]> = bootstrap_nodes
-        .into_iter()
-        .map(|v| {
-            if v.len() != 2 {
-                return Err("每个 bootstrap 节点必须包含 peer_id 和 multiaddr".to_string());
-            }
-            // 验证 multiaddr 格式
-            v[1].parse::<libp2p::Multiaddr>()
-                .map_err(|_| format!("无效的 multiaddr 格式: {}", v[1]))?;
-            Ok([v[0].clone(), v[1].clone()])
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let data_dir = app_data_dir(&state).await;
+    let relay = relay_nodes.into_iter().map(parse_node).collect::<Result<Vec<_>, _>>()?;
+    let bootstrap = bootstrap_nodes.into_iter().map(parse_node).collect::<Result<Vec<_>, _>>()?;
 
     let config = openwire_core::p2p::nodes::NodesConfig {
         relay_nodes: relay,
@@ -723,9 +720,7 @@ async fn save_nodes_config(
 
 #[tauri::command]
 async fn reset_nodes_config(state: tauri::State<'_, AppData>) -> Result<String, String> {
-    let inner = state.inner.read().await;
-    let data_dir = inner.data_dir.clone();
-    drop(inner);
+    let data_dir = app_data_dir(&state).await;
 
     let config = openwire_core::p2p::nodes::NodesConfig::reset_to_default(&data_dir)
         .map_err(|e| format!("重置节点配置失败: {}", e))?;
@@ -748,11 +743,7 @@ async fn is_keyring_available() -> Result<bool, String> {
 /// 查询网络状态（用于前端网络监控组件）
 #[tauri::command]
 async fn get_network_status(state: tauri::State<'_, AppData>) -> Result<String, String> {
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
-    };
-    let Some(cmd_tx) = cmd_tx else {
+    let Ok(cmd_tx) = require_cmd_tx(&state).await else {
         return Ok(openwire_core::NetworkStatusData::error_json(
             openwire_core::NetworkStatusData::ERR_CORE_NOT_INITIALIZED,
             "OpenWire core is not initialized yet",
@@ -769,11 +760,15 @@ async fn get_network_status(state: tauri::State<'_, AppData>) -> Result<String, 
         ));
     }
 
-    match resp_rx.await {
-        Ok(json) => Ok(json),
-        Err(e) => Ok(openwire_core::NetworkStatusData::error_json(
+    match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await {
+        Ok(Ok(json)) => Ok(json),
+        Ok(Err(e)) => Ok(openwire_core::NetworkStatusData::error_json(
             openwire_core::NetworkStatusData::ERR_CORE_NO_RESPONSE,
             &format!("Core did not respond to status query: {}", e),
+        )),
+        Err(_) => Ok(openwire_core::NetworkStatusData::error_json(
+            openwire_core::NetworkStatusData::ERR_CORE_NO_RESPONSE,
+            "Core did not respond to status query within 10s",
         )),
     }
 }
@@ -784,29 +779,29 @@ async fn export_routing_table(
     state: tauri::State<'_, AppData>,
     save_path: String,
 ) -> Result<String, String> {
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
-    };
+    let cmd_tx = require_cmd_tx(&state).await?;
 
     let raw_path = std::path::PathBuf::from(&save_path);
-    // 先创建父目录，确保 canonicalize 能成功
-    if let Some(parent) = raw_path.parent() {
+    // 先校验敏感路径，再创建父目录（防御顺序：校验在文件系统变更之前）
+    let resolved = reject_sensitive_path(&raw_path)?;
+    if let Some(parent) = resolved.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
     }
-    let resolved = reject_sensitive_path(&raw_path)?;
 
-    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .try_send(openwire_core::ChatCommand::ExportRoutingTable { resp: resp_tx })
         .map_err(|e| format!("发送导出命令失败: {}", e))?;
 
-    let json = resp_rx
-        .await
-        .map_err(|_| "核心未响应导出请求".to_string())?;
+    let json = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        resp_rx,
+    )
+    .await
+    .map_err(|_| "核心响应导出请求超时".to_string())?
+    .map_err(|_| "核心未响应导出请求".to_string())?;
 
     std::fs::write(&resolved, &json).map_err(|e| format!("写入导出文件失败: {}", e))?;
     tracing::info!("路由表已导出到 {:?} ({} bytes)", resolved, json.len());
@@ -823,19 +818,16 @@ async fn import_routing_table(
         return Err("路由表文件过大".to_string());
     }
 
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
-    };
-    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    let cmd_tx = require_cmd_tx(&state).await?;
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .try_send(openwire_core::ChatCommand::ImportRoutingTable { data, resp: resp_tx })
         .map_err(|e| format!("发送导入命令失败: {}", e))?;
 
-    resp_rx
+    tokio::time::timeout(std::time::Duration::from_secs(15), resp_rx)
         .await
+        .map_err(|_| "核心响应导入请求超时".to_string())?
         .map_err(|_| "核心未响应导入请求".to_string())
 }
 
@@ -848,6 +840,7 @@ pub struct AppDataInner {
     pub data_dir: PathBuf,
     pub mlkem_pubkey_hex: Option<String>,
     pub core_ready: bool,
+    pub is_quitting: bool,
 }
 
 fn create_placeholder_appdata(data_dir: PathBuf) -> AppData {
@@ -857,6 +850,7 @@ fn create_placeholder_appdata(data_dir: PathBuf) -> AppData {
             data_dir,
             mlkem_pubkey_hex: None,
             core_ready: false,
+            is_quitting: false,
         })),
     }
 }
@@ -945,84 +939,41 @@ async fn setup_core_and_event_loop(
                     .emit("contact-online-status", payload.to_string())
                     .ok();
             }
+            MessageEvent::IdentityChanged { mlkem_pubkey_hex } => {
+                let app_data = app_handle_for_events.state::<AppData>();
+                let mut inner = app_data.inner.write().await;
+                inner.mlkem_pubkey_hex = mlkem_pubkey_hex;
+            }
         }
     }
 }
 
+/// 应用恢复到前台时调用：重新发现所有联系人并拨号，避免对方因连接超时标记离线。
+/// 可在此处扩展后续需要的后台恢复逻辑（刷新路由表、重置定时器等）。
 #[tauri::command]
-async fn copy_file(state: tauri::State<'_, AppData>, src: String, dst: String) -> Result<(), String> {
-    let data_dir = {
-        let inner = state.inner.read().await;
-        inner.data_dir.clone()
+async fn on_foreground(state: tauri::State<'_, AppData>) -> Result<(), String> {
+    let Some(owner_identity_id) = current_identity().await? else {
+        return Ok(());
     };
-    let data_canon = data_dir.canonicalize().map_err(|e| format!("data dir unavailable: {e}"))?;
-    let src_path = std::path::PathBuf::from(&src);
-    let src_canon = src_path.canonicalize().map_err(|e| format!("source file not found: {e}"))?;
-    let ext = src_canon.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") {
-        return Err(format!("unsupported source file type: .{ext}"));
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let contacts = storage::list_contacts(pool, &owner_identity_id)
+        .await
+        .map_err(|e| format!("加载联系人失败: {e}"))?;
+    let cmd_tx = require_cmd_tx(&state).await?;
+    for contact in &contacts {
+        let tx = cmd_tx.clone();
+        let mldsa_pubkey_hex = contact.mldsa_pubkey_hex.clone();
+        let name = contact.name.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(ChatCommand::DiscoverContact {
+                    mldsa_pubkey_hex,
+                    name,
+                })
+                .await;
+        });
     }
-    let dst_path = std::path::PathBuf::from(&dst);
-    let parent = dst_path.parent().ok_or("no parent directory")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("create dir failed: {e}"))?;
-    let parent_canon = parent.canonicalize().map_err(|e| format!("destination dir unavailable: {e}"))?;
-    if !parent_canon.starts_with(&data_canon) {
-        return Err("destination path outside app data directory".into());
-    }
-    // 用父目录 canonical + 文件名构造目标路径。
-    // 不能直接对 dst_path.canonicalize()：目标文件尚不存在时会失败。
-    let file_name = dst_path
-        .file_name()
-        .ok_or("invalid destination filename")?;
-    let dst_canon = parent_canon.join(file_name);
-    if !dst_canon.starts_with(&data_canon) {
-        return Err("destination path outside app data directory after resolution".into());
-    }
-    // 文件复制，最多重试 3 次（Windows 下目标文件可能被短暂占用）
-    let mut last_err = None;
-    for attempt in 0..3 {
-        match std::fs::copy(&src_canon, &dst_canon) {
-            Ok(_) => {
-                // 复制成功后清理同目录下其他 background* 文件，防止堆积
-                cleanup_old_backgrounds(&parent_canon, &dst_canon);
-                return Ok(());
-            }
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < 2 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-        }
-    }
-    Err(format!(
-        "copy file failed after 3 attempts: {}",
-        last_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into())
-    ))
-}
-
-/// 删除 dir 下除 keep 之外的所有 background* 文件
-fn cleanup_old_backgrounds(dir: &std::path::Path, keep: &std::path::Path) {
-    let keep_name = keep.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if name == keep_name {
-            continue;
-        }
-        if name.starts_with("background") {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    Ok(())
 }
 
 /// 校验路径不指向系统敏感目录（服务端防线，防止绕过对话框/dir-isolation 直接读写系统文件）。
@@ -1052,6 +1003,7 @@ fn reject_sensitive_path(p: &std::path::Path) -> Result<std::path::PathBuf, Stri
         "/.config/gcloud/",
         "/.config/gh/",
         "/.config/github-copilot/",
+        "/.mozilla/firefox/",
         "/.npmrc",
         "/.pypirc",
         "/.netrc",
@@ -1118,14 +1070,13 @@ async fn read_text_file(path: String) -> Result<String, String> {
 /// 设置计费网络检测模式（free / paid / disabled）
 #[tauri::command]
 async fn set_paid_network(state: tauri::State<'_, AppData>, mode: String) -> Result<(), String> {
-    if !["free", "paid", "disabled"].contains(&mode.as_str()) {
-        return Err(format!("未知的计费网络模式: {mode}"));
-    }
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
+    let mode = match mode.as_str() {
+        "free" => openwire_core::PaidNetworkMode::Free,
+        "paid" => openwire_core::PaidNetworkMode::Metered,
+        "disabled" => openwire_core::PaidNetworkMode::Disabled,
+        _ => return Err(format!("未知的计费网络模式: {mode}")),
     };
-    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    let cmd_tx = require_cmd_tx(&state).await?;
     cmd_tx
         .try_send(openwire_core::ChatCommand::SetPaidNetworkMode(mode))
         .map_err(|e| format!("发送命令失败: {}", e))?;
@@ -1141,11 +1092,7 @@ async fn dial_peer(state: tauri::State<'_, AppData>, peer_id: String, addr: Stri
     let multiaddr: libp2p::Multiaddr = addr
         .parse()
         .map_err(|_| "无效的 Multiaddr".to_string())?;
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
-    };
-    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    let cmd_tx = require_cmd_tx(&state).await?;
     cmd_tx
         .try_send(openwire_core::ChatCommand::DialPeer {
             peer_id: peer_id.to_string(),
@@ -1158,14 +1105,13 @@ async fn dial_peer(state: tauri::State<'_, AppData>, peer_id: String, addr: Stri
 /// 设置中继角色（server / client / off，互斥）
 #[tauri::command]
 async fn set_relay_role(state: tauri::State<'_, AppData>, role: String) -> Result<(), String> {
-    if !["server", "client", "off"].contains(&role.as_str()) {
-        return Err(format!("未知的中继角色: {role}"));
-    }
-    let cmd_tx = {
-        let inner = state.inner.read().await;
-        inner.cmd_tx.clone()
+    let role = match role.as_str() {
+        "server" => openwire_core::RelayRole::Server,
+        "client" => openwire_core::RelayRole::Client,
+        "off" => openwire_core::RelayRole::Off,
+        _ => return Err(format!("未知的中继角色: {role}")),
     };
-    let cmd_tx = cmd_tx.ok_or_else(|| "核心尚未初始化".to_string())?;
+    let cmd_tx = require_cmd_tx(&state).await?;
     cmd_tx
         .try_send(openwire_core::ChatCommand::SetRelayRole(role))
         .map_err(|e| format!("发送命令失败: {}", e))?;
@@ -1183,6 +1129,21 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if cfg!(desktop) {
+                    let is_quitting = window
+                        .try_state::<AppData>()
+                        .map(|data| data.inner.blocking_read().is_quitting)
+                        .unwrap_or(false);
+                    if is_quitting {
+                        return;
+                    }
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .setup(|app| {
             let apphandle = app.handle().clone();
 
@@ -1240,6 +1201,67 @@ pub fn run() {
                 }
             });
 
+            // 系统托盘（仅桌面端）
+            #[cfg(desktop)]
+            {
+                use tauri::tray::TrayIconBuilder;
+                use tauri::menu::{MenuBuilder, MenuItemBuilder};
+
+                let show_item = MenuItemBuilder::with_id("show", "显示窗口").build(app)?;
+                let quit_item = MenuItemBuilder::with_id("quit", "彻底退出").build(app)?;
+                let menu = MenuBuilder::new(app)
+                    .item(&show_item)
+                    .separator()
+                    .item(&quit_item)
+                    .build()?;
+
+                TrayIconBuilder::new()
+                    .icon(app.default_window_icon().expect("default_window_icon must be set in tauri.conf.json").clone())
+                    .tooltip("OpenWire")
+                    .menu(&menu)
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, .. } = event {
+                            if let Some(window) = tray.app_handle().get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    })
+                    .on_menu_event(|app, event| {
+                        match event.id.as_ref() {
+                            "show" => {
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                            }
+                            "quit" => {
+                                let app = app.clone();
+                                // 标记退出中，让 CloseRequested 跳过 prevent_close，正常关闭窗口
+                                if let Some(data) = app.try_state::<AppData>() {
+                                    data.inner.blocking_write().is_quitting = true;
+                                }
+                                let cmd_tx = app
+                                    .try_state::<AppData>()
+                                    .and_then(|data| data.inner.blocking_read().cmd_tx.clone());
+                                // on_menu_event 是同步回调，不在 Tokio runtime 中，
+                                // 必须用 tauri::async_runtime::spawn 而非 tokio::spawn
+                                tauri::async_runtime::spawn(async move {
+                                    if let Some(cmd_tx) = cmd_tx {
+                                        let _ = cmd_tx.send(openwire_core::ChatCommand::Shutdown).await;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    // 正常关闭窗口，Tauri 在所有窗口关闭后自然退出，避免 app.exit() 的 WebView2 窗口类反注册竞争
+                                    if let Some(window) = app.get_webview_window("main") {
+                                        let _ = window.close();
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                    })
+                    .build(app)?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1252,6 +1274,7 @@ pub fn run() {
             generate_identity,
             add_contact,
             discover_contact,
+            on_foreground,
             request_file_download,
             load_messages,
             get_identity_qr_data,
@@ -1264,7 +1287,6 @@ pub fn run() {
             reset_nodes_config,
             list_sent_files,
             delete_sent_file,
-copy_file,
             get_version,
             get_network_status,
             export_routing_table,

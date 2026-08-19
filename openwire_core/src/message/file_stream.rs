@@ -1,37 +1,17 @@
-use crate::crypto::constant_time_compare;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::{FileTransferError, FileTransferResult};
 
 /// 文件哈希信息（FileHash 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileHashInfo {
-    /// 文件唯一标识（SHA256）
-    pub file_id: [u8; 32],
     /// 原始文件名
     pub filename: String,
     /// 文件总大小（字节）
     pub total_size: u64,
-    /// 完整文件 SHA256
-    pub file_hash: [u8; 32],
-}
-
-/// 文件流元数据（FileStream 消息的 data 载荷）
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FileStreamMeta {
-    /// 文件唯一标识（SHA256）
-    pub file_id: [u8; 32],
-    /// 原始文件名
-    pub filename: String,
-    /// 文件总大小（字节）
-    pub total_size: u64,
-    /// 总分片数
-    pub total_chunks: u32,
-    /// 分片大小（字节）
-    pub chunk_size: u32,
     /// 完整文件 SHA256
     pub file_hash: [u8; 32],
 }
@@ -39,8 +19,6 @@ pub struct FileStreamMeta {
 /// 文件流分片（FileStream 消息的 data 载荷）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileStreamChunk {
-    /// 文件唯一标识（SHA256）
-    pub file_id: [u8; 32],
     /// 原始文件名
     pub filename: String,
     /// 文件总大小（字节）
@@ -61,15 +39,6 @@ pub struct FileStreamChunk {
     pub file_hash: [u8; 32],
     /// 是否为最后一个分片
     pub is_last: bool,
-}
-
-/// 分片接收确认（文件下载请求的响应）
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChunkResponse {
-    /// 文件唯一标识（SHA256）
-    pub file_id: [u8; 32],
-    /// 已接收的分片序号列表（用于断点续传）
-    pub received_chunks: Vec<u32>,
 }
 
 /// 文件下载请求（接收方 → 发送方）
@@ -102,39 +71,10 @@ pub struct DownloadResponse {
 
 impl FileHashInfo {
     /// 创建文件哈希信息
-    pub fn new(filename: String, total_size: u64, file_hash: [u8; 32], file_id: [u8; 32]) -> Self {
+    pub fn new(filename: String, total_size: u64, file_hash: [u8; 32]) -> Self {
         Self {
-            file_id,
             filename,
             total_size,
-            file_hash,
-        }
-    }
-}
-
-// ========== 文件流传输方法 ==========
-
-impl FileStreamMeta {
-    /// 创建文件流元数据
-    pub fn new(
-        filename: String,
-        total_size: u64,
-        chunk_size: u32,
-        file_hash: [u8; 32],
-        file_id: [u8; 32],
-    ) -> Self {
-        let total_chunks = if total_size == 0 {
-            1
-        } else {
-            total_size.div_ceil(chunk_size as u64) as u32
-        };
-
-        Self {
-            file_id,
-            filename,
-            total_size,
-            total_chunks,
-            chunk_size,
             file_hash,
         }
     }
@@ -145,8 +85,6 @@ impl FileStreamMeta {
 /// 将多个元数据参数打包为一个结构体，避免函数参数过多（clippy::too_many_arguments）
 #[derive(Clone, Debug)]
 pub struct ChunkReadConfig {
-    /// 文件唯一标识
-    pub file_id: [u8; 32],
     /// 原始文件名
     pub filename: String,
     /// 文件总大小
@@ -168,7 +106,7 @@ impl FileStreamChunk {
     ///
     /// # 参数
     /// - `file`: 已打开的 tokio 文件句柄
-    /// - `config`: 分片读取配置（包含 file_id, filename, total_size 等元数据）
+    /// - `config`: 分片读取配置（包含 file_hash, filename, total_size 等元数据）
     /// - `compression_level`: zstd 压缩等级
     ///
     /// # 返回
@@ -206,7 +144,6 @@ impl FileStreamChunk {
 
         Ok((
             Self {
-                file_id: config.file_id,
                 filename: config.filename.clone(),
                 total_size: config.total_size,
                 total_chunks: config.total_chunks,
@@ -222,44 +159,4 @@ impl FileStreamChunk {
         ))
     }
 
-    /// 解压缩分片数据并写入文件
-    ///
-    /// # 参数
-    /// - `file`: 已打开的 tokio 文件句柄（可写）
-    /// - `expected_file_id`: 期望的 file_id，用于校验
-    ///
-    /// # 返回
-    /// 写入的字节数
-    pub async fn decompress_to_file(
-        &self,
-        file: &mut File,
-        expected_file_id: &[u8; 32],
-    ) -> FileTransferResult<usize> {
-        // 校验 file_id
-        if &self.file_id != expected_file_id {
-            return Err(FileTransferError::FileIdMismatch {
-                expected: *expected_file_id,
-                got: self.file_id,
-            });
-        }
-
-        // 解压缩
-        let decompressed = crate::compression::decompress(&self.chunk_data).await?;
-
-        // 校验分片哈希
-        let computed_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(&decompressed);
-            hasher.finalize()
-        };
-        if !constant_time_compare(&computed_hash, &self.chunk_hash) {
-            return Err(FileTransferError::ChunkHashMismatch(self.chunk_index));
-        }
-
-        // 定位到指定偏移量并写入
-        file.seek(std::io::SeekFrom::Start(self.offset)).await?;
-        file.write_all(&decompressed).await?;
-
-        Ok(decompressed.len())
     }
-}

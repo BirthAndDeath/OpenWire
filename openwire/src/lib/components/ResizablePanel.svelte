@@ -1,10 +1,11 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   let {
     min = 200,
     max = 500,
     defaultSize = 300,
-    bind:size = $bindable(defaultSize),
-    position = 'left' as 'left' | 'right' | 'top' | 'bottom',
+    size = $bindable(defaultSize),
+    position = 'left' as 'left' | 'top' | 'bottom',
     mobileHidden = false,
     children,
   }: {
@@ -12,9 +13,9 @@
     max?: number;
     defaultSize?: number;
     size?: number;
-    position?: 'left' | 'right' | 'top' | 'bottom';
+    position?: 'left' | 'top' | 'bottom';
     mobileHidden?: boolean;
-    children?: any;
+    children?: Snippet;
   } = $props();
 
   let dragging = $state(false);
@@ -28,7 +29,7 @@
 
   function onDrag(e: MouseEvent | TouchEvent) {
     const { x, y } = getClientXY(e);
-    const isHorizontal = position === 'left' || position === 'right';
+    const isHorizontal = position === 'left';
     const isBottom = position === 'bottom';
     const val = isHorizontal
       ? Math.max(min, Math.min(max, x))
@@ -55,12 +56,12 @@
 </script>
 
 {#if !mobileHidden}
-  {#if position === 'left' || position === 'right'}
+  {#if position === 'left'}
     <div class="panel panel-h" style="--size: {size}px" class:dragging>
       {@render children?.()}
       <button
         class="resizer"
-        style="{position === 'left' ? 'right' : 'left'}: calc(var(--resizer-size) / -2)"
+        style="right: calc(var(--resizer-size) / -2)"
         onmousedown={onDown}
         ontouchstart={onDown}
         aria-label="调整面板宽度"

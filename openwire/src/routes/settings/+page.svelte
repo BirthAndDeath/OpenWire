@@ -1,33 +1,25 @@
 <script lang="ts">
   import "../../lib/i18n";
-  import { _, locale } from "svelte-i18n";
+  import { _ } from "svelte-i18n";
   import { goto } from "$app/navigation";
   import { theme, setTheme } from "../../lib/theme";
-  import { language, setLanguage } from "../../lib/language";
+  import { language, setLanguage, SUPPORTED_LANGUAGES_WITH_NAMES } from "../../lib/language";
   import {
     getSetting,
     setSetting,
     initSettingsStore,
     screenshotProtectionStore,
-    chatBackgroundStore,
-    chatBackgroundVersion,
     fontSizeScale,
   } from "../../lib/settings";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
-import { join, appDataDir } from "@tauri-apps/api/path";
-import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
-
-  // 语言选项
-  const languages = [
-    { code: "en", name: "English" },
-    { code: "zh", name: "中文" },
-    { code: "fr", name: "Français" },
-    { code: "es", name: "Español" },
-    { code: "de", name: "Deutsch" },
-    { code: "ja", name: "日本語" },
-  ];
+  import { invoke } from "@tauri-apps/api/core";
+  import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
+  import {
+    BG_MARKER,
+    loadBackgroundBlob,
+    saveBackgroundBlob,
+    clearBackground,
+  } from "../../lib/background";
 
   // 主题选项（使用 $derived 响应语言切换）
   let themes = $derived([
@@ -41,13 +33,10 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
   // 截屏保护
   let screenshotProtection = $state(false);
 
-  // 聊天背景图
-  let chatBackgroundPath = $state("");
-  let chatBackgroundUrl = $derived(
-    chatBackgroundPath
-      ? `${convertFileSrc(chatBackgroundPath)}?v=${$chatBackgroundVersion}`
-      : ""
-  );
+  // 聊天背景图（统一 IndexedDB 存储，预览用 objectURL）
+  let chatBackgroundUrl = $state("");
+  let bgObjectUrl: string | null = null;
+  let bgFileInput: HTMLInputElement | undefined = $state();
 
   // 字号缩放
   let fontSize = $state(1.0);
@@ -91,6 +80,14 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
     };
   });
 
+  // 组件销毁时释放背景预览 objectURL，防止泄漏
+  $effect(() => {
+    return () => {
+      if (bgObjectUrl?.startsWith("blob:")) URL.revokeObjectURL(bgObjectUrl);
+      bgObjectUrl = null;
+    };
+  });
+
   // 加载设置
   $effect(() => {
     async function loadSettings() {
@@ -120,12 +117,15 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
         console.error("获取截屏保护设置失败:", e);
       }
 
-      // 获取聊天背景图设置
+      // 获取聊天背景图设置（IndexedDB Blob → 预览 objectURL）
       try {
         const saved = await getSetting<string>("chat_background");
-        if (saved) {
-          chatBackgroundPath = saved;
-          chatBackgroundStore.set(saved);
+        if (saved === BG_MARKER) {
+          const blob = await loadBackgroundBlob();
+          if (blob) {
+            chatBackgroundUrl = URL.createObjectURL(blob);
+            bgObjectUrl = chatBackgroundUrl;
+          }
         }
       } catch (e) {
         console.error("获取聊天背景设置失败:", e);
@@ -269,49 +269,40 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
     await setLanguage(lang);
   }
 
-  // 选择聊天背景图
+  // 选择聊天背景图（全平台统一：WebView 文件输入 + IndexedDB 保存）
   async function pickBackground() {
+    bgFileInput?.click();
+  }
+
+  // 文件选择完成：即时预览 + 存储
+  async function onBgFileSelected(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
     try {
-      const selected = await open({
-        multiple: false,
-        filters: [
-          {
-            name: "图片",
-            extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"],
-          },
-        ],
-      });
-      if (selected) {
-        const appData = await appDataDir();
-        const srcName = selected.split(/[/\\]/).pop()!;
-        const ext = srcName.lastIndexOf(".") >= 0 ? srcName.slice(srcName.lastIndexOf(".")) : "";
-        // 唯一文件名（时间戳）：目标路径每次变化，确保 WebView 不因同路径缓存显示旧图
-        const dest = await join(appData, "backgrounds", `background-${Date.now()}${ext}`);
-        try {
-          await invoke("copy_file", { src: selected, dst: dest });
-          chatBackgroundPath = dest;
-          chatBackgroundStore.set(dest);
-          chatBackgroundVersion.update((v) => v + 1);
-          await setSetting("chat_background", dest);
-        } catch (e) {
-          console.error("背景图复制失败:", e);
-          chatBackgroundPath = "";
-          chatBackgroundStore.set("");
-          chatBackgroundVersion.update((v) => v + 1);
-          await setSetting("chat_background", "");
-        }
-      }
-    } catch (e) {
-      console.error("选择背景图失败:", e);
+      if (bgObjectUrl?.startsWith("blob:")) URL.revokeObjectURL(bgObjectUrl);
+      // 异步读取文件字节到新 Blob，确保预览不受 input 重置影响
+      const buffer = await file.arrayBuffer();
+      const blob = new Blob([buffer], { type: file.type });
+      chatBackgroundUrl = URL.createObjectURL(blob);
+      bgObjectUrl = chatBackgroundUrl;
+      await saveBackgroundBlob(blob);
+    } catch (err) {
+      console.error("背景图保存失败:", err);
+      if (bgObjectUrl?.startsWith("blob:")) URL.revokeObjectURL(bgObjectUrl);
+      bgObjectUrl = null;
+      chatBackgroundUrl = "";
+      await clearBackground();
     }
   }
 
   // 移除聊天背景图
   async function removeBackground() {
-    chatBackgroundPath = "";
-    chatBackgroundStore.set("");
-    chatBackgroundVersion.update((v) => v + 1);
-    await setSetting("chat_background", "");
+    if (bgObjectUrl?.startsWith("blob:")) URL.revokeObjectURL(bgObjectUrl);
+    bgObjectUrl = null;
+    chatBackgroundUrl = "";
+    await clearBackground();
   }
 
   // 改变字号
@@ -366,7 +357,7 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
             onchange={(e) =>
               changeLanguage((e.target as HTMLSelectElement).value)}
           >
-            {#each languages as lang}
+            {#each SUPPORTED_LANGUAGES_WITH_NAMES as lang}
               <option value={lang.code}>{lang.name}</option>
             {/each}
           </select>
@@ -442,7 +433,7 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
           {#if chatBackgroundUrl}
             <div
               class="bg-preview"
-              style="background-image: url({chatBackgroundUrl})"
+              style:background-image={chatBackgroundUrl ? `url(${chatBackgroundUrl})` : undefined}
             ></div>
           {:else}
             <div class="bg-preview bg-preview-empty">
@@ -450,10 +441,17 @@ import NetworkMonitor from "../../lib/components/NetworkMonitor.svelte";
             </div>
           {/if}
           <div class="bg-actions">
+            <input
+              type="file"
+              accept="image/*"
+              hidden
+              bind:this={bgFileInput}
+              onchange={onBgFileSelected}
+            />
             <button class="bg-pick-btn" onclick={pickBackground}>
               {$_("select_background")}
             </button>
-            {#if chatBackgroundPath}
+            {#if chatBackgroundUrl}
               <button class="bg-remove-btn" onclick={removeBackground}>
                 {$_("remove_background")}
               </button>

@@ -2,8 +2,18 @@ import { writable } from 'svelte/store';
 import { initSettingsStore, getSetting, setSetting } from './settings';
 import { locale } from 'svelte-i18n';
 
-// 支持的语言列表
-export const SUPPORTED_LANGUAGES = ['en', 'zh', 'fr', 'es', 'de', 'ja'];
+// 支持的语言列表（代码 + 显示名称）
+export const SUPPORTED_LANGUAGES_WITH_NAMES = [
+  { code: 'en', name: 'English' },
+  { code: 'zh', name: '中文' },
+  { code: 'fr', name: 'Français' },
+  { code: 'es', name: 'Español' },
+  { code: 'de', name: 'Deutsch' },
+  { code: 'ja', name: '日本語' },
+];
+
+// 支持的语言代码列表（由 WITH_NAMES 派生，单一数据源）
+export const SUPPORTED_LANGUAGES = SUPPORTED_LANGUAGES_WITH_NAMES.map((l) => l.code);
 
 // 创建可写的语言 store，默认值为 'en'
 const languageStore = writable<string>('en');

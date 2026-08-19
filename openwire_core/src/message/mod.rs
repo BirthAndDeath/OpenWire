@@ -7,8 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 文件流子模块
 pub mod file_stream;
 pub use file_stream::{
-    ChunkReadConfig, ChunkResponse, DownloadRequest, DownloadResponse, FileHashInfo,
-    FileStreamChunk, FileStreamMeta,
+    ChunkReadConfig, DownloadRequest, DownloadResponse, FileHashInfo, FileStreamChunk,
 };
 
 /// 消息最大允许年龄（秒）
@@ -21,6 +20,8 @@ const MESSAGE_FUTURE_TOLERANCE_SECS: u64 = 60;
 #[repr(u8)]
 #[non_exhaustive]
 pub enum ChatMessageType {
+    /// 未知类型（仅用于数据库哨兵，表示未初始化，不参与协议）
+    Unknown = 255,
     /// 文本消息
     Text = 0,
     /// 文件哈希分享
@@ -49,6 +50,7 @@ impl TryFrom<i32> for ChatMessageType {
             4 => Ok(Self::DeliveryReceipt),
             5 => Ok(Self::OnlineStatus),
             6 => Ok(Self::FileDownloadResponse),
+            255 => Ok(Self::Unknown),
             _ => Err(()),
         }
     }
@@ -205,34 +207,68 @@ impl ChatMessage {
     pub fn verify(&self) -> crate::error::MessageResult<bool> {
         // 1. 验证消息新鲜度 (防止重放攻击的一部分)
         if !self.is_fresh() {
+            let now = SystemTime::now();
+            let message_time = UNIX_EPOCH + Duration::from_millis(self.timestamp);
+            tracing::debug!(
+                "verify: freshness failed. now_ms={}, msg_timestamp={}, msg_time={:?}, future_tolerance_secs={}",
+                now.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                self.timestamp,
+                message_time.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0),
+                MESSAGE_FUTURE_TOLERANCE_SECS
+            );
             return Ok(false);
         }
 
         // 2. 验证数据完整性 (Hash)
         let computed = Self::compute_hash(self.msgtype, self.timestamp, &self.nonce, &self.data);
         if !constant_time_compare(&computed, &self.hash) {
+            tracing::debug!(
+                "verify: hash mismatch. computed={}.. stored={}.. data_len={}",
+                &hex::encode(&computed)[..16.min(hex::encode(&computed).len())],
+                &hex::encode(&self.hash)[..16.min(hex::encode(&self.hash).len())],
+                self.data.len()
+            );
             return Ok(false);
         }
 
         // 3. 验证 ML-DSA 签名
-        crate::signature::verify_signature(&self.sender_public_key, &computed, &self.signature)
-            .map_err(|e| {
-                crate::error::MessageError::VerifyFailed(Box::new(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })
+        match crate::signature::verify_signature(&self.sender_public_key, &computed, &self.signature)
+        {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                tracing::debug!(
+                    "verify: signature invalid. pubkey_len={}, sig_len={}, data_len={}",
+                    self.sender_public_key.len(),
+                    self.signature.len(),
+                    self.data.len()
+                );
+                Ok(false)
+            }
+            Err(e) => Err(crate::error::MessageError::VerifyFailed(Box::new(
+                std::io::Error::other(e.to_string()),
+            ))),
+        }
     }
 
-    /// 检查消息是否在有效时间窗口内（防止重放攻击）
-    pub fn is_fresh(&self) -> bool {
+/// 检查消息是否在有效时间窗口内（防止重放攻击）
+///
+/// 规则：
+/// - 消息来自过去：年龄 ≤ `MESSAGE_MAX_AGE_SECS`
+/// - 消息来自未来：超前量 ≤ `MESSAGE_FUTURE_TOLERANCE_SECS`（容忍 60 秒以内时钟偏差）
+pub fn is_fresh(&self) -> bool {
         let now = SystemTime::now();
         let message_time = UNIX_EPOCH + Duration::from_millis(self.timestamp);
-        if message_time > now + Duration::from_secs(MESSAGE_FUTURE_TOLERANCE_SECS) {
-            return false;
-        }
         match now.duration_since(message_time) {
+            // 消息来自过去：检查最大年龄
             Ok(age) => age <= Duration::from_secs(MESSAGE_MAX_AGE_SECS),
-            Err(_) => false,
+            // 消息来自未来（本机时钟偏慢或对方时钟偏快）：仅在容差范围内通过
+            Err(_) => {
+                if let Ok(future) = message_time.duration_since(now) {
+                    future <= Duration::from_secs(MESSAGE_FUTURE_TOLERANCE_SECS)
+                } else {
+                    false
+                }
+            }
         }
     }
 }

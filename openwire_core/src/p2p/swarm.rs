@@ -176,7 +176,6 @@ pub fn swarm_init(
                 let autonat =
                     autonat::Behaviour::new(key.public().to_peer_id(), Default::default());
                 let upnp = libp2p::upnp::tokio::Behaviour::default();
-                #[cfg(feature = "pathranker")]
                 let pathranker = libp2p_pathranker::PathRankerBehaviour::new(key.clone());
                 Ok(MyBehaviour {
                     autonat,
@@ -192,7 +191,6 @@ pub fn swarm_init(
                     dcutr,
                     limits,
                     memory_limits,
-                    #[cfg(feature = "pathranker")]
                     pathranker,
                 })
             })
@@ -216,82 +214,16 @@ pub fn swarm_init(
 
     // 各地址族独立尝试监听，失败仅记录日志，不中断初始化。
     // 前端网络监控通过监听地址列表展示实际可用的 IPv4/IPv6。
-    if let Err(e) = try_listen_or_fallback(
-        &mut swarm,
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Udp(quic_port))
-            .with(Protocol::QuicV1),
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Udp(0))
-            .with(Protocol::QuicV1),
-    ) {
-        tracing::warn!("IPv4 QUIC listen failed: {e}");
-    }
-    if let Err(e) = try_listen_or_fallback(
-        &mut swarm,
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Udp(quic_port))
-            .with(Protocol::QuicV1),
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Udp(0))
-            .with(Protocol::QuicV1),
-    ) {
-        tracing::warn!("IPv6 QUIC listen failed: {e}");
-    }
-    if let Err(e) = try_listen_or_fallback(
-        &mut swarm,
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(tcp_port)),
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(0)),
-    ) {
-        tracing::warn!("IPv4 TCP listen failed: {e}");
-    }
-    if let Err(e) = try_listen_or_fallback(
-        &mut swarm,
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(tcp_port)),
-        Multiaddr::empty()
-            .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-            .with(Protocol::Tcp(0)),
-    ) {
-        tracing::warn!("IPv6 TCP listen failed: {e}");
-    }
+    // 回退地址（端口 0 由 OS 分配）由 listen_family 自动派生。
+    listen_family(&mut swarm, Ipv4Addr::UNSPECIFIED, &[Protocol::Udp(quic_port), Protocol::QuicV1], "IPv4 QUIC");
+    listen_family(&mut swarm, Ipv6Addr::UNSPECIFIED, &[Protocol::Udp(quic_port), Protocol::QuicV1], "IPv6 QUIC");
+    listen_family(&mut swarm, Ipv4Addr::UNSPECIFIED, &[Protocol::Tcp(tcp_port)], "IPv4 TCP");
+    listen_family(&mut swarm, Ipv6Addr::UNSPECIFIED, &[Protocol::Tcp(tcp_port)], "IPv6 TCP");
     #[cfg(not(target_os = "android"))]
     {
-        if let Err(e) = try_listen_or_fallback(
-            &mut swarm,
-            Multiaddr::empty()
-                .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(_ws_port))
-                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-            Multiaddr::empty()
-                .with(Protocol::from(Ipv4Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(0))
-                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-        ) {
-            tracing::warn!("IPv4 WebSocket listen failed: {e}");
-        }
-        if let Err(e) = try_listen_or_fallback(
-            &mut swarm,
-            Multiaddr::empty()
-                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(_ws_port))
-                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-            Multiaddr::empty()
-                .with(Protocol::from(Ipv6Addr::UNSPECIFIED))
-                .with(Protocol::Tcp(0))
-                .with(Protocol::Ws(std::borrow::Cow::Borrowed(""))),
-        ) {
-            tracing::warn!("IPv6 WebSocket listen failed: {e}");
-        }
+        let ws = Protocol::Ws(std::borrow::Cow::Borrowed(""));
+        listen_family(&mut swarm, Ipv4Addr::UNSPECIFIED, &[Protocol::Tcp(_ws_port), ws.clone()], "IPv4 WebSocket");
+        listen_family(&mut swarm, Ipv6Addr::UNSPECIFIED, &[Protocol::Tcp(_ws_port), ws], "IPv6 WebSocket");
     } // relay 节点拨号由 P2pActor 在 AutoNAT 确定 NAT 状态后按需进行
 
     Ok(swarm)
@@ -309,13 +241,12 @@ fn create_kademlia(
     })?;
     let parallelism = NonZero::new(KAD_PARALLELISM)
         .ok_or_else(|| P2pError::SwarmInitFailed("KAD_PARALLELISM must be non-zero".into()))?;
-    let _ = &mut config
-        .set_query_timeout(Duration::from_secs(KAD_QUERY_TIMEOUT_SECS))
-        .set_replication_factor(replication_factor)
-        .set_parallelism(parallelism)
-        .set_periodic_bootstrap_interval(Some(Duration::from_secs(KAD_BOOTSTRAP_INTERVAL_SECS)))
-        .set_provider_record_ttl(Some(Duration::from_secs(KAD_PROVIDER_TTL_SECS)))
-        .set_publication_interval(Some(Duration::from_secs(KAD_PUBLICATION_INTERVAL_SECS)));
+    config.set_query_timeout(Duration::from_secs(KAD_QUERY_TIMEOUT_SECS))
+    .set_replication_factor(replication_factor)
+    .set_parallelism(parallelism)
+    .set_periodic_bootstrap_interval(Some(Duration::from_secs(KAD_BOOTSTRAP_INTERVAL_SECS)))
+    .set_provider_record_ttl(Some(Duration::from_secs(KAD_PROVIDER_TTL_SECS)))
+    .set_publication_interval(Some(Duration::from_secs(KAD_PUBLICATION_INTERVAL_SECS)));
 
     let mut kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
     kademlia.set_mode(Some(Mode::Client));
@@ -565,4 +496,44 @@ fn try_listen_or_fallback(
         .listen_on(fallback)
         .map_err(|e| P2pError::SwarmInitFailed(format!("Failed to listen: {}", e).into()))?;
     Ok(())
+}
+
+/// 构建监听地址：IP 族 + 传输协议链
+fn listen_addr<I>(ip: I, transport: &[Protocol<'static>]) -> Multiaddr
+where
+    I: Copy,
+    Protocol<'static>: From<I>,
+{
+    let mut addr = Multiaddr::empty().with(Protocol::from(ip));
+    for p in transport {
+        addr.push(p.clone());
+    }
+    addr
+}
+
+/// 尝试监听指定 IP 族 + 传输协议链，失败仅记录日志，不中断初始化。
+///
+/// 回退地址由协议链中的端口协议自动派生为端口 0（OS 分配）。
+fn listen_family<I>(
+    swarm: &mut Swarm<MyBehaviour>,
+    ip: I,
+    transport: &[Protocol<'static>],
+    label: &str,
+) where
+    I: Copy,
+    Protocol<'static>: From<I>,
+{
+    let preferred = listen_addr(ip, transport);
+    let fallback: Vec<Protocol<'static>> = transport
+        .iter()
+        .map(|p| match p {
+            Protocol::Udp(_) => Protocol::Udp(0),
+            Protocol::Tcp(_) => Protocol::Tcp(0),
+            other => other.clone(),
+        })
+        .collect();
+    let fallback = listen_addr(ip, &fallback);
+    if let Err(e) = try_listen_or_fallback(swarm, preferred, fallback) {
+        tracing::warn!("{label} listen failed: {e}");
+    }
 }

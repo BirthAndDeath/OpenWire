@@ -14,12 +14,7 @@ export async function initSettingsStore(): Promise<Store> {
   return globalStore;
 }
 
-/**
- * 获取全局 Store 实例
- */
-export function getSettingsStore(): Store | null {
-  return globalStore;
-}
+
 
 /**
  * 通用的设置读取方法
@@ -66,12 +61,6 @@ export const screenshotProtectionStore = writable<boolean>(false);
  * 用于在组件间共享背景图状态（如 +layout.svelte 和 settings 页面）
  */
 export const chatBackgroundStore = writable<string>("");
-
-/**
- * 聊天背景图版本号，每次选择/移除背景时递增
- * 用于作为 URL 缓存破坏参数，确保 WebView 不缓存旧背景
- */
-export const chatBackgroundVersion = writable<number>(0);
 
 /**
  * 聊天消息字号缩放比例（0.5 ~ 2.0，默认 1.00）

@@ -16,7 +16,7 @@
 //! - **文件流压缩**：`compress_file()` / `decompress_file()` 用于大文件，流式处理避免内存溢出
 
 use async_compression::futures::bufread::{ZstdDecoder, ZstdEncoder};
-use futures::io::BufReader;
+use futures::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use std::path::Path;
 use tokio::fs::File;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -180,10 +180,31 @@ pub async fn decompress_file(
     // 将 tokio AsyncWrite 转换为 futures AsyncWrite
     let mut writer = output_file.compat_write();
 
-    // 使用 futures::io::copy 进行流式复制（自动解压）
-    futures::io::copy(&mut decoder, &mut writer)
-        .await
-        .map_err(crate::error::CompressionError::DecompressFailed)?;
+    // 流式解压并限制输出大小：`DECOMPRESS_MAX_SIZE` 仍适用于磁盘输出，
+    // 防止恶意 zstd 炸弹填满磁盘。超限时删除已写入的部分。
+    let mut total: usize = 0;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .await
+            .map_err(crate::error::CompressionError::DecompressFailed)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+        if total > DECOMPRESS_MAX_SIZE {
+            // 先关闭输出句柄再删除，否则 Windows 上删除打开中的文件会静默失败
+            drop(writer);
+            drop(decoder);
+            let _ = std::fs::remove_file(output_path);
+            return Err(crate::error::CompressionError::DecompressedDataTooLarge(total));
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(crate::error::CompressionError::DecompressFailed)?;
+    }
 
     Ok(())
 }

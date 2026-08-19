@@ -18,14 +18,6 @@ pub struct SentFile {
     pub sent_at: i64,
 }
 
-#[allow(dead_code)]
-fn feature_err<T>() -> StorageResult<T> {
-    Err(crate::error::StorageError::FeatureNotEnabled(
-        "sqlite_history_storage",
-    ))
-}
-
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn add_sent_file(
     pool: &Pool<Sqlite>,
     file_hash: &[u8],
@@ -44,18 +36,7 @@ pub async fn add_sent_file(
     .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn add_sent_file(
-    _pool: &Pool<Sqlite>,
-    _file_hash: &[u8],
-    _file_path: &str,
-    _filename: &str,
-    _total_size: u64,
-) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn get_sent_file(
     pool: &Pool<Sqlite>,
     file_hash: &[u8],
@@ -68,15 +49,7 @@ pub async fn get_sent_file(
     .await
     .map_err(Into::into)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_sent_file(
-    _pool: &Pool<Sqlite>,
-    _file_hash: &[u8],
-) -> StorageResult<Option<SentFile>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn list_all_sent_files(pool: &Pool<Sqlite>) -> StorageResult<Vec<SentFile>> {
     sqlx::query_as::<_, SentFile>(
         "SELECT file_hash, file_path, filename, total_size, sent_at FROM sent_files",
@@ -85,12 +58,7 @@ pub async fn list_all_sent_files(pool: &Pool<Sqlite>) -> StorageResult<Vec<SentF
     .await
     .map_err(Into::into)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn list_all_sent_files(_pool: &Pool<Sqlite>) -> StorageResult<Vec<SentFile>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn delete_sent_file(pool: &Pool<Sqlite>, file_hash: &[u8]) -> StorageResult<()> {
     let result = sqlx::query("DELETE FROM sent_files WHERE file_hash = ?1")
         .bind(file_hash)
@@ -104,14 +72,9 @@ pub async fn delete_sent_file(pool: &Pool<Sqlite>, file_hash: &[u8]) -> StorageR
     }
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn delete_sent_file(_pool: &Pool<Sqlite>, _file_hash: &[u8]) -> StorageResult<()> {
-    feature_err()
-}
 
 const VERIFY_HASH_SIZE_LIMIT: u64 = 10 * 1024 * 1024;
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn verify_sent_file(
     sent: &SentFile,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -129,10 +92,4 @@ pub async fn verify_sent_file(
     } else {
         Ok(true)
     }
-}
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn verify_sent_file(
-    _sent: &SentFile,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    Err("sqlite_history_storage feature is not enabled".into())
 }

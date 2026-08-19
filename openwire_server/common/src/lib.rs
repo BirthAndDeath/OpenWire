@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZero;
 use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +27,21 @@ const PROTOCOL_NETEVENT: StreamProtocol = StreamProtocol::new("/chat/rr_netevent
 
 /// 中继信息输出文件：PeerId 与监听地址，供运维复制到客户端 nodes.json
 const RELAY_INFO_FILE: &str = "relay-info.json";
+const PORT_PREFERENCE_FILE: &str = "port-preference.txt";
+
+/// 端口偏好持久化：保存上次使用的端口，重启后优先使用。
+/// CLI 参数 > 持久化端口 > 默认 44909。
+fn load_port_preference(dir: &Path) -> Option<u16> {
+    let path = dir.join(PORT_PREFERENCE_FILE);
+    std::fs::read_to_string(&path).ok()?.trim().parse().ok()
+}
+
+fn save_port_preference(dir: &Path, port: u16) {
+    let path = dir.join(PORT_PREFERENCE_FILE);
+    if let Err(e) = std::fs::write(&path, port.to_string()) {
+        tracing::warn!("Failed to save port preference: {e}");
+    }
+}
 
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
@@ -71,15 +87,26 @@ fn load_keypair(path: &Path) -> anyhow::Result<identity::Keypair> {
     Ok(kp)
 }
 
-pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
-    let dir = dir.unwrap_or_else(|| Path::new(".openwire-relay"));
-    std::fs::create_dir_all(dir)?;
+pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> {
+    let dir: PathBuf = dir.unwrap_or_else(|| Path::new(".openwire-relay")).to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+
+    // 端口优先级：CLI 参数 > 持久化端口 > 默认 44909（兼容既有安装/防火墙配置）
+    let port = match port {
+        Some(p) => p,
+        None => load_port_preference(&dir).unwrap_or(44909),
+    };
+    if port == 0 {
+        tracing::info!("端口由 OS 分配 / port assigned by OS");
+    } else {
+        tracing::info!("使用端口 / using port: {port}");
+    }
 
     let kp = load_keypair(&dir.join("ed25519.bin"))?;
     let peer_id = kp.public().to_peer_id();
     println!("中继公钥: PeerId={peer_id}");
 
-    let nodes_cfg = openwire_core::p2p::nodes::NodesConfig::load(dir);
+    let nodes_cfg = openwire_core::p2p::nodes::NodesConfig::load(&dir);
     let bootstrap_nodes = nodes_cfg.bootstrap_nodes;
 
     let mut kad_config = KadConfig::new(PROTOCOL_KAD);
@@ -148,12 +175,11 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
             // 依靠客户端连接后通过 Identify 填充路由表。
             let mut has_remote = false;
             for node in &bootstrap_nodes {
-                if let (Ok(boot_pid), Ok(addr)) = (PeerId::from_str(&node[0]), node[1].parse()) {
-                    if boot_pid != pid {
+                if let (Ok(boot_pid), Ok(addr)) = (PeerId::from_str(&node[0]), node[1].parse())
+                    && boot_pid != pid {
                         kademlia.add_address(&boot_pid, addr);
                         has_remote = true;
                     }
-                }
             }
             if has_remote {
                 let _ = kademlia.bootstrap();
@@ -270,7 +296,7 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
 
     // 监听地址集合：NewListenAddr 事件到达后重写 relay-info.json
     let mut listened: HashSet<Multiaddr> = HashSet::new();
-    write_relay_info(dir, &peer_id, &listened);
+    write_relay_info(&dir, &peer_id, &listened);
     println!(
         "中继信息已写入 / Relay info written to: {:?}",
         dir.join(RELAY_INFO_FILE)
@@ -280,8 +306,16 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("Listening on {address}");
+                // 仅由 TCP 地址更新端口偏好，避免 QUIC/UDP 事件覆盖 TCP 端口
+                let port = address.iter().find_map(|p| match p {
+                    Protocol::Tcp(p) => Some(p),
+                    _ => None,
+                });
+                if let Some(p) = port {
+                    save_port_preference(&dir, p);
+                }
                 listened.insert(address);
-                write_relay_info(dir, &peer_id, &listened);
+                write_relay_info(&dir, &peer_id, &listened);
             }
             SwarmEvent::Behaviour(RelayBehaviourEvent::Relay(
                 relay::Event::ReservationReqAccepted { src_peer_id, .. },
@@ -308,6 +342,21 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                         signature,
                         ..
                     } => {
+                        // 限流检查前置：冷确期内直接 Ack 跳过昂贵的 ML-DSA 签名验证，
+                        // 防止攻击者用大量连接强制持续的签名验证 CPU 消耗。
+                        if friend_online_rate
+                            .get(&peer)
+                            .is_some_and(|last| last.elapsed() < FRIEND_ONLINE_COOLDOWN)
+                        {
+                            tracing::debug!("FriendOnline rate limited for {}", peer);
+                            let _ = swarm
+                                .behaviour_mut()
+                                .rr_netevent
+                                .send_response(channel, NetEventResponse::Ack);
+                            // 预防性：不清空 map 条目，让重放攻击者逐渐填满自己的条目
+                            continue;
+                        }
+
                         // 校验 PeerID 与签名：无效请求返回 Nack，不缓存
                         let mut response = NetEventResponse::Ack;
                         let claimed_peer: Option<PeerId> = peer_id.parse().ok();
@@ -346,30 +395,23 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                                 reason: NackReason::SignatureVerificationFailed,
                             };
                         }
-                        // 请求有效且通过校验后，受 5s 限流保护地写入缓存
+                        // 请求有效且通过校验后，写入缓存并记录限流时间
                         if matches!(response, NetEventResponse::Ack) {
-                            if friend_online_rate
-                                .get(&peer)
-                                .map_or(true, |last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
+                            dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                            // 限流 map 达到上限时淘汰任意条目，防止恶意 PeerID 无限占满内存
+                            if friend_online_rate.len() >= FRIEND_ONLINE_RATE_MAX
+                                && !friend_online_rate.contains_key(&peer)
+                                && let Some(evict) = friend_online_rate.keys().next().copied()
                             {
-                                let _ = dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
-                                // 限流 map 达到上限时淘汰任意条目，防止恶意 PeerID 无限占满内存
-                                if friend_online_rate.len() >= FRIEND_ONLINE_RATE_MAX
-                                    && !friend_online_rate.contains_key(&peer)
-                                    && let Some(evict) = friend_online_rate.keys().next().copied()
-                                {
-                                    friend_online_rate.remove(&evict);
-                                    tracing::debug!("FriendOnline rate map at capacity, evicted {evict}");
-                                }
-                                friend_online_rate.insert(peer, Instant::now());
-                                tracing::info!(
-                                    "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
-                                    &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
-                                    peer
-                                );
-                            } else {
-                                tracing::debug!("FriendOnline rate limited for {}", peer);
+                                friend_online_rate.remove(&evict);
+                                tracing::debug!("FriendOnline rate map at capacity, evicted {evict}");
                             }
+                            friend_online_rate.insert(peer, Instant::now());
+                            tracing::info!(
+                                "=== RELAY CACHED FriendOnline: {}.. -> {} ===",
+                                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+                                peer
+                            );
                         }
                         let _ = swarm
                             .behaviour_mut()
@@ -377,10 +419,7 @@ pub async fn relay(dir: Option<&Path>, port: u16) -> anyhow::Result<()> {
                             .send_response(channel, response);
                     }
                     NetEventRequest::DiscoverPeer { mldsa_pubkey_hex } => {
-                        let peer_id = dht_cache
-                            .get_peerid_by_pubkey(mldsa_pubkey_hex)
-                            .ok()
-                            .flatten();
+                        let peer_id = dht_cache.get_peerid_by_pubkey(mldsa_pubkey_hex);
                         // ML-KEM 公钥由 FriendOnline 直接携带，DHT 不缓存
                         match peer_id {
                         Some(pid) => {
@@ -444,17 +483,26 @@ fn try_listen_or_fallback(swarm: &mut libp2p::swarm::Swarm<RelayBehaviour>, pref
 /// 将中继服务器的 PeerId 与监听地址写入数据目录 `relay-info.json`，
 ///
 /// 地址附加 `/p2p/<peer_id>` 后缀，格式与客户端配置一致。
-/// 端口从实际监听地址解析，避免使用偏好端口掩盖回退分配。
+/// 端口从实际监听地址解析（优先 TCP），避免使用偏好端口掩盖回退分配。
 fn write_relay_info(dir: &Path, peer_id: &PeerId, addresses: &HashSet<Multiaddr>) {
-    let port = addresses
-        .iter()
-        .find_map(|a| {
-            a.iter().find_map(|p| match p {
-                Protocol::Tcp(p) | Protocol::Udp(p) => Some(p),
-                _ => None,
-            })
-        })
-        .unwrap_or(0);
+    if addresses.is_empty() {
+        tracing::error!("No listen addresses available yet, relay-info.json will have port=0");
+    }
+    let port = {
+        let mut tcp_port = 0u16;
+        let mut udp_port = 0u16;
+        for addr in addresses {
+            for p in addr.iter() {
+                match p {
+                    Protocol::Tcp(p) => tcp_port = p,
+                    Protocol::Udp(p) => udp_port = p,
+                    _ => {}
+                }
+            }
+        }
+        // 优先 TCP，其次 UDP
+        if tcp_port != 0 { tcp_port } else { udp_port }
+    };
     let list: Vec<String> = addresses
         .iter()
         .map(|a| format!("{a}/p2p/{peer_id}"))
@@ -465,7 +513,7 @@ fn write_relay_info(dir: &Path, peer_id: &PeerId, addresses: &HashSet<Multiaddr>
         "peer_id": peer_id.to_string(),
         "port": port,
         "addresses": sorted,
-        "note": "Replace /ip4/0.0.0.0 with the server's public IP; add an entry to client nodes.json relay_nodes"
+        "note": "Actual listening port & addresses. Replace /ip4/0.0.0.0 with the server's public IP. Add an entry to client nodes.json relay_nodes"
     });
     let path = dir.join(RELAY_INFO_FILE);
     match serde_json::to_string_pretty(&info) {

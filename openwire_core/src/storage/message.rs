@@ -30,14 +30,8 @@ pub struct Message {
     pub msgtype: i32,
 }
 
-#[allow(dead_code)]
-fn feature_err<T>() -> StorageResult<T> {
-    Err(crate::error::StorageError::FeatureNotEnabled(
-        "sqlite_history_storage",
-    ))
-}
-
-#[cfg(feature = "sqlite_history_storage")]
+// 参数逐一对应 messages 表列与调用方字段；聚合结构体需新增无复用价值的中间类型
+#[allow(clippy::too_many_arguments)]
 pub async fn add_message_with_hash(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -81,21 +75,7 @@ pub async fn add_message_with_hash(
     .await?;
     Ok(Some(row.get(0)))
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn add_message_with_hash(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-    _content: &str,
-    _is_outgoing: bool,
-    _pending: bool,
-    _dedup_hash: &str,
-    _msgtype: i32,
-) -> StorageResult<Option<i64>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn get_messages(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -126,18 +106,9 @@ pub async fn get_messages(
     };
     Ok(messages)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_messages(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-    _limit: Option<i64>,
-    _offset: i64,
-) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
+// 分页游标参数（before/after + id 键控游标）必须同时存在才能定位翻页位置
+#[allow(clippy::too_many_arguments)]
 pub async fn get_messages_range(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -184,21 +155,7 @@ pub async fn get_messages_range(
     };
     Ok(messages)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_messages_range(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-    _before: Option<i64>,
-    _before_id: Option<i64>,
-    _after: Option<i64>,
-    _after_id: Option<i64>,
-    _limit: i64,
-) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn get_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
         "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
@@ -209,12 +166,7 @@ pub async fn get_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<Option<M
     .await?;
     Ok(msg)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_message(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<Option<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn get_message_by_hash(
     pool: &Pool<Sqlite>,
     hash: &str,
@@ -228,15 +180,7 @@ pub async fn get_message_by_hash(
     .await?;
     Ok(msg)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_message_by_hash(
-    _pool: &Pool<Sqlite>,
-    _hash: &str,
-) -> StorageResult<Option<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn get_last_message(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -253,16 +197,7 @@ pub async fn get_last_message(
     .await?;
     Ok(msg)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn get_last_message(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-) -> StorageResult<Option<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn delete_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<i64> {
     let result = sqlx::query("DELETE FROM messages WHERE id = ?1")
         .bind(id)
@@ -270,12 +205,7 @@ pub async fn delete_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<i64> 
         .await?;
     Ok(result.rows_affected() as i64)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn delete_message(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<i64> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<()> {
     if ids.is_empty() {
         return Ok(());
@@ -292,12 +222,7 @@ pub async fn delete_messages_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageR
     query.execute(pool).await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn delete_messages_batch(_pool: &Pool<Sqlite>, _ids: &[i64]) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn delete_messages_by_peer(
     pool: &Pool<Sqlite>,
     owner_identity_id: &str,
@@ -311,16 +236,7 @@ pub async fn delete_messages_by_peer(
             .await?;
     Ok(result.rows_affected() as i64)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn delete_messages_by_peer(
-    _pool: &Pool<Sqlite>,
-    _owner_identity_id: &str,
-    _peer_pubkey_hex: &str,
-) -> StorageResult<i64> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
         "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
@@ -330,12 +246,7 @@ pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     .await?;
     Ok(msgs)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn list_pending(_pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn list_pending_by_peer(
     pool: &Pool<Sqlite>,
     peer_pubkey_hex: &str,
@@ -349,18 +260,8 @@ pub async fn list_pending_by_peer(
     .await?;
     Ok(msgs)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn list_pending_by_peer(
-    _pool: &Pool<Sqlite>,
-    _peer_pubkey_hex: &str,
-) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
 /// 批量查询多个联系人的待发送消息
-/// 用于 retry_pending_for_online_peers 避免全表扫描
-
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
         "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
@@ -370,12 +271,7 @@ pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     .await?;
     Ok(msgs)
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn list_failed(_pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn mark_sent(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
     sqlx::query("UPDATE messages SET pending = 0 WHERE id = ?1")
         .bind(id)
@@ -383,12 +279,7 @@ pub async fn mark_sent(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
         .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn mark_sent(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<()> {
     if ids.is_empty() {
         return Ok(());
@@ -405,12 +296,7 @@ pub async fn mark_sent_batch(pool: &Pool<Sqlite>, ids: &[i64]) -> StorageResult<
     query.execute(pool).await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn mark_sent_batch(_pool: &Pool<Sqlite>, _ids: &[i64]) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn mark_sent_by_hash(pool: &Pool<Sqlite>, hash: &str) -> StorageResult<()> {
     sqlx::query("UPDATE messages SET pending = 0 WHERE message_hash = ?1")
         .bind(hash)
@@ -418,12 +304,7 @@ pub async fn mark_sent_by_hash(pool: &Pool<Sqlite>, hash: &str) -> StorageResult
         .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn mark_sent_by_hash(_pool: &Pool<Sqlite>, _hash: &str) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn mark_pending(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
     sqlx::query("UPDATE messages SET pending = 1 WHERE id = ?1")
         .bind(id)
@@ -431,12 +312,7 @@ pub async fn mark_pending(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
         .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn mark_pending(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn mark_failed(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
     sqlx::query("UPDATE messages SET pending = 2 WHERE id = ?1")
         .bind(id)
@@ -444,12 +320,7 @@ pub async fn mark_failed(pool: &Pool<Sqlite>, id: i64) -> StorageResult<()> {
         .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn mark_failed(_pool: &Pool<Sqlite>, _id: i64) -> StorageResult<()> {
-    feature_err()
-}
 
-#[cfg(feature = "sqlite_history_storage")]
 pub async fn update_message_hash(
     pool: &Pool<Sqlite>,
     id: i64,
@@ -462,13 +333,67 @@ pub async fn update_message_hash(
         .await?;
     Ok(())
 }
-#[cfg(not(feature = "sqlite_history_storage"))]
-pub async fn update_message_hash(
-    _pool: &Pool<Sqlite>,
-    _id: i64,
-    _hash: &str,
-) -> StorageResult<()> {
-    feature_err()
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn init_test_db() -> &'static Pool<Sqlite> {
+        let dir = std::env::temp_dir().join("openwire_msg_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.sqlite");
+        let _ = std::fs::remove_file(&path);
+        crate::storage::init_path(&path).await.expect("init db");
+        crate::storage::pool().expect("pool")
+    }
+
+    #[tokio::test]
+    async fn test_load_messages_query_path() {
+        let pool = init_test_db().await;
+        let owner = "owner";
+        let peer = "peer";
+        crate::storage::add_identity(pool, owner).await.expect("add identity");
+        crate::storage::set_current_identity(pool, owner).await.expect("set current");
+        crate::storage::upsert_contact(pool, owner, peer, Some("p"), None)
+            .await
+            .expect("add contact");
+        for i in 0..5 {
+            add_message_with_hash(
+                pool,
+                owner,
+                peer,
+                &format!("msg-{i}"),
+                i % 2 == 0,
+                false,
+                &format!("hash-{i}"),
+                0,
+            )
+            .await
+            .expect("insert");
+        }
+
+        // 首次加载（loadLatest 路径：无 before/after）
+        let first = get_messages_range(pool, owner, peer, None, None, None, None, 50)
+            .await
+            .expect("first page");
+        assert_eq!(first.len(), 5);
+
+        // 游标翻页（loadOlder 路径）
+        let cursor = first.last().unwrap();
+        let older = get_messages_range(
+            pool,
+            owner,
+            peer,
+            Some(cursor.ts),
+            Some(cursor.id),
+            None,
+            None,
+            50,
+        )
+        .await
+        .expect("cursor page");
+        assert!(older.is_empty());
+    }
 }
 
 

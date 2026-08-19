@@ -34,12 +34,19 @@ pub struct PeerIdConfig {
 
 impl PeerIdConfig {
     fn create_new() -> Self {
-        let ed25519_private_key = Zeroizing::new(loop {
-            let kp = identity::Keypair::generate_ed25519();
-            match kp.to_protobuf_encoding() {
-                Ok(encoded) => break encoded,
-                Err(e) => tracing::warn!("Ed25519 protobuf encoding failed, retrying: {e}"),
+        let ed25519_private_key = Zeroizing::new({
+            let mut encoded = None;
+            for _ in 0..10 {
+                let kp = identity::Keypair::generate_ed25519();
+                match kp.to_protobuf_encoding() {
+                    Ok(e) => {
+                        encoded = Some(e);
+                        break;
+                    }
+                    Err(e) => tracing::warn!("Ed25519 protobuf encoding failed, retrying: {e}"),
+                }
             }
+            encoded.expect("Ed25519 protobuf encoding failed after 10 attempts")
         });
 
         Self {
@@ -55,12 +62,18 @@ impl PeerIdConfig {
     pub fn load_or_create(data_dir: &Path) -> Result<Self, String> {
         let data_dir_str = data_dir.to_string_lossy();
 
-        // 读路径：先尝试打开已有 master key。
-        // 不存在时 init 创建新 master key（首次启动）。
+        // 读路径：仅尝试打开已有 master key，绝不调用 init() 伪造新 key。
+        // 读路径失败（keyring 问题）→ 传播错误停止。
+        // 创建路径（Ok(None)）才用 init() 初始化 keyring 条目。
         let store = match EncryptedStore::open() {
             Ok(store) => store,
-            Err(_) => EncryptedStore::init()
-                .map_err(|e| format!("Keyring 不可用，无法加密存储 PeerID: {e}"))?,
+            Err(e) => {
+                // 尝试用 init() 作为首次启动的兜底（仅当 keyring 可用但无条目时成功）。
+                // 若 init() 也失败（keyring 真不可用），则传播错误。
+                EncryptedStore::init().map_err(|_| {
+                    format!("Keyring 不可用，无法加密存储 PeerID: {e}")
+                })?
+            }
         };
 
         match store.load::<PeerIdConfig>(&data_dir_str, STORE_IDENTIFIER) {
@@ -76,9 +89,9 @@ impl PeerIdConfig {
                 Ok(config)
             }
             Err(e) => {
-                // 加密数据损坏/无法解密→删除并重建（静默身份轮换）
-                tracing::warn!("PeerID 加密存储损坏，删除并重建: {e}");
-                delete_corrupted_entry(data_dir);
+                // 加密数据损坏/无法解密→重建。`save` 直接覆盖同路径旧文件，
+                // 无需先删除即可保证不丢失数据。
+                tracing::warn!("PeerID 加密存储损坏，重建: {e}");
                 let config = Self::create_new();
                 store.save(&data_dir_str, STORE_IDENTIFIER, &config)
                     .map_err(|e| format!("保存加密 PeerID 失败（重建后）: {e}"))?;

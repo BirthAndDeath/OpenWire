@@ -18,8 +18,8 @@ pub use contact::{
     upsert_contact,
 };
 pub use identity::{
-    Identity, add_identity, delete_identity, get_current_identity, list_identities,
-    set_current_identity,
+    Identity, add_identity, current_identity_id, delete_identity, get_current_identity,
+    list_identities, set_current_identity,
 };
 pub use message::{
     Message, MAX_MESSAGE_PAGE_SIZE, add_message_with_hash, delete_message, delete_messages_batch,

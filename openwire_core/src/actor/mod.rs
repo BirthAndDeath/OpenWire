@@ -20,6 +20,3 @@ pub static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("Failed to build tokio runtime")
 });
 
-/// 全局 Tokio 运行时句柄
-pub static RUNTIME_HANDLE: LazyLock<tokio::runtime::Handle> =
-    LazyLock::new(|| RUNTIME.handle().clone());
