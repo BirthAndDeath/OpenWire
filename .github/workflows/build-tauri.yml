@@ -71,20 +71,24 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: install Android SDK/NDK
-        if: matrix.mobile == 'android'
-        env:
-          ANDROID_HOME: "${{ runner.temp }}/android-sdk"
-        run: |
-          mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
-          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
-          mv /tmp/cmdline-tools/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" > /dev/null
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+      # Android SDK/NDK: GitHub ubuntu-22.04 runner 镜像预装，
+      # 路径为 /usr/local/lib/android/sdk，包含 platform-tools、platforms、build-tools、ndk。
+      # 若需特定版本，启用以下步骤手动安装。
+      # - name: install Android SDK/NDK
+      #   if: matrix.mobile == 'android'
+      #   env:
+      #     ANDROID_HOME: "${{ runner.temp }}/android-sdk"
+      #   run: |
+      #     mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+      #     wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdline-tools.zip
+      #     unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
+      #     mv /tmp/cmdline-tools/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+      #     yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      #     "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" > /dev/null
+      #     echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+      #     echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      #     echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+      #     echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
       - name: setup node
         uses: actions/setup-node@v7.0.0
         with:
