@@ -36,7 +36,7 @@ jobs:
             args: "--apk"
             mobile: "android"
           - platform: "macos-latest"
-            args: "--target aarch64-apple-ios"
+            args: "--target aarch64"
             mobile: "ios"
 
     runs-on: ${{ matrix.platform }}
@@ -109,10 +109,10 @@ jobs:
           cache-on-failure: "true"
 
       - name: decode keystore
-        if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 != ''
+        if: matrix.mobile == 'android' && secrets.ANDROID_KEYSTORE_BASE64 != ''
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ${{ runner.temp }}/upload-keystore.jks
       - name: fail if keystore missing
-        if: matrix.mobile == 'android' && env.ANDROID_KEYSTORE_BASE64 == ''
+        if: matrix.mobile == 'android' && secrets.ANDROID_KEYSTORE_BASE64 == ''
         run: exit 1
         shell: bash
 
