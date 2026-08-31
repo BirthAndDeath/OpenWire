@@ -28,7 +28,7 @@
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tauri-apps/cli": "^2.11.2",
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.4.0",
     "@types/three": "^0.185.4",
     "globals": "^17.11.0",
     "svelte": "^5.56.10",
