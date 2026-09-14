@@ -20,7 +20,7 @@
     "jsqr": "^1.4.0",
     "qr": "^0.6.0",
     "svelte-i18n": "^4.0.1",
-    "three": "^0.185.1",
+    "three": "^0.186.0",
     "virtua": "^0.50.3"
   },
   "devDependencies": {
