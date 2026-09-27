@@ -21,7 +21,7 @@
     "qr": "^0.7.0",
     "svelte-i18n": "^4.0.1",
     "three": "^0.186.0",
-    "virtua": "^0.50.3"
+    "virtua": "^0.52.7"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",
