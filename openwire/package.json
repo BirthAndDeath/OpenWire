@@ -1,6 +1,6 @@
 {
   "name": "openwire",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "",
   "type": "module",
   "scripts": {
@@ -17,10 +17,13 @@
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-store": "^2.4.4",
+    "hast-util-sanitize": "^5.0.2",
+    "hast-util-to-html": "^9.0.5",
     "jsqr": "^1.4.0",
+    "mdast-util-from-markdown": "^2.0.3",
+    "mdast-util-to-hast": "^13.2.1",
     "qr": "^0.6.0",
     "svelte-i18n": "^4.0.1",
-    "three": "^0.185.1",
     "virtua": "^0.50.0"
   },
   "devDependencies": {
@@ -29,7 +32,6 @@
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tauri-apps/cli": "^2.11.2",
     "@types/node": "^26.1.2",
-    "@types/three": "^0.185.4",
     "globals": "^17.11.0",
     "svelte": "^5.56.8",
     "svelte-check": "^4.7.4",

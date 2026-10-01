@@ -16,6 +16,11 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    // 允许 `?raw` 引用仓库根 README（About 页构建期内嵌单一事实源）
+    fs: {
+      allow: [".."],
+    },
+    //
     hmr: host
       ? {
         protocol: "ws",
