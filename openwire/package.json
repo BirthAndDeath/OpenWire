@@ -24,7 +24,7 @@
     "virtua": "^0.53.3"
   },
   "devDependencies": {
-    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/adapter-static": "^4.0.0",
     "@sveltejs/kit": "^3.0.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tauri-apps/cli": "^2.12.1",
