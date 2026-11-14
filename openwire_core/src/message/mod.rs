@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 文件流子模块
 pub mod file_stream;
 pub use file_stream::{
-    ChunkReadConfig, DownloadRequest, DownloadResponse, FileHashInfo, FileStreamChunk,
+    ChunkReadConfig, DownloadRequest, DownloadResponse, EncryptedFileChunk, FileHashInfo,
+    FileStreamChunk,
 };
 
 /// 消息最大允许年龄（秒）
@@ -73,7 +74,47 @@ pub struct ChatMessage {
     pub signature: Vec<u8>,
     /// 发送者 ML-DSA 公钥（原始格式，1952 字节）
     pub sender_public_key: Vec<u8>,
+    /// 发送者当前会话 ML-KEM 公钥的 SHA-256 指纹（32 字节）。
+    ///
+    /// 用于让接收方检测「发送方 ML-KEM 公钥已轮换」：
+    /// 指纹与本地缓存不一致 → 发送方会话密钥已更新，接收方应回发
+    /// FriendOnline 完成双向密钥交换；一致则继续正常处理。
+    /// 指纹纳入签名哈希，篡改即验签失败，天然防注入。
+    /// `#[serde(default)]`：容忍旧版本序列化数据（空指纹=跳过过期检测，安全降级）。
+    #[serde(default)]
+    pub sender_mlkem_sha256: Vec<u8>,
+    /// 多设备路由元数据（`None` = 单设备/旧客户端，消息照旧直发）。
+    ///
+    /// 同一账号多设备间转发、去重与增量同步的依据；字段全部纳入签名哈希，
+    /// 篡改即验签失败。`#[serde(default)]` 保证新旧客户端互操作安全。
+    #[serde(default)]
+    pub routing: Option<DeviceRouting>,
 }
+
+/// 多设备路由元数据（同一账号多设备间消息交换）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceRouting {
+    /// 账号内单调序号（源设备生成，跨设备去重/乱序排序键）。
+    /// 各源设备维护自增游标，`(source_device, seq)` 构成账号内唯一消息键。
+    pub seq: u64,
+    /// 源设备 PeerID（Base58）
+    pub source_device: String,
+    /// 目标账号 ML-DSA 公钥 hex（消息归属账号）
+    pub target_identity: String,
+    /// 转发跳数（防环：叶子→设备→设备逐跳递增，超过上限丢弃）
+    pub hop: u8,
+    /// 消息来源哈希：由**原始发送方**在首条消息生成并随转发逐跳原样携带，
+    /// 是跨直发/转发、跨设备加密副本的稳定去重键。
+    ///
+    /// 派生自 `SHA256(源账号公钥‖msgtype‖源随机 nonce‖明文哈希)`——源 nonce
+    /// 每次发送新生成，保证"相同内容重复发送"不被误判，而同一逻辑消息的所有
+    /// 直发/转发副本共享相同 origin_hash。`#[serde(default)]` 容忍旧客户端。
+    #[serde(default)]
+    pub origin_hash: String,
+}
+
+/// 多设备转发跳数上限（防环）。设备网格深度远超此值即视为异常丢弃。
+pub const MAX_DEVICE_ROUTING_HOP: u8 = 8;
 
 /// 消息响应（签名确认）
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,18 +187,28 @@ impl ChatResponse {
 // ========== ChatMessage 方法 ==========
 
 impl ChatMessage {
-    /// 计算消息哈希（msgtype + timestamp + nonce + data）
+    /// 计算消息哈希（msgtype + timestamp + nonce + data + sender_mlkem_sha256 + routing）
     pub fn compute_hash(
         msgtype: ChatMessageType,
         timestamp: u64,
         nonce: &[u8],
         data: &[u8],
+        sender_mlkem_sha256: &[u8],
+        routing: Option<&DeviceRouting>,
     ) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update([msgtype as u8]);
         hasher.update(timestamp.to_be_bytes());
         hasher.update(nonce);
         hasher.update(data);
+        hasher.update(sender_mlkem_sha256);
+        if let Some(r) = routing {
+            hasher.update(b"routing-v1");
+            hasher.update(r.seq.to_be_bytes());
+            hasher.update(r.source_device.as_bytes());
+            hasher.update(r.target_identity.as_bytes());
+            hasher.update([r.hop]);
+        }
         hasher.finalize().to_vec()
     }
 
@@ -165,18 +216,29 @@ impl ChatMessage {
     ///
     /// # 参数
     /// - `data`: 已预处理的数据（FileStream 类型应为序列化后的 FileStreamChunk）
+    /// - `sender_mlkem_sha256`: 发送方当前会话 ML-KEM 公钥指纹（32B，纳入签名哈希）
+    /// - `routing`: 多设备路由元数据（单设备直发传 `None`）
     pub fn new_signed(
         msgtype: ChatMessageType,
         data: Vec<u8>,
         mldsa_private_key: &[u8],
         mldsa_public_key: &[u8],
+        sender_mlkem_sha256: Vec<u8>,
+        routing: Option<DeviceRouting>,
     ) -> crate::error::MessageResult<Self> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let mut nonce = [0u8; 16];
         rng().fill(&mut nonce);
 
         // 对处理后的数据进行哈希
-        let hash = Self::compute_hash(msgtype, timestamp, &nonce, &data);
+        let hash = Self::compute_hash(
+            msgtype,
+            timestamp,
+            &nonce,
+            &data,
+            &sender_mlkem_sha256,
+            routing.as_ref(),
+        );
 
         // 使用 ML-DSA 签名
         let signature = crate::signature::sign_data(mldsa_private_key, &hash).map_err(|e| {
@@ -191,6 +253,8 @@ impl ChatMessage {
             hash,
             signature,
             sender_public_key: mldsa_public_key.to_vec(),
+            sender_mlkem_sha256,
+            routing,
         })
     }
 
@@ -220,7 +284,14 @@ impl ChatMessage {
         }
 
         // 2. 验证数据完整性 (Hash)
-        let computed = Self::compute_hash(self.msgtype, self.timestamp, &self.nonce, &self.data);
+        let computed = Self::compute_hash(
+            self.msgtype,
+            self.timestamp,
+            &self.nonce,
+            &self.data,
+            &self.sender_mlkem_sha256,
+            self.routing.as_ref(),
+        );
         if !constant_time_compare(&computed, &self.hash) {
             tracing::debug!(
                 "verify: hash mismatch. computed={}.. stored={}.. data_len={}",

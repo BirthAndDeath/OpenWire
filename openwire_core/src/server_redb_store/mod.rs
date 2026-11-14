@@ -562,6 +562,18 @@ impl RecordStore for RedbRecordStore {
                 && let Ok(Some(data)) = t.get(key_str)
                 && let Ok(providers) = postcard::from_bytes::<Vec<StoredProvider>>(data.value())
             {
+                // 单个读事务内批量取全部 provider 的 multiaddrs，
+                // 避免每个 provider 独立 begin_read 造成 N+1 事务风暴
+                let addr_table = txn.open_table(PEER_MULTIADDRS_TABLE).ok();
+                let addr_of = |provider: &PeerId| -> Vec<Multiaddr> {
+                    let pid_str = provider.to_string();
+                    addr_table
+                        .as_ref()
+                        .and_then(|t| t.get(pid_str.as_str()).ok().flatten())
+                        .and_then(|data| postcard::from_bytes::<Vec<String>>(data.value()).ok())
+                        .map(|addrs| addrs.into_iter().filter_map(|s| s.parse().ok()).collect())
+                        .unwrap_or_default()
+                };
                 return providers
                     .into_iter()
                     .filter_map(|stored| {
@@ -573,7 +585,7 @@ impl RecordStore for RedbRecordStore {
                                 Instant::now()
                                     + Duration::from_secs(exp.saturating_sub(Self::now_unix()))
                             });
-                            let addresses = self.get_multiaddrs(&provider).unwrap_or_default();
+                            let addresses = addr_of(&provider);
 
                             Some(ProviderRecord {
                                 key: key.clone(),
@@ -597,6 +609,18 @@ impl RecordStore for RedbRecordStore {
         {
             provided_records.reserve(500);
 
+            // 单个读事务内批量取 multiaddrs，避免逐 provider 独立事务
+            let addr_table = txn.open_table(PEER_MULTIADDRS_TABLE).ok();
+            let addr_of = |provider: &PeerId| -> Vec<Multiaddr> {
+                let pid_str = provider.to_string();
+                addr_table
+                    .as_ref()
+                    .and_then(|t| t.get(pid_str.as_str()).ok().flatten())
+                    .and_then(|data| postcard::from_bytes::<Vec<String>>(data.value()).ok())
+                    .map(|addrs| addrs.into_iter().filter_map(|s| s.parse().ok()).collect())
+                    .unwrap_or_default()
+            };
+
             let iter = table.iter().ok();
             if let Some(mut iter) = iter {
                 while let Some(Ok((key, value))) = iter.next() {
@@ -611,7 +635,7 @@ impl RecordStore for RedbRecordStore {
                                     Instant::now()
                                         + Duration::from_secs(exp.saturating_sub(Self::now_unix()))
                                 });
-                                let addresses = self.get_multiaddrs(&provider).unwrap_or_default();
+                                let addresses = addr_of(&provider);
 
                                 provided_records.push(Cow::Owned(ProviderRecord {
                                     key: RecordKey::from(key_str.as_bytes().to_vec()),

@@ -5,6 +5,7 @@ pub mod dht_cache;
 /// Kademlia DHT 事件处理
 pub mod kademlia;
 mod events;
+pub(crate) use events::send_reject_response;
 pub mod netevent;
 pub mod nodes;
 mod swarm;

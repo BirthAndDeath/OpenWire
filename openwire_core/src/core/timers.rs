@@ -58,8 +58,9 @@ pub fn spawn_all(
         shutdown_token.clone(),
     );
 
-    // 联系人发现：首次 15 秒后触发，之后每 60 秒重试一次。
+    // 联系人发现：首次 15 秒后触发，之后每 120 秒重试一次。
     // BootstrapReady 是加速路径，此定时器是兜底保障。
+    // 周期 120s 与 discover_contact 的 120s 冷却对齐，避免每轮都触发 DHT 查询风暴。
     spawn_delayed_task(
         &rt_handle,
         "discover_contacts_initial",
@@ -71,7 +72,7 @@ pub fn spawn_all(
     spawn_interval_task(
         &rt_handle,
         "discover_contacts",
-        Duration::from_secs(60),
+        Duration::from_secs(120),
         || ChatCommand::TimerDiscoverAllContacts,
         cmd_tx.clone(),
         shutdown_token.clone(),
@@ -84,6 +85,17 @@ pub fn spawn_all(
         "file_transfer_timeout_scan",
         Duration::from_secs(60),
         || ChatCommand::TimerScanFileTransfers,
+        cmd_tx.clone(),
+        shutdown_token.clone(),
+    );
+
+    // 在线状态周期对账（60秒）：补偿偶发丢失的在线/离线事件，
+    // 让前端在线状态最迟 60 秒内收敛到 connected_peers 的权威视图
+    spawn_interval_task(
+        &rt_handle,
+        "presence_refresh",
+        Duration::from_secs(60),
+        || ChatCommand::TimerRefreshPresence,
         cmd_tx.clone(),
         shutdown_token.clone(),
     );

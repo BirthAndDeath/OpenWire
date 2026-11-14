@@ -1,6 +1,32 @@
 import { writable } from 'svelte/store';
 import { initSettingsStore, getSetting, setSetting } from './settings';
 import { locale } from 'svelte-i18n';
+import { invoke } from '@tauri-apps/api/core';
+import en from './locales/en.json';
+import zh from './locales/zh.json';
+import fr from './locales/fr.json';
+import es from './locales/es.json';
+import de from './locales/de.json';
+import ja from './locales/ja.json';
+
+// 托盘菜单文案按语言映射（单一数据源：与 i18n 的 JSON 同源）
+const TRAY_LABELS: Record<string, { show_window: string; quit: string }> = {
+  en: { show_window: en.tray_show_window, quit: en.tray_quit },
+  zh: { show_window: zh.tray_show_window, quit: zh.tray_quit },
+  fr: { show_window: fr.tray_show_window, quit: fr.tray_quit },
+  es: { show_window: es.tray_show_window, quit: es.tray_quit },
+  de: { show_window: de.tray_show_window, quit: de.tray_quit },
+  ja: { show_window: ja.tray_show_window, quit: ja.tray_quit },
+};
+
+// 同步托盘菜单文本到原生侧（切换/初始化语言时调用，fire-and-forget）
+function syncTrayMenu(lang: string) {
+  const labels = TRAY_LABELS[lang] ?? TRAY_LABELS.en;
+  invoke('set_tray_menu_texts', {
+    showWindowText: labels.show_window,
+    quitText: labels.quit,
+  }).catch((e) => console.error('更新托盘菜单失败:', e));
+}
 
 // 支持的语言列表（代码 + 显示名称）
 export const SUPPORTED_LANGUAGES_WITH_NAMES = [
@@ -70,9 +96,12 @@ function getSystemLanguage(): string {
 function applyLanguage(lang: string) {
   // 更新 Svelte store
   languageStore.set(lang);
-  
+
   // 更新 svelte-i18n
   locale.set(lang);
+
+  // 同步原生托盘菜单文案
+  syncTrayMenu(lang);
 }
 
 // 持久化语言设置

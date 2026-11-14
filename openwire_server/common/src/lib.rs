@@ -25,6 +25,12 @@ const DHT_RELAY_INDEX_KEY: &str = "relay_nodes_public";
 const PROTOCOL_KAD: StreamProtocol = StreamProtocol::new("/chat/kad/0.0.1");
 const PROTOCOL_NETEVENT: StreamProtocol = StreamProtocol::new("/chat/rr_netevent/0.0.1");
 
+/// FriendOnline 限流冷却与表容量（防签名验证 CPU 冲刷）
+const FRIEND_ONLINE_COOLDOWN: Duration = Duration::from_secs(5);
+const FRIEND_ONLINE_RATE_MAX: usize = 10_000;
+/// 限流表整体清理周期：剔除冷却期已过的条目，防止长期运行被递增 PeerID 占满常驻内存
+const RATE_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
+
 /// 中继信息输出文件：PeerId 与监听地址，供运维复制到客户端 nodes.json
 const RELAY_INFO_FILE: &str = "relay-info.json";
 const PORT_PREFERENCE_FILE: &str = "port-preference.txt";
@@ -130,7 +136,6 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
             .mode(0o600)
             .open(&db_path)
             .map_err(|e| anyhow::anyhow!("创建 DHT 数据库失败 {}: {e}", db_path.display()))?;
@@ -152,14 +157,35 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
         .with_dns()
         .map_err(|e| anyhow::anyhow!("dns: {e}"))?
         .with_behaviour(|key| {
+            // === 中继资源配额（可由环境变量收紧；默认值即此前硬编码阈值）===
+            // 开放中继可被任意 libp2p 节点用于匿名流量中转（带宽吸血），
+            // 运行方应据部署环境收紧如下配额 / 或按 README 用 OS 防火墙做 Peer 白名单。
+            let env_usize = |name: &str, dft: usize| -> usize {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(dft)
+            };
+            let env_u64 = |name: &str, dft: u64| -> u64 {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(dft)
+            };
             let relay_cfg = relay::Config {
-                max_circuits: 50,
-                max_circuits_per_peer: 5,
-                max_reservations: 50,
-                max_reservations_per_peer: 5,
-                reservation_duration: Duration::from_secs(7200),
-                max_circuit_duration: Duration::from_secs(3600),
-                max_circuit_bytes: 100 << 20,
+                max_circuits: env_usize("OPENWIRE_RELAY_MAX_CIRCUITS", 50),
+                max_circuits_per_peer: env_usize("OPENWIRE_RELAY_MAX_CIRCUITS_PER_PEER", 5),
+                max_reservations: env_usize("OPENWIRE_RELAY_MAX_RESERVATIONS", 50),
+                max_reservations_per_peer: env_usize("OPENWIRE_RELAY_MAX_RESERVATIONS_PER_PEER", 5),
+                reservation_duration: Duration::from_secs(env_u64(
+                    "OPENWIRE_RELAY_RESERVATION_DURATION_SECS",
+                    7200,
+                )),
+                max_circuit_duration: Duration::from_secs(env_u64(
+                    "OPENWIRE_RELAY_MAX_CIRCUIT_DURATION_SECS",
+                    3600,
+                )),
+                max_circuit_bytes: env_u64("OPENWIRE_RELAY_MAX_CIRCUIT_BYTES", 100 << 20),
                 ..Default::default()
             };
             let relay = relay::Behaviour::new(key.public().to_peer_id(), relay_cfg);
@@ -170,6 +196,11 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
                 RedbRecordStore::new(db.clone()),
                 kad_config.clone(),
             );
+            // 专用服务器：固定服务入站 DHT 查询。
+            // kad 默认 Client 模式会拒绝全部入站 Kademlia 子流（DeniedUpgrade），
+            // 且本 server 无 autonat/upnp，auto_mode 在无外部地址确认时永远不会升 Server，
+            // 导致 provider 记录无法被存储/响应、客户端 bootstrap 查询全部落空。
+            kademlia.set_mode(Some(kad::Mode::Server));
 
             // 向 bootstrap 节点注册，但排除自身（避免自引用）
             // 如果所有 bootstrap 节点都是自身，则跳过 bootstrap 注册，
@@ -190,7 +221,7 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
 
             let identify = identify::Behaviour::new(
                 identify::Config::new("/rootcell/identify/1.0.0".to_string(), key.public())
-                    .with_agent_version("openwire-relay/0.1.0".to_string()),
+                    .with_agent_version("openwire-relay/0.2.0".to_string()),
             );
             let ping = ping::Behaviour::new(ping::Config::new());
 
@@ -292,8 +323,7 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
     }
 
     let mut friend_online_rate: HashMap<PeerId, Instant> = HashMap::new();
-    const FRIEND_ONLINE_COOLDOWN: Duration = Duration::from_secs(5);
-    const FRIEND_ONLINE_RATE_MAX: usize = 10_000;
+    let mut rate_last_cleanup: Instant = Instant::now();
 
     // 监听地址集合：NewListenAddr 事件到达后重写 relay-info.json
     let mut listened: HashSet<Multiaddr> = HashSet::new();
@@ -343,6 +373,43 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
                         signature,
                         ..
                     } => {
+                        // 防御上限：超大公钥 hex 会让签名验证/hex::decode 产生巨额
+                        // 分配与 CPU 开销（公网攻击面），先于限流与验证拒绝。
+                        if mldsa_pubkey_hex.len()
+                            > openwire_core::p2p::netevent::MAX_MLDSA_PUBKEY_HEX_LEN
+                        {
+                            tracing::warn!(
+                                "relay FriendOnline 公钥长度异常 ({}), 拒绝",
+                                mldsa_pubkey_hex.len()
+                            );
+                            let _ = swarm
+                                .behaviour_mut()
+                                .rr_netevent
+                                .send_response(
+                                    channel,
+                                    NetEventResponse::Nack {
+                                        reason: NackReason::Other {
+                                            description: "Invalid mldsa_pubkey_hex length"
+                                                .to_string(),
+                                        },
+                                    },
+                                );
+                            continue;
+                        }
+                        // 过期条目按需剔除：冷却期已过则不再限流
+                        if friend_online_rate
+                            .get(&peer)
+                            .is_some_and(|last| last.elapsed() >= FRIEND_ONLINE_COOLDOWN)
+                        {
+                            friend_online_rate.remove(&peer);
+                        }
+                        // 周期性整体清理：防止长期运行被递增 PeerID 占满常驻内存
+                        if rate_last_cleanup.elapsed() >= RATE_CLEANUP_INTERVAL {
+                            friend_online_rate
+                                .retain(|_, last| last.elapsed() < FRIEND_ONLINE_COOLDOWN);
+                            rate_last_cleanup = Instant::now();
+                        }
+
                         // 限流检查前置：冷确期内直接 Ack 跳过昂贵的 ML-DSA 签名验证，
                         // 防止攻击者用大量连接强制持续的签名验证 CPU 消耗。
                         if friend_online_rate
@@ -399,6 +466,12 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
                         // 请求有效且通过校验后，写入缓存并记录限流时间
                         if matches!(response, NetEventResponse::Ack) {
                             dht_cache.set_pubkey_peerid(mldsa_pubkey_hex, &peer);
+                            // 同步缓存摘要→PeerID：扫码方仅持 SHA256(公钥) 摘要，
+                            // 凭摘要即可反查对端当前 PeerID，解决扫码暂存长期卡等。
+                            dht_cache.set_digest_peerid(
+                                &openwire_core::actor::p2p::swarm_ops::dht_key(mldsa_pubkey_hex),
+                                &peer,
+                            );
                             // 限流 map 达到上限时淘汰任意条目，防止恶意 PeerID 无限占满内存
                             if friend_online_rate.len() >= FRIEND_ONLINE_RATE_MAX
                                 && !friend_online_rate.contains_key(&peer)
@@ -420,8 +493,12 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
                             .send_response(channel, response);
                     }
                     NetEventRequest::DiscoverPeer { mldsa_pubkey_hex } => {
-                        let peer_id = dht_cache.get_peerid_by_pubkey(mldsa_pubkey_hex);
-                        // ML-KEM 公钥由 FriendOnline 直接携带，DHT 不缓存
+                        // 查询载荷可为完整 ML-DSA 公钥（3904 hex）或 SHA256(公钥) 摘要
+                        // （64 hex，扫码暂存方只持摘要）。ML-KEM 公钥由 FriendOnline
+                        // 直接携带，DHT 不缓存。
+                        let peer_id = dht_cache
+                            .get_peerid_by_pubkey(mldsa_pubkey_hex)
+                            .or_else(|| dht_cache.get_peerid_by_digest(mldsa_pubkey_hex));
                         match peer_id {
                         Some(pid) => {
                             tracing::info!(
@@ -457,6 +534,20 @@ pub async fn relay(dir: Option<&Path>, port: Option<u16>) -> anyhow::Result<()> 
                         tracing::trace!("relay ignored NetEventRequest: {:?}", request);
                     }
                 }
+            }
+            // 客户端连接后通过 Identify 回填路由表。
+            // 与 bootstrap 自排除注释一致：无远程 bootstrap 时依赖客户端填充，
+            // 否则本 server 作为 Listener 侧不记录对端地址，路由表会一直为空。
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) => {
+                for multiaddr in info.listen_addrs {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, multiaddr);
+                }
+                tracing::debug!(
+                    "identified {peer_id} with {} protocols",
+                    info.protocols.len()
+                );
             }
             // 忽略其他事件
             _ => {}
@@ -506,6 +597,11 @@ fn write_relay_info(dir: &Path, peer_id: &PeerId, addresses: &HashSet<Multiaddr>
     };
     let list: Vec<String> = addresses
         .iter()
+        .filter(|a| {
+            // 过滤掉 0.0.0.0 和 [::] 等未指定地址，避免运维误用
+            !a.iter().any(|p| matches!(p, Protocol::Ip4(ip) if ip.is_unspecified()))
+                && !a.iter().any(|p| matches!(p, Protocol::Ip6(ip) if ip.is_unspecified()))
+        })
         .map(|a| format!("{a}/p2p/{peer_id}"))
         .collect();
     let mut sorted = list;
@@ -514,7 +610,7 @@ fn write_relay_info(dir: &Path, peer_id: &PeerId, addresses: &HashSet<Multiaddr>
         "peer_id": peer_id.to_string(),
         "port": port,
         "addresses": sorted,
-        "note": "Actual listening port & addresses. Replace /ip4/0.0.0.0 with the server's public IP. Add an entry to client nodes.json relay_nodes"
+        "note": "Actual listening port & addresses. Replace /ip4/0.0.0.0 with the server's public IP. Add an entry to client nodes.json relay_nodes. WARNING: this relay is OPEN by default (any libp2p peer can use it) and may be abused for anonymous traffic relay; enforce PeerID allowlisting via OS firewall and tighten OPENWIRE_RELAY_MAX_* quotas for public deployments — see openwire_server/README.md"
     });
     let path = dir.join(RELAY_INFO_FILE);
     match serde_json::to_string_pretty(&info) {

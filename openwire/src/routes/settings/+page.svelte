@@ -2,7 +2,17 @@
   import "../../lib/i18n";
   import { _ } from "svelte-i18n";
   import { goto } from "$app/navigation";
-  import { theme, setTheme } from "../../lib/theme";
+  import {
+    theme,
+    setTheme,
+    accent,
+    setAccent,
+    ACCENT_PRESETS,
+    uiScale,
+    setUiScale,
+    density,
+    setDensity,
+  } from "../../lib/theme";
   import { language, setLanguage, SUPPORTED_LANGUAGES_WITH_NAMES } from "../../lib/language";
   import {
     getSetting,
@@ -91,12 +101,19 @@
   // 加载设置
   $effect(() => {
     async function loadSettings() {
-      // 确保 settings store 已初始化，否则 getSetting 会返回 undefined
-      await initSettingsStore();
+      // 确保 settings store 已初始化，否则 getSetting 会返回 undefined；
+      // 初始化失败时也要把 keyringCheckDone 置真，避免设置页永久停留在"检查中"
+      try {
+        await initSettingsStore();
+      } catch (e) {
+        console.error("初始化设置存储失败:", e);
+        keyringCheckDone = true;
+        return;
+      }
 
       // 检查 Keyring 可用性（隔离层）
       try {
-        keyringAvailable = await invoke<boolean>("is_keyring_available");
+        keyringAvailable = await invoke<boolean>("plugin:rootcell|is_keyring_available");
         keyringCheckDone = true;
         console.log("Keyring available:", keyringAvailable);
       } catch (e) {
@@ -143,11 +160,18 @@
       }
 
       // 加载节点配置
-      await loadNodesConfig();
+      try {
+        await loadNodesConfig();
+      } catch (e) {
+        console.error("加载节点配置失败:", e);
+      }
     }
 
     if (!isLoading) {
-      loadSettings();
+      void loadSettings().catch((e) => {
+        console.error("加载设置失败:", e);
+        keyringCheckDone = true;
+      });
     }
   });
 
@@ -306,8 +330,14 @@
   }
 
   // 改变字号
+  // 滑块采用几何（对数）映射：位置 0~100 → 字号倍率 0.5×4^(pos/100)。
+  // 等距滑块移动 = 等倍率缩放（50%→100% 与 100%→200% 感知一致），而非线性值刻度。
+  const fontPosToScale = (pos: number) => 0.5 * Math.pow(4, pos / 100);
+  const fontScaleToPos = (scale: number) =>
+    100 * (Math.log(Math.min(2, Math.max(0.5, scale)) / 0.5) / Math.log(4));
   async function changeFontSize(e: Event) {
-    const val = parseFloat((e.target as HTMLInputElement).value);
+    const pos = parseFloat((e.target as HTMLInputElement).value);
+    const val = Math.round(fontPosToScale(pos) * 100) / 100;
     fontSize = val;
     fontSizeScale.set(val);
     await setSetting("font_size", val);
@@ -316,6 +346,75 @@
   // 返回首页
   function goBack() {
     goto("/");
+  }
+
+  // ================= 存储管理 =================
+  interface StorageItem {
+    peer_pubkey_hex: string;
+    name: string;
+    msg_count: number;
+    msg_bytes: number;
+    file_count: number;
+    file_bytes: number;
+    total_bytes: number;
+  }
+  let storageItems = $state<StorageItem[]>([]);
+  let storageVisible = $state(20);
+  const STORAGE_PAGE = 20;
+  let storageLoading = $state(false);
+  let storageError = $state("");
+  let confirmTarget = $state<{
+    pubkey: string;
+    name: string;
+    kind: "history" | "files";
+  } | null>(null);
+
+  function fmtBytes(n: number): string {
+    if (n <= 0) return "0 B";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  async function loadStorageStats() {
+    storageLoading = true;
+    storageError = "";
+    try {
+      const raw = (await invoke("get_storage_stats")) as string;
+      storageItems = JSON.parse(raw);
+      storageVisible = Math.min(STORAGE_PAGE, storageItems.length);
+    } catch (e) {
+      storageError = String(e);
+    } finally {
+      storageLoading = false;
+    }
+  }
+
+  // 懒加载：滚动到底部加载更多
+  function onStorageScroll(e: Event) {
+    const el = e.target as HTMLElement;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+      storageVisible = Math.min(
+        storageItems.length,
+        storageVisible + STORAGE_PAGE,
+      );
+    }
+  }
+
+  async function runStorageDelete(kind: "history" | "files") {
+    if (!confirmTarget) return;
+    const t = confirmTarget;
+    confirmTarget = null;
+    try {
+      if (kind === "history") {
+        await invoke("delete_contact_history", { mldsaPubkeyHex: t.pubkey });
+      } else {
+        await invoke("delete_contact_files", { mldsaPubkeyHex: t.pubkey });
+      }
+      await loadStorageStats();
+    } catch (e) {
+      storageError = String(e);
+    }
   }
 
   // 切换截屏保护
@@ -340,7 +439,7 @@
 {:else}
   <div class="settings-container">
     <header class="settings-header">
-      <button class="back-button" onclick={goBack} aria-label="返回主页">
+      <button class="back-button" onclick={goBack} aria-label={$_("back_to_home")}>
         ← {$_("back")}
       </button>
       <h1>{$_("settings")}</h1>
@@ -382,27 +481,172 @@
           </select>
         </div>
 
-        <div class="font-size-setting">
-          <label for="font-size-slider">
-            {$_("font_size")}: {Math.round(fontSize * 100)}%
-          </label>
-          <input
-            id="font-size-slider"
-            type="range"
-            min="0.5"
-            max="2.0"
-            step="0.1"
-            value={fontSize}
-            oninput={changeFontSize}
-            class="font-size-slider"
-          />
-          <div class="slider-labels">
-            <span>50%</span>
-            <span>100%</span>
-            <span>200%</span>
+        <div class="accent-setting">
+          <span class="accent-label">{$_("accent_color")}：</span>
+          <div class="accent-presets">
+            {#each ACCENT_PRESETS as p}
+              <button
+                class="accent-dot"
+                class:sel={$accent === p.color}
+                style="background: {p.color}"
+                title={p.name}
+                onclick={() => setAccent(p.color)}
+                aria-label={p.name}
+              ></button>
+            {/each}
+            <input
+              type="color"
+              value={$accent}
+              onchange={(e) =>
+                setAccent((e.target as HTMLInputElement).value)}
+              aria-label={$_("aria_custom_accent")}
+            />
           </div>
         </div>
+
+        <div class="font-block">
+          <h3 class="font-block-title">{$_("font_title")}</h3>
+          <div class="font-item">
+            <label for="ui-scale-slider">
+              {$_("ui_font_size")}: {Math.round($uiScale * 100)}%
+            </label>
+            <input
+              id="ui-scale-slider"
+              type="range"
+              min="0.85"
+              max="1.25"
+              step="0.05"
+              value={$uiScale}
+              oninput={(e) =>
+                setUiScale(Number((e.target as HTMLInputElement).value))}
+              class="font-size-slider"
+            />
+          </div>
+          <div class="font-item">
+            <label for="font-size-slider">
+              {$_("message_font_size")}: {Math.round(fontSize * 100)}%
+            </label>
+            <input
+              id="font-size-slider"
+              type="range"
+              min="0"
+              max="100"
+              step="1"
+              value={fontScaleToPos(fontSize)}
+              oninput={changeFontSize}
+              class="font-size-slider"
+            />
+            <div class="slider-labels">
+              <span>50%</span>
+              <span>100%</span>
+              <span>200%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="theme-selector">
+          <label for="density-select">{$_("ui_density")}：</label>
+          <select
+            id="density-select"
+            value={$density}
+            onchange={(e) =>
+              setDensity(
+                (e.target as HTMLSelectElement).value as "cozy" | "compact",
+              )}
+          >
+            <option value="cozy">{$_("density_cozy")}</option>
+            <option value="compact">{$_("density_compact")}</option>
+          </select>
+        </div>
       </section>
+
+      <!-- 存储管理 -->
+      <section class="settings-section">
+        <h2>{$_("storage_management")}</h2>
+        <div class="storage-toolbar">
+          <button class="storage-refresh" onclick={loadStorageStats}>
+            {storageLoading ? `${$_("loading")}…` : $_("load_stats")}
+          </button>
+          {#if storageError}<span class="storage-error">{storageError}</span>{/if}
+        </div>
+        {#if storageItems.length === 0 && !storageLoading}
+          <p class="storage-empty">{$_("storage_empty")}</p>
+        {:else}
+          <div class="storage-list" onscroll={onStorageScroll}>
+            {#each storageItems.slice(0, storageVisible) as item (item.peer_pubkey_hex)}
+              <div class="storage-row">
+                <div class="storage-info">
+                  <span class="storage-name">{item.name}</span>
+                  <span class="storage-meta"
+                    >{$_("storage_meta", { values: { messages: item.msg_count, files: item.file_count, bytes: fmtBytes(item.total_bytes) } })}</span
+                  >
+                </div>
+                <div class="storage-actions">
+                  <button
+                    class="storage-btn"
+                    onclick={() =>
+                      (confirmTarget = {
+                        pubkey: item.peer_pubkey_hex,
+                        name: item.name,
+                        kind: "history",
+                      })}
+                    >{$_("delete_history")}</button
+                  >
+                  <button
+                    class="storage-btn danger"
+                    onclick={() =>
+                      (confirmTarget = {
+                        pubkey: item.peer_pubkey_hex,
+                        name: item.name,
+                        kind: "files",
+                      })}
+                    >{$_("delete_files")}</button
+                  >
+                </div>
+              </div>
+            {/each}
+            {#if storageVisible < storageItems.length}
+              <p class="storage-hint"
+                >{$_("load_more_hint", { values: { shown: storageVisible, total: storageItems.length } })}</p
+              >
+            {/if}
+          </div>
+        {/if}
+      </section>
+
+      <!-- 存储管理二次确认弹窗 -->
+      {#if confirmTarget}
+        <div
+          class="storage-modal-overlay"
+          role="presentation"
+          aria-hidden="true"
+          onclick={() => (confirmTarget = null)}
+        >
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <div
+            class="storage-modal"
+            role="dialog"
+            aria-label={$_("delete_confirm")}
+            tabindex="-1"
+            onclick={(e) => e.stopPropagation()}
+          >
+            <h3>{confirmTarget.kind === "history" ? $_("delete_history_title") : $_("delete_files")}</h3>
+            <p class="confirm-text">
+              {confirmTarget.kind === "history"
+                ? $_("delete_confirm_history", { values: { name: confirmTarget.name } })
+                : $_("delete_confirm_files", { values: { name: confirmTarget.name } })}
+            </p>
+            <div class="modal-actions">
+              <button class="btn-ghost" onclick={() => (confirmTarget = null)}>{$_("action_cancel")}</button>
+              <button
+                class="btn-danger"
+                onclick={() => confirmTarget && runStorageDelete(confirmTarget.kind)}
+                >{$_("confirm_delete")}</button
+              >
+            </div>
+          </div>
+        </div>
+      {/if}
 
       <!-- 截屏保护 -->
       <section class="settings-section">
@@ -410,7 +654,7 @@
         <div class="toggle-setting">
           <label class="toggle-label" for="screenshot-toggle">
             <span class="toggle-desc">{$_("screenshot_protection_desc")}</span>
-            <span class="toggle-note">Linux 上此功能可能不生效</span>
+            <span class="toggle-note">{$_("screenshot_note_linux")}</span>
           </label>
           <button
             id="screenshot-toggle"
@@ -712,6 +956,43 @@
     gap: 12px;
   }
 
+  .accent-setting {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+  }
+  .accent-setting .accent-label {
+    font-size: 14px;
+    color: var(--text-primary, #fafafa);
+    white-space: nowrap;
+  }
+  .accent-presets {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .accent-dot {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    cursor: pointer;
+    padding: 0;
+  }
+  .accent-dot.sel {
+    border-color: var(--text-primary, #fafafa);
+  }
+  .accent-presets input[type="color"] {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    cursor: pointer;
+  }
+
   .language-selector label,
   .theme-selector label {
     font-size: 14px;
@@ -760,18 +1041,30 @@
   }
 
   /* 字号滑块 */
-  .font-size-setting {
+  .font-block {
     margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 12px;
+  }
+  .font-block-title {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary, #fafafa);
+  }
+  .font-item {
     display: flex;
     flex-direction: column;
     gap: 6px;
   }
-
-  .font-size-setting label {
-    font-size: 14px;
-    color: var(--text-primary, #fafafa);
+  .font-item label {
+    font-size: 13px;
+    color: var(--text-secondary, #737373);
   }
-
   .font-size-slider {
     width: 100%;
     height: 6px;
@@ -1194,5 +1487,145 @@
 
   .bg-remove-btn:hover {
     background: rgba(239, 68, 68, 0.15);
+  }
+
+  /* ============ 存储管理 ============ */
+  .storage-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .storage-refresh {
+    padding: 6px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--color-primary);
+    background: transparent;
+    color: var(--color-primary);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .storage-refresh:hover {
+    background: var(--color-primary-soft);
+  }
+  .storage-error {
+    color: var(--color-danger);
+    font-size: 12px;
+  }
+  .storage-empty {
+    color: var(--text-secondary, #737373);
+    font-size: 13px;
+    padding: 12px 0;
+  }
+  .storage-list {
+    max-height: 320px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-right: 4px;
+  }
+  .storage-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 10px;
+  }
+  .storage-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .storage-name {
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .storage-meta {
+    font-size: 11px;
+    color: var(--text-secondary, #737373);
+  }
+  .storage-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .storage-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--color-primary);
+    background: transparent;
+    color: var(--color-primary);
+    cursor: pointer;
+  }
+  .storage-btn.danger {
+    border-color: var(--color-danger);
+    color: var(--color-danger);
+  }
+  .storage-hint {
+    font-size: 11px;
+    color: var(--text-secondary, #737373);
+    text-align: center;
+    padding: 6px 0;
+  }
+  /* 确认弹窗 */
+  .storage-modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1100;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .storage-modal {
+    width: min(340px, 86vw);
+    box-sizing: border-box;
+    padding: 20px;
+    border-radius: 12px;
+    background: var(--bg-secondary, #1a1a2e);
+    border: 1px solid var(--border-color, #2a2a2a);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .storage-modal h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  .confirm-text {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary, #c0c0c0);
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .btn-ghost {
+    padding: 7px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color, #2a2a2a);
+    background: transparent;
+    color: var(--text-secondary, #737373);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .btn-danger {
+    padding: 7px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--color-danger);
+    background: var(--color-danger);
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
   }
 </style>

@@ -1,14 +1,15 @@
 [package]
 name = "openwire_core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+publish = false
 [features]
 redb_dht = ["redb"]
 [dependencies]
 thiserror = "2"
 libp2p = { workspace = true }
 anyhow = "1.0.104"
-futures = "0.3.33"
+futures = "0.3.34"
 rootcell = { workspace = true }
 postcard = { version = "1.1", features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -19,20 +20,21 @@ sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "macros"] }
 tokio = { workspace = true }
 tracing-appender = "0.2.5"
 tracing = { workspace = true }
-aes-gcm = "0.11.0"
+aes-gcm = "0.11.1"
 
-aws-lc-rs = { version = "1.17", features = ["prebuilt-nasm"] }
+aws-lc-rs = { version = "1.18", features = ["prebuilt-nasm"] }
 
 
 hex = "0.4.3"
 subtle = "2"
-rand = "0.10.2"
-lru = "0.18.2"
+rand = "0.10.3"
+if-addrs = "0.15"
+lru = "0.18.5"
 
 dashmap = "6"
-redb = { version = "4.1.0", optional = true }
+redb = { version = "4.3.0", optional = true }
 zeroize = { version = "1.9.0", features = ["zeroize_derive", "serde"] }
-async-compression = { version = "0.4.43", features = ["futures-io", "zstd"] }
+async-compression = { version = "0.4.50", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 libp2p-pathranker = { path = "../libp2p-pathranker" }
 serde_json = "1"

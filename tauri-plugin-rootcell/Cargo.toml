@@ -1,0 +1,19 @@
+[package]
+name = "tauri-plugin-rootcell"
+version = "0.1.0"
+description = "Tauri plugin wrapping rootcell identity/keyring"
+license = "AGPL-3.0"
+edition = "2021"
+links = "tauri-plugin-rootcell"
+
+[lib]
+name = "tauri_plugin_rootcell"
+crate-type = ["lib", "cdylib"]
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+[dependencies]
+tauri = { version = "2", default-features = false }
+rootcell = { path = "../rootcell", version = "0.3.0" }
+tracing.workspace = true

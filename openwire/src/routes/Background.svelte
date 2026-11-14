@@ -79,13 +79,17 @@
 
   // ===== 生命周期 =====
   onMount(async () => {
-    // 加载截屏保护设置
-    await initSettingsStore();
-    const saved = await getSetting<boolean>("screenshot_protection");
-    if (saved !== undefined) {
-      screenshotProtection = saved;
-      // 同步共享 store，确保订阅时初始值一致
-      screenshotProtectionStore.set(saved);
+    // 加载截屏保护设置：读取失败不阻断动画——仍要订阅 store 并启动动画循环
+    try {
+      await initSettingsStore();
+      const saved = await getSetting<boolean>("screenshot_protection");
+      if (saved !== undefined) {
+        screenshotProtection = saved;
+        // 同步共享 store，确保订阅时初始值一致
+        screenshotProtectionStore.set(saved);
+      }
+    } catch (e) {
+      console.error("加载截屏保护设置失败:", e);
     }
 
     // 订阅共享 store，实时响应设置页面的变更

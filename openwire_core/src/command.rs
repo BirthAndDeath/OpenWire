@@ -64,6 +64,8 @@ impl std::fmt::Display for TransferProgressStatus {
 /// - chat_core 自身不依赖 serde_json，仅使用 serde derive
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileTransferProgress {
+    /// 文件唯一标识（hex 的 file_hash，前端取消/匹配用，比 filename 稳定）
+    pub file_id: String,
     /// 文件名
     pub filename: String,
     /// 当前已完成的分片索引
@@ -74,11 +76,32 @@ pub struct FileTransferProgress {
     pub received_bytes: u64,
     /// 文件总大小（字节）
     pub total_size: u64,
+    /// 发送方 ML-DSA 公钥 hex（全局面板重试下载用；空 = 未知/本机发起）
+    pub sender_pubkey_hex: String,
     /// 传输状态
     pub status: TransferProgressStatus,
 }
 
-/// 控制命令：外部向核心发送的指令
+/// 扫码添加好友的载荷（跨 Tauri/CoreHandle/命令/存储复用，避免 5 层重复参数表）。
+/// `digest_hex` 与 DHT 查询键一致（`swarm_ops::dht_key`）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanContactInfo {
+    /// SHA256(ML-DSA 公钥 hex 字符串) 摘要，64 位 hex
+    pub digest_hex: String,
+    /// 二维码推荐的 PeerID（Base58，可选）
+    pub peer_id: Option<String>,
+    /// 二维码推荐的 Multiaddr 列表
+    pub addrs: Vec<String>,
+    /// 二维码推荐的公共 relay（每项 [PeerId, Multiaddr]）
+    pub relay_addrs: Vec<Vec<String>>,
+    /// 联系人名称（可选）
+    pub name: Option<String>,
+    /// 来源二维码的版本字段
+    pub version: i64,
+}
+
+/// 核心事件循环可处理的命令（经 Channel 串行消费）
 #[derive(Debug)]
 pub enum ChatCommand {
     /// 发送消息到网络,由核心封装签名/时间戳/hash
@@ -101,6 +124,22 @@ pub enum ChatCommand {
         name: Option<String>,
         /// 响应通道：操作完成后发送结果 (true=成功, false=失败)
         resp: oneshot::Sender<bool>,
+    },
+
+    /// 扫码添加好友（仅凭 SHA256 摘要，完整公钥经 FriendOnline 交换后匹配）
+    AddContactByScan {
+        /// 二维码载荷（摘要 + 推荐发现信息）
+        info: ScanContactInfo,
+        /// 响应通道：操作完成后发送结果 (true=已暂存/已添加, false=失败)
+        resp: oneshot::Sender<bool>,
+    },
+
+    /// 扫码添加好友（v2 二进制二维码载荷，解码后与 AddContactByScan 同路径）
+    AddContactByScanBinary {
+        /// v2 二进制二维码字节
+        bytes: Vec<u8>,
+        /// 响应通道：Ok(摘要 hex)=已暂存/已添加；Err(())=解码失败或添加失败
+        resp: oneshot::Sender<Result<String, ()>>,
     },
 
     /// 生成新身份
@@ -149,6 +188,34 @@ pub enum ChatCommand {
     /// 重试发送所有待发送消息（离线消息队列）
     RetryPendingMessages,
 
+    /// 启动时自动续传未完成的文件下载（扫描 .state/.tmp 配对并重发 DownloadRequest）
+    ResumeFileTransfers,
+
+    /// 取消文件传输（下载/被推送均可；后续到达的分片将被拒绝，发送方据此终止）
+    CancelFileTransfer {
+        /// hex 的 file_hash（64 字符）
+        file_id_hex: String,
+        /// 响应通道：是否确有该传输被取消
+        resp: oneshot::Sender<bool>,
+    },
+
+    /// 更新联系人元数据（自定义昵称/备注/分组/屏蔽）。
+    /// 各字段 `None` 表示不修改（区别于清空，空串表示清空）。
+    UpdateContactMeta {
+        /// 对方 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 自定义昵称（None=不变，Some("")=清空）
+        name: Option<String>,
+        /// 备注（None=不变，Some("")=清空）
+        notes: Option<String>,
+        /// 分组名（None=不变，Some("")=移回默认分组）
+        group_name: Option<String>,
+        /// 屏蔽状态（None=不变）
+        blocked: Option<bool>,
+        /// 响应通道
+        resp: oneshot::Sender<bool>,
+    },
+
     /// 优雅关闭核心
     Shutdown,
 
@@ -161,6 +228,12 @@ pub enum ChatCommand {
     GetNetworkStatus {
         /// 响应通道：返回 JSON 序列化的 NetworkStatusData
         resp: tokio::sync::oneshot::Sender<String>,
+    },
+
+    /// 生成身份分享二维码载荷（v2 二进制：digest + peerid + addr + relay）
+    GetIdentityShareInfo {
+        /// 响应通道：返回二进制载荷字节
+        resp: tokio::sync::oneshot::Sender<Vec<u8>>,
     },
 
     /// 导出当前路由表（用于分享给其他节点）
@@ -197,6 +270,43 @@ pub enum ChatCommand {
     TimerRefreshRoutingTable,
     /// 定时器：扫描并清理超时文件传输
     TimerScanFileTransfers,
+    /// 定时器：周期对账并刷新在线状态（补偿偶发丢失的上线/下线事件，
+    /// 使前端在线状态在通道丢事件后自行收敛到权威视图）
+    TimerRefreshPresence,
+
+    /// 按关键词搜索所有联系人的消息内容（结果 JSON 数组，按 ts 倒序）
+    SearchMessages {
+        /// 关键词
+        query: String,
+        /// 响应通道：JSON 字符串
+        resp: oneshot::Sender<String>,
+    },
+
+    /// 存储管理统计：每位联系人的消息/文件占用（JSON 数组，按占用降序）
+    GetStorageStats {
+        /// 响应通道：JSON 字符串
+        resp: oneshot::Sender<String>,
+    },
+
+    /// 删除指定联系人的聊天记录（messages）
+    DeleteContactHistory {
+        /// 联系人 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 响应通道：是否删除成功
+        resp: oneshot::Sender<bool>,
+    },
+
+    /// 删除指定联系人的已发送文件（sent_files 记录 + 本地文件）
+    DeleteContactFiles {
+        /// 联系人 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 响应通道：释放的字节数（None=失败）
+        resp: oneshot::Sender<Option<i64>>,
+    },
+
+    /// 应用从后台回到前台：重建网络连接层（转发 P2pCommand::OnForeground，
+    /// 重拨中继 + 重跑 DHT bootstrap + 补发暂存 DiscoverPeer）
+    OnForeground,
 }
 
 /// 收到的消息类型：chat_core 向上层传递的结构化数据
@@ -264,18 +374,24 @@ pub enum MessageEvent {
         /// 当前在线联系人的 ML-DSA 公钥 hex 列表
         online_contacts: Vec<String>,
     },
-    /// 单个联系人的在线状态变更通知（来自 gossipsub）
+    /// 单个联系人的在线状态变更通知（来自连接事件 / FriendOffline）
     ContactOnlineStatus {
         /// 联系人 ML-DSA 公钥 hex
         mldsa_pubkey_hex: String,
         /// 是否在线
         online: bool,
+        /// 该联系人当前在线（或可达）的设备 PeerID 列表（空 = 全部离线）
+        remaining_devices: Vec<String>,
     },
     /// 当前身份已切换，携带新的 ML-KEM 公钥（上层更新缓存的公钥）
     IdentityChanged {
         /// 新当前身份的 ML-KEM 公钥 hex
         mlkem_pubkey_hex: Option<String>,
     },
+    /// 联系人列表已变更（新增/更新/删除，含扫码暂存自动补添）
+    ///
+    /// 上层收到后应重新拉取联系人列表刷新 UI。
+    ContactsChanged,
     /// 发生错误
     Error(String),
     /// 日志信息（连接状态等）
@@ -383,6 +499,8 @@ pub struct NetworkStatusData {
     pub connected_relay_peer: Option<String>,
     /// 外部地址列表
     pub external_addresses: Vec<String>,
+    /// 可推荐直连地址（二维码 addr 用）：含局域网/私有地址，排除环回/链路本地/circuit
+    pub recommend_addrs: Vec<String>,
     /// 本节点 PeerID
     pub local_peer_id: String,
     /// 已连接节点数
@@ -427,6 +545,7 @@ impl NetworkStatusData {
             "bootstrap_ready": false,
             "connected_relay_peer": null,
             "external_addresses": [],
+            "recommend_addrs": [],
             "local_peer_id": "",
             "connected_peer_count": 0u64,
         }).to_string()

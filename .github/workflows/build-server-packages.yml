@@ -16,8 +16,6 @@ concurrency:
 jobs:
   build-deb:
     name: "DEB (${{ matrix.platform }})"
-    permissions:
-      contents: write
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -71,18 +69,8 @@ jobs:
           name: openwire-server-cli-deb-${{ matrix.target }}
           path: target/${{ matrix.target }}/debian/*.deb
 
-      - name: create GitHub release with .deb
-        uses: softprops/action-gh-release@v2.6.2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: target/${{ matrix.target }}/debian/*.deb
-          draft: true
-          generate_release_notes: true
-
   build-rpm:
     name: "RPM (${{ matrix.target }})"
-    permissions:
-      contents: write
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -141,11 +129,40 @@ jobs:
           name: openwire-server-cli-rpm-${{ matrix.target }}
           path: target/${{ matrix.target }}/generate-rpm/*.rpm
 
-      - name: create GitHub release with .rpm
-        uses: softprops/action-gh-release@v2.6.2
-        if: startsWith(github.ref, 'refs/tags/')
+  # 发布：等待全部构建 job 成功，汇总所有 deb/rpm 后一次性创建 release。
+  # 避免各矩阵 job 抢建同一 tag_name 导致竞态（仅一个成功、release 缺包）。
+  publish:
+    name: "Publish server release"
+    if: github.ref == 'refs/heads/release' || github.ref == 'refs/heads/nightly'
+    needs: [build-deb, build-rpm]
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: generate release metadata
+        id: release_meta
+        run: |
+          TS="${{ github.event.push.head_commit.timestamp }}"
+          if [ -z "$TS" ]; then TS=$(date -u +%Y%m%d%H%M%S); else TS=$(date -u -d "$TS" +%Y%m%d%H%M%S); fi
+          echo "version=server-${{ github.ref_name }}-$TS" >> "$GITHUB_OUTPUT"
+
+      - name: download all server packages
+        uses: actions/download-artifact@v6.0.0
         with:
-          files: target/${{ matrix.target }}/generate-rpm/*.rpm
+          path: packages
+          merge-multiple: true
+
+      - name: create GitHub release (all deb/rpm)
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.version }}
+          name: ${{ steps.release_meta.outputs.version }}
+          files: |
+            packages/*.deb
+            packages/*.rpm
           draft: true
           generate_release_notes: true
 

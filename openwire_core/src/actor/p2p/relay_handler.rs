@@ -18,9 +18,91 @@ use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 
 use super::P2pActor;
-use crate::command::RelayRole;
+use crate::command::{PaidNetworkMode, RelayRole};
 use super::P2pEvent;
 use super::DHT_RELAY_INDEX_KEY;
+
+/// 中继设置持久化文件名：`data_dir/relay_settings.json`
+///
+/// 保存用户显式选择的 `relay_role` 与 `paid_network_mode`，
+/// 使「付费网络检测 API 不可用 / 用户设为 disabled」时能按持久化身份运行
+/// （默认 client），而不是每次重启退化为"当作付费网络强制关闭中继"。
+const RELAY_SETTINGS_FILE: &str = "relay_settings.json";
+
+/// 中继设置（可持久化）
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct RelaySettings {
+    /// 用户显式选择的中继角色："server" / "client" / "off"；
+    /// `None` 表示用户从未显式设置（走自动迁移/默认 client）
+    #[serde(default)]
+    pub relay_role: Option<String>,
+    /// 付费网络检测模式："free" / "paid" / "disabled"；`None` 表示未检测
+    #[serde(default)]
+    pub paid_network_mode: Option<String>,
+}
+
+/// 从 data_dir 加载中继设置（文件缺失/解析失败时返回默认）
+pub(super) fn load_relay_settings(data_dir: &std::path::Path) -> RelaySettings {
+    let path = data_dir.join(RELAY_SETTINGS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(s) => {
+                tracing::debug!("已加载中继设置: {:?}", path);
+                s
+            }
+            Err(e) => {
+                tracing::warn!("解析中继设置失败 {}: {e}", path.display());
+                RelaySettings::default()
+            }
+        },
+        Err(_) => RelaySettings::default(),
+    }
+}
+
+impl RelaySettings {
+    /// 持久化到 data_dir（先写临时文件再改名，避免崩溃留下半截 JSON）。
+    ///
+    /// 注意：`std::fs::rename` 在 Windows 上若目标已存在会失败，
+    /// 必须先删除旧目标文件再改名（两次调用之间有小窗口，
+    /// 但相比直接 write 覆写，能避免留下半截 JSON 导致下次启动解析失败）。
+    fn save(&self, data_dir: &std::path::Path) {
+        let path = data_dir.join(RELAY_SETTINGS_FILE);
+        let tmp = data_dir.join(format!("{RELAY_SETTINGS_FILE}.tmp"));
+        if let Err(e) = std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default())
+        {
+            tracing::warn!("保存中继设置失败(临时文件) {}: {e}", tmp.display());
+            return;
+        }
+        // 目标已存在先删除，再改名（Windows 兼容）
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::warn!("保存中继设置失败(改名) {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// 解析中继角色（未知值回退 None）
+    pub(super) fn parsed_relay_role(&self) -> Option<RelayRole> {
+        self.relay_role.as_deref().and_then(|s| match s {
+            "server" => Some(RelayRole::Server),
+            "client" => Some(RelayRole::Client),
+            "off" => Some(RelayRole::Off),
+            _ => None,
+        })
+    }
+
+    /// 解析付费网络模式（未知值回退 None）
+    pub(super) fn parsed_paid_mode(&self) -> Option<PaidNetworkMode> {
+        self.paid_network_mode.as_deref().and_then(|s| match s {
+            "free" => Some(PaidNetworkMode::Free),
+            "paid" => Some(PaidNetworkMode::Metered),
+            "disabled" => Some(PaidNetworkMode::Disabled),
+            _ => None,
+        })
+    }
+}
 
 /// Relay DHT 查询最小间隔（秒）—— 防止 dial_relay_nodes 高频调用时 DHT 查询风暴
 const RELAY_DHT_QUERY_INTERVAL_SECS: u64 = 60;
@@ -29,6 +111,10 @@ const BACKOFF_MAX_SECS: u64 = 300;
 /// 退避重置间隔（秒）—— 冷却到期后须再经过此时长且无新失败，才重置计数器。
 /// 持续失败会不断刷新冷却时间，此条件不会满足，避免无限重置。
 const BACKOFF_RESET_SECS: u64 = 300;
+/// 同时请求 circuit reservation 的候选中继数量上限。
+/// 配置中继不受此限制；候选节点仅在已成功 reservation 数低于上限时参与，
+/// 避免过量占用远端中继（轻量级 server）的 reservation 配额。
+const MAX_RESERVATION_RELAYS: usize = 4;
 
 /// 从 Multiaddr 中剥离所有 `P2p` 组件，返回纯传输地址。
 /// 用于在插入 relay_nodes / relay_candidates 前归一化，确保存储不变量。
@@ -39,6 +125,11 @@ pub(super) fn strip_p2p(addr: &Multiaddr) -> Multiaddr {
             m.push(p);
             m
         })
+}
+
+/// 判断地址是否含完整传输层（Tcp / QuicV1），不含传输层的地址不可拨号/不可 reservation。
+fn has_transport(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::Tcp(_) | Protocol::QuicV1))
 }
 
 /// 解析并归一化配置的中继节点列表，丢弃无效/重复条目。
@@ -126,10 +217,7 @@ impl P2pActor {
             let full_addr = candidate_addr.clone().with(Protocol::P2p(*candidate_peer_id));
             // 仅当含完整传输层（Tcp / QuicV1）时才拨号；
             // 如果地址为空（DHT 发现的占位），Kademlia 尚未填充传输地址，跳过
-            let has_transport = full_addr
-                .iter()
-                .any(|p| matches!(p, Protocol::Tcp(_) | Protocol::QuicV1));
-            if !has_transport {
+            if !has_transport(&full_addr) {
                 tracing::debug!(
                     "Skipping dial for relay candidate {}: no transport address yet",
                     candidate_peer_id
@@ -209,37 +297,66 @@ impl P2pActor {
 
     /// 连接建立后向中继请求 circuit reservation
     ///
-    /// 仅向配置的中继节点发送 reservation 请求。
-    /// 自动发现的候选节点（Identify/DHT）虽然支持 relay 协议，
-    /// 但可能是 IPFS 引导节点等非中继服务器，不会接受 reservation。
-    /// 候选节点用于拨号回退，不用于 reservation。
+    /// 按 Circuit Relay v2 标准流程：dial → Identify（确认 HOP 协议）→
+    /// listen_on(relay_addr/p2p-circuit)。配置的中继节点总是保留；
+    /// 通过 Identify/DHT 发现且已确认支持 HOP、具备传输地址的候选节点，
+    /// 在 reservation 数量上限内同样请求 —— 不依赖当前 libp2p-relay 对
+    /// ReservationReqAccepted 事件的具体实现，上游修复后自动正确。
     pub(crate) fn on_relay_connected(&mut self, relay_peer_id: &PeerId) -> bool {
-        for (pid, addr) in &self.relay_nodes {
-            if pid == relay_peer_id {
-                // addr 已归一化为纯传输地址，安全追加 P2p + P2pCircuit
-                let circuit_addr = addr
-                    .clone()
-                    .with(Protocol::P2p(*pid))
-                    .with(Protocol::P2pCircuit);
-                return match self.swarm.listen_on(circuit_addr) {
-                    Ok(_) => {
-                        tracing::info!(
-                            "=== RESERVATION REQ: sent to relay {relay_peer_id} ==="
+        // 1. 配置的中继节点（不受上限约束）
+        let (pid, addr) = match self
+            .relay_nodes
+            .iter()
+            .find(|(pid, _)| pid == relay_peer_id)
+        {
+            Some((p, a)) => (*p, a.clone()),
+            None => {
+                // 2. 候选节点：仅具备纯传输地址、且 successfully reservation 数未达上限时参与
+                // （按成功数计：失败的/被拒的尝试不占槽位，避免耗尽候选配额）
+                if self.reservation_established.len() >= MAX_RESERVATION_RELAYS {
+                    tracing::debug!(
+                        "relay {} 候选 reservation 达到上限({MAX_RESERVATION_RELAYS})，跳过",
+                        relay_peer_id
+                    );
+                    return false;
+                }
+                match self
+                    .relay_candidates
+                    .iter()
+                    .find(|(pid, addr, _)| pid == relay_peer_id && has_transport(addr))
+                {
+                    Some((p, a, _)) => (*p, a.clone()),
+                    None => {
+                        tracing::debug!(
+                            "relay {} 无可用 reservation 地址（配置或候选均不可用）",
+                            relay_peer_id
                         );
-                        true
+                        return false;
                     }
-                    Err(e) => {
-                        tracing::warn!("listen_on relay {} failed: {e:?}", relay_peer_id);
-                        false
-                    }
-                };
+                }
+            }
+        };
+        self.request_circuit_reservation(&pid, &addr)
+    }
+
+    fn request_circuit_reservation(&mut self, pid: &PeerId, addr: &Multiaddr) -> bool {
+        // addr 已归一化为纯传输地址，安全追加 P2p + P2pCircuit
+        let circuit_addr = addr
+            .clone()
+            .with(Protocol::P2p(*pid))
+            .with(Protocol::P2pCircuit);
+        match self.swarm.listen_on(circuit_addr) {
+            Ok(_) => {
+                tracing::info!(
+                    "=== RESERVATION REQ: sent to relay {pid} ==="
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!("listen_on relay {pid} failed: {e:?}");
+                false
             }
         }
-        tracing::debug!(
-            "relay {} not in configured relay list, skipping reservation (candidate only)",
-            relay_peer_id
-        );
-        false
     }
 
     pub(crate) fn disconnect_relay_nodes(&mut self) {
@@ -251,20 +368,35 @@ impl P2pActor {
         }
         self.relay_connections.clear();
         self.relay_candidates.clear();
+        // 断开即报废已发起的 reservation：清空后重新连接时可重新请求
+        // （修复 Public→Private 翻转后 reservation_attempted 残留导致不重新 reservation）
+        self.reservation_attempted.clear();
+        self.reservation_established.clear();
     }
 
     pub(crate) fn try_enable_relay_server(&mut self) {
         if self.relay_server_enabled {
             return;
         }
-        // 计费网络不允许启用中继（避免产生额外流量费用）
-        if self.paid_network {
+        // 用户显式选择的角色最高优先级：显式 server 即使计费网络也启用（用户自担流量）。
+        // 计费门只拦截「自动路径」——未显式配置角色时避免意外产生流量费用。
+        let user_explicit_server =
+            self.relay_role_user_configured && self.relay_role == RelayRole::Server;
+        if self.paid_network && !user_explicit_server {
             tracing::debug!("Relay server not allowed on paid network, skipping");
             return;
         }
-        // 公网节点自动授权中继 + 角色迁移（在角色检查之前，确保迁移能生效）
+        // 公网节点自动授权中继 + 角色迁移（在角色检查之前，确保迁移能生效）。
+        // 用户显式选择 server 最高优先级：不受「必须公网」限制，直接放行。
         if !self.relay_server_allowed {
-            if matches!(self.nat_status, libp2p::autonat::NatStatus::Public(_)) {
+            if user_explicit_server {
+                self.relay_server_allowed = true;
+                tracing::info!("User explicitly chose relay role 'server', authorizing");
+            } else if matches!(self.nat_status, libp2p::autonat::NatStatus::Public(_))
+                // 检测禁用（Disabled）时不做自动迁移：保持持久化角色（默认 client），
+                // 只有明确检测为免费（Free）的自动路径才在公网时升级为 server。
+                && self.paid_network_mode != PaidNetworkMode::Disabled
+            {
                 self.relay_server_allowed = true;
                 // 自动迁移旧节点：默认角色 client 升级到 server（用户未显式设置过时）
                 if !self.relay_role_user_configured && self.relay_role == RelayRole::Client {
@@ -349,6 +481,39 @@ impl P2pActor {
                 self.relay_role = RelayRole::Off;
             }
         }
+        self.persist_relay_settings();
+    }
+
+    /// 持久化当前中继设置到磁盘（relay_settings.json）
+    ///
+    /// 只持久化「用户显式设置」的角色：自动迁移（公网 client→server）
+    /// 是运行时可逆决策，不应写盘——否则重启后会被误判为用户显式选择，
+    /// 使付费网络下中继服务关不掉（流量费风险）。自动迁移的角色在
+    /// 每次启动时由 nat_status + paid_network_mode 重新评估。
+    pub(crate) fn persist_relay_settings(&self) {
+        let settings = RelaySettings {
+            relay_role: if self.relay_role_user_configured {
+                Some(match self.relay_role {
+                    RelayRole::Server => "server".to_string(),
+                    RelayRole::Client => "client".to_string(),
+                    RelayRole::Off => "off".to_string(),
+                })
+            } else {
+                None
+            },
+            paid_network_mode: Some(match self.paid_network_mode {
+                PaidNetworkMode::Free => "free".to_string(),
+                PaidNetworkMode::Metered => "paid".to_string(),
+                PaidNetworkMode::Disabled => "disabled".to_string(),
+            }),
+        };
+        settings.save(&self.data_dir);
+        tracing::debug!(
+            "中继设置已持久化: role={:?} (user_configured={}), mode={:?}",
+            settings.relay_role,
+            self.relay_role_user_configured,
+            self.paid_network_mode
+        );
     }
 
     /// 关闭所有 relay 客户端连接，清理相关状态
@@ -356,6 +521,7 @@ impl P2pActor {
         self.disconnect_relay_nodes();
         self.relay_candidates.clear();
         self.reservation_attempted.clear();
+        self.reservation_established.clear();
         self.relay_reconnect_cooldown_until = None;
         self.relay_reconnect_attempt = 0;
         tracing::info!("Relay client disabled");

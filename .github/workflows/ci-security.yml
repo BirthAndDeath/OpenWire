@@ -30,12 +30,18 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: audit
-        run: cargo audit
+        # RUSTSEC-2026-0097 忽略依据：rand@0.7.3 仅存在于 dev 依赖树
+        # （did-key ← openwire_core[dev-dependencies]），不进生产产物。
+        run: cargo audit --ignore RUSTSEC-2026-0097
 
   cargo-clippy:
     name: "cargo clippy (workspace)"
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -55,6 +61,46 @@ jobs:
             openwire_cli
             openwire_server
 
-      - name: clippy
-        # 排除 openwire（Tauri GUI crate，ubuntu runner 上需要 webkit2gtk 系统依赖）
-        run: cargo clippy -p openwire_core -p rootcell -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-features --all-targets -- -D warnings
+      - name: install clippy-sarif
+        run: cargo install clippy-sarif sarif-fmt --locked
+
+      - name: clippy (workspace, hard gate + SARIF)
+        # 排除 openwire（Tauri GUI crate，ubuntu runner 上需要 webkit2gtk 系统依赖）。
+        # set -o pipefail 保证 -D warnings 硬失败不被管道吞掉；tee 保存原始 JSON 供 SARIF 生成。
+        run: |
+          set -o pipefail
+          cargo clippy -p openwire_core -p rootcell -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-features --all-targets --message-format=json -- -D warnings | tee clippy-results.json | clippy-sarif > clippy-results.sarif
+
+      - name: Upload analysis results to GitHub
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4.37.7
+        with:
+          sarif_file: clippy-results.sarif
+          wait-for-processing: true
+
+  cargo-test:
+    name: "cargo test (workspace)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            openwire_core
+            rootcell
+            openwire_cli
+            openwire_server
+
+      - name: cargo test (non-GUI crates)
+        # 排除 openwire（Tauri GUI crate，ubuntu runner 需 webkit2gtk 系统依赖），
+        # 与 clippy 作业保持一致。运行全部单元/集成测试，防止逻辑回归漏检。
+        run: cargo test -p openwire_core -p rootcell -p libp2p-pathranker -p openwire_cli -p openwire-server-cli -p openwire_server_common --all-features

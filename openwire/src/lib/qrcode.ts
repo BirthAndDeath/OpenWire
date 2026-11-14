@@ -48,7 +48,7 @@ export function drawQrCode(
 
     const matrix = encodeQR(text, "raw", {
         encoding: "byte",
-        version: 39,
+        ecc: "medium",
         border: 4,
         textEncoder: (input: string) => {
             return latin1ToBytes(input);
@@ -84,26 +84,107 @@ export function drawQrCode(
 }
 
 /**
- * 从 ImageData 中解码二维码。
+ * 从 ImageData 中解码二维码（异步）。
  *
- * 使用 jsQR 库解码，通过 binaryData 获取原始字节。
- * jsQR 的 binaryData 是 Uint8Array，包含 QR 码中编码的原始字节数据，
- * 不受 UTF-8 解码影响，适合解码二进制数据。
+ * 优先交给 Web Worker 解码：jsQR 是同步 CPU 密集操作，手机原图可达千万像素，
+ * 在主线程直接解码会冻结界面。Worker 解码失败/不可用时回退主线程同步解码，
+ * 但对超大输入先降采样，避免回退路径再次冻结。
  *
  * @param imageData 图像像素数据
  * @returns 解码出的字符串（Latin-1 编码，每个字符的 charCodeAt 对应原始字节值），失败返回 null
  */
-export function decodeQrCode(imageData: ImageData): string | null {
-    try {
-        const result = jsQR(imageData.data, imageData.width, imageData.height);
-        if (!result) {
-            return null;
+
+// 同步回退路径的单帧像素上限（≈2048²）：超过则先降采样，防止主线程冻结
+const MAX_SYNC_PIXELS = 2048 * 2048;
+const QR_WORKER_TIMEOUT_MS = 8000;
+
+function decodeSync(imageData: ImageData): string | null {
+    let data = imageData;
+    if (imageData.width * imageData.height > MAX_SYNC_PIXELS) {
+        const scale = Math.sqrt(MAX_SYNC_PIXELS / (imageData.width * imageData.height));
+        const w = Math.max(1, Math.round(imageData.width * scale));
+        const h = Math.max(1, Math.round(imageData.height * scale));
+        const src = document.createElement("canvas");
+        src.width = imageData.width;
+        src.height = imageData.height;
+        const sctx = src.getContext("2d");
+        const dst = document.createElement("canvas");
+        dst.width = w;
+        dst.height = h;
+        const dctx = dst.getContext("2d");
+        if (sctx && dctx) {
+            sctx.putImageData(imageData, 0, 0);
+            dctx.drawImage(src, 0, 0, w, h);
+            data = dctx.getImageData(0, 0, w, h);
         }
-        // binaryData 是原始字节数组（number[]），转为 Uint8Array 后再转 Latin-1 字符串
-        // 上层通过 charCodeAt 提取原始字节值
+    }
+    try {
+        const result = jsQR(data.data, data.width, data.height);
+        if (!result) return null;
         return bytesToLatin1(new Uint8Array(result.binaryData));
     } catch (e) {
         console.error("[decodeQrCode] jsQR 抛出异常:", e);
         return null;
     }
+}
+
+let qrWorker: Worker | null = null;
+let qrWorkerBroken = false;
+let qrSeq = 0;
+const qrPending = new Map<number, (value: string | null) => void>();
+
+function getQrWorker(): Worker | null {
+    if (qrWorker) return qrWorker;
+    if (qrWorkerBroken) return null;
+    try {
+        const worker = new Worker(new URL("./qr-worker.ts", import.meta.url), {
+            type: "module",
+        });
+        worker.onmessage = (e: MessageEvent<{ id: number; data: Uint8Array | null }>) => {
+            const { id, data } = e.data ?? {};
+            const resolve = qrPending.get(id);
+            if (!resolve) return;
+            qrPending.delete(id);
+            resolve(data ? bytesToLatin1(data) : null);
+        };
+        worker.onerror = () => {
+            // worker 脚本加载失败（模块 worker 不可用）：标记失效，回退主线程同步解码
+            qrWorkerBroken = true;
+            qrWorker = null;
+            for (const resolve of qrPending.values()) resolve(null);
+            qrPending.clear();
+        };
+        qrWorker = worker;
+        return worker;
+    } catch {
+        qrWorkerBroken = true;
+        return null;
+    }
+}
+
+export function decodeQrCode(imageData: ImageData): Promise<string | null> {
+    const worker = getQrWorker();
+    if (!worker) return Promise.resolve(decodeSync(imageData));
+    return new Promise((resolve) => {
+        const id = ++qrSeq;
+        const timer = setTimeout(() => {
+            qrPending.delete(id);
+            resolve(null);
+        }, QR_WORKER_TIMEOUT_MS);
+        qrPending.set(id, (value) => {
+            clearTimeout(timer);
+            resolve(value);
+        });
+        try {
+            // 转移像素缓冲（零拷贝）；调用方每帧都新建 ImageData，转移安全
+            worker.postMessage(
+                { id, data: imageData.data, width: imageData.width, height: imageData.height },
+                [imageData.data.buffer],
+            );
+        } catch {
+            clearTimeout(timer);
+            qrPending.delete(id);
+            resolve(decodeSync(imageData));
+        }
+    });
 }

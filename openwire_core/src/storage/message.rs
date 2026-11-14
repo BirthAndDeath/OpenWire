@@ -7,6 +7,137 @@ use crate::error::StorageResult;
 /// 单次加载消息的最大分页数。所有层（storage、Tauri command、JS isolation hook）共享此值。
 pub const MAX_MESSAGE_PAGE_SIZE: i64 = 200;
 
+/// 按消息内容关键词搜索匹配的结果行（附联系人显示名）
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MessageSearchHit {
+    /// 消息 id（跳转定位用）
+    pub id: i64,
+    /// 联系人公钥 hex
+    pub peer_pubkey_hex: String,
+    /// 联系人显示名（前端以空昵称哈希回退覆盖）
+    pub name: String,
+    /// 消息内容（完整，前端截断预览）
+    pub content: String,
+    /// 是否出站
+    pub is_outgoing: i32,
+    /// 时间戳
+    pub ts: i64,
+}
+
+/// 按关键词搜索当前身份下所有联系人的消息内容（LIKE 子串匹配）。
+///
+/// 关键词中的 `%`/`_`/`\` 按字面处理（转义），全子串匹配。
+/// 说明：前导通配符无法利用 B-tree 索引，属全表扫描；LIMIT 控制成本，
+/// 海量消息时应迁移 FTS5。
+pub async fn search_messages_by_content(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+    keyword: &str,
+    limit: i64,
+) -> StorageResult<Vec<MessageSearchHit>> {
+    let escaped = keyword
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let like = format!("%{escaped}%");
+    sqlx::query_as::<_, MessageSearchHit>(
+        "SELECT m.id,
+                c.mldsa_pubkey_hex AS peer_pubkey_hex,
+                COALESCE(NULLIF(TRIM(c.name), ''), '') AS name,
+                m.content, m.is_outgoing, m.ts
+         FROM messages m
+         JOIN contacts c ON c.id = m.contact_id
+         WHERE m.owner_identity_id = ?1 AND m.content LIKE ?2 ESCAPE '\\'
+         ORDER BY m.ts DESC
+         LIMIT ?3",
+    )
+    .bind(owner_identity_id)
+    .bind(&like)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+/// 以指定消息为中心返回一个窗口（radius 条更旧 + radius 条更新，含目标本身），
+/// 供"搜索命中跳转"使用。按 (ts,id) 元组排序，兼容时间戳相同的情况。
+pub async fn get_messages_around(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+    peer_pubkey_hex: &str,
+    msg_id: i64,
+    radius: i64,
+) -> StorageResult<Vec<Message>> {
+    let older = sqlx::query_as::<_, Message>(
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         JOIN (SELECT ts, id FROM messages WHERE id = ?3 AND owner_identity_id = ?1) t \
+         WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 \
+           AND (m.ts, m.id) < (t.ts, t.id) \
+         ORDER BY m.ts DESC, m.id DESC LIMIT ?4",
+    )
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
+    .bind(msg_id)
+    .bind(radius)
+    .fetch_all(pool)
+    .await?;
+
+    let newer = sqlx::query_as::<_, Message>(
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         JOIN (SELECT ts, id FROM messages WHERE id = ?3 AND owner_identity_id = ?1) t \
+         WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 \
+           AND (m.ts, m.id) >= (t.ts, t.id) \
+         ORDER BY m.ts ASC, m.id ASC LIMIT ?4",
+    )
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
+    .bind(msg_id)
+    .bind(radius)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = older;
+    out.reverse(); // 更旧段：倒序为时间正序
+    out.extend(newer);
+    Ok(out)
+}
+
+/// 某联系人的消息统计（条数、字节数、文件消息数），供存储管理
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ContactMessagesStat {
+    /// 联系人公钥 hex
+    pub peer_pubkey_hex: String,
+    /// 消息总条数
+    pub msg_count: i64,
+    /// 消息内容总字节（近似占用）
+    pub msg_bytes: i64,
+    /// 文件消息（FileHash）条数
+    pub file_count: i64,
+}
+
+/// 按联系人汇总消息统计（当前身份下全部联系人）
+pub async fn contact_messages_stat(
+    pool: &Pool<Sqlite>,
+    owner_identity_id: &str,
+) -> StorageResult<Vec<ContactMessagesStat>> {
+    sqlx::query_as::<_, ContactMessagesStat>(
+        "SELECT c.mldsa_pubkey_hex AS peer_pubkey_hex,
+                COUNT(m.id) AS msg_count,
+                COALESCE(SUM(LENGTH(m.content)), 0) AS msg_bytes,
+                SUM(CASE WHEN m.msgtype = 1 THEN 1 ELSE 0 END) AS file_count
+         FROM contacts c
+         LEFT JOIN messages m ON m.contact_id = c.id
+         WHERE c.owner_identity_id = ?1
+         GROUP BY c.id",
+    )
+    .bind(owner_identity_id)
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
 #[derive(Debug, Clone, FromRow)]
 /// 消息结构
 pub struct Message {
@@ -60,8 +191,8 @@ pub async fn add_message_with_hash(
         Some(dedup_hash)
     };
     let row = sqlx::query(
-        r#"INSERT INTO messages (owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype)
-          VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6, ?7)
+        r#"INSERT INTO messages (owner_identity_id, contact_id, content, is_outgoing, pending, ts, message_hash, msgtype)
+          VALUES (?1, (SELECT id FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2), ?3, ?4, ?5, unixepoch(), ?6, ?7)
           RETURNING id"#,
     )
     .bind(owner_identity_id)
@@ -85,8 +216,9 @@ pub async fn get_messages(
 ) -> StorageResult<Vec<Message>> {
     let messages = if let Some(limit) = limit {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-             FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC LIMIT ?3 OFFSET ?4",
+            "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+             FROM messages m JOIN contacts c ON c.id = m.contact_id \
+             WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 ORDER BY m.ts DESC LIMIT ?3 OFFSET ?4",
         )
         .bind(owner_identity_id)
         .bind(peer_pubkey_hex)
@@ -96,8 +228,9 @@ pub async fn get_messages(
         .await?
     } else {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-             FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 ORDER BY ts DESC",
+            "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+             FROM messages m JOIN contacts c ON c.id = m.contact_id \
+             WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 ORDER BY m.ts DESC",
         )
         .bind(owner_identity_id)
         .bind(peer_pubkey_hex)
@@ -124,10 +257,11 @@ pub async fn get_messages_range(
     let before_id = before_id.unwrap_or(i64::MAX);
     let messages = if let (Some(after_id), Some(after)) = (after_id, after) {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-             FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
-             AND (ts, id) < (?3, ?4) AND (ts, id) > (?5, ?6) \
-             ORDER BY ts DESC LIMIT ?7",
+            "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+             FROM messages m JOIN contacts c ON c.id = m.contact_id \
+             WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 \
+             AND (m.ts, m.id) < (?3, ?4) AND (m.ts, m.id) > (?5, ?6) \
+             ORDER BY m.ts DESC LIMIT ?7",
         )
         .bind(owner_identity_id)
         .bind(peer_pubkey_hex)
@@ -140,10 +274,11 @@ pub async fn get_messages_range(
         .await?
     } else {
         sqlx::query_as::<_, Message>(
-            "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-             FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
-             AND (ts, id) < (?3, ?4) \
-             ORDER BY ts DESC LIMIT ?5",
+            "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+             FROM messages m JOIN contacts c ON c.id = m.contact_id \
+             WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 \
+             AND (m.ts, m.id) < (?3, ?4) \
+             ORDER BY m.ts DESC LIMIT ?5",
         )
         .bind(owner_identity_id)
         .bind(peer_pubkey_hex)
@@ -158,8 +293,8 @@ pub async fn get_messages_range(
 
 pub async fn get_message(pool: &Pool<Sqlite>, id: i64) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE id = ?1",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id WHERE m.id = ?1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -172,8 +307,8 @@ pub async fn get_message_by_hash(
     hash: &str,
 ) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE message_hash = ?1",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id WHERE m.message_hash = ?1",
     )
     .bind(hash)
     .fetch_optional(pool)
@@ -187,9 +322,10 @@ pub async fn get_last_message(
     peer_pubkey_hex: &str,
 ) -> StorageResult<Option<Message>> {
     let msg = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2 \
-         ORDER BY ts DESC LIMIT 1",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         WHERE m.owner_identity_id = ?1 AND c.mldsa_pubkey_hex = ?2 \
+         ORDER BY m.ts DESC LIMIT 1",
     )
     .bind(owner_identity_id)
     .bind(peer_pubkey_hex)
@@ -228,19 +364,22 @@ pub async fn delete_messages_by_peer(
     owner_identity_id: &str,
     peer_pubkey_hex: &str,
 ) -> StorageResult<i64> {
-    let result =
-        sqlx::query("DELETE FROM messages WHERE owner_identity_id = ?1 AND peer_pubkey_hex = ?2")
-            .bind(owner_identity_id)
-            .bind(peer_pubkey_hex)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query(
+        "DELETE FROM messages WHERE contact_id IN \
+         (SELECT id FROM contacts WHERE owner_identity_id = ?1 AND mldsa_pubkey_hex = ?2)",
+    )
+    .bind(owner_identity_id)
+    .bind(peer_pubkey_hex)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() as i64)
 }
 
 pub async fn list_pending(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE pending = 1 ORDER BY ts ASC",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         WHERE m.pending = 1 ORDER BY m.ts ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -252,8 +391,9 @@ pub async fn list_pending_by_peer(
     peer_pubkey_hex: &str,
 ) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE pending = 1 AND peer_pubkey_hex = ?1 ORDER BY ts ASC",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         WHERE m.pending = 1 AND c.mldsa_pubkey_hex = ?1 ORDER BY m.ts ASC",
     )
     .bind(peer_pubkey_hex)
     .fetch_all(pool)
@@ -264,8 +404,9 @@ pub async fn list_pending_by_peer(
 /// 批量查询多个联系人的待发送消息
 pub async fn list_failed(pool: &Pool<Sqlite>) -> StorageResult<Vec<Message>> {
     let msgs = sqlx::query_as::<_, Message>(
-        "SELECT id, owner_identity_id, peer_pubkey_hex, content, is_outgoing, pending, ts, message_hash, msgtype \
-         FROM messages WHERE pending = 2 ORDER BY ts ASC",
+        "SELECT m.id, m.owner_identity_id, c.mldsa_pubkey_hex AS peer_pubkey_hex, m.content, m.is_outgoing, m.pending, m.ts, m.message_hash, m.msgtype \
+         FROM messages m JOIN contacts c ON c.id = m.contact_id \
+         WHERE m.pending = 2 ORDER BY m.ts ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -358,7 +499,7 @@ mod tests {
             .await
             .expect("add contact");
         for i in 0..5 {
-            add_message_with_hash(
+            let id = add_message_with_hash(
                 pool,
                 owner,
                 peer,
@@ -369,7 +510,16 @@ mod tests {
                 0,
             )
             .await
-            .expect("insert");
+            .expect("insert")
+            .expect("new row");
+            // 统一秒级时间戳会撞秒，导致 (ts,id) 游标排序不稳；
+            // 显式写入互异 ts 保证翻页顺序确定。
+            sqlx::query("UPDATE messages SET ts = ?1 WHERE id = ?2")
+                .bind(i as i64)
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("set ts");
         }
 
         // 首次加载（loadLatest 路径：无 before/after）

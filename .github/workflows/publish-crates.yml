@@ -1,0 +1,33 @@
+# 发布可复用 crate 到 crates.io（rootcell → tauri-plugin-rootcell，按依赖序）
+# 触发：tag 形如 `crates-v*`（如 crates-v0.4.0）；crates.io 已发布版本不可覆盖，
+# 发布前必须本地 `cargo publish --dry-run` + 手动确认版本号。
+# 前置：仓库 Settings → Secrets → Actions 需配置 `CRATES_IO_TOKEN`。
+name: "publish-crates"
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "crates-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: "cargo publish (rootcell 系)"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: publish rootcell
+        run: cargo publish -p rootcell --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+      - name: publish tauri-plugin-rootcell
+        # 依赖 rootcell，必须在其发布成功后执行
+        run: cargo publish -p tauri-plugin-rootcell --token "${{ secrets.CRATES_IO_TOKEN }}"

@@ -48,10 +48,10 @@
 
 {#if show}
   <div class="overlay" role="button" tabindex="-1" onclick={() => (show = false)} onkeydown={(e) => e.key === "Escape" && (show = false)}>
-    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}} role="dialog" aria-label="已发送文件管理" tabindex="-1">
+    <div class="modal" onclick={(e) => e.stopPropagation()} onkeydown={() => {}} role="dialog" aria-label={$_("sent_files")} tabindex="-1">
       <div class="header">
         <h2>{$_("sent_files")}</h2>
-        <button class="close" onclick={() => (show = false)} aria-label="关闭">&times;</button>
+        <button class="close" onclick={() => (show = false)} aria-label={$_("close")}>&times;</button>
       </div>
       {#if loading}
         <div class="loading">{$_("loading")}</div>
@@ -185,16 +185,16 @@
   }
   .revoke {
     padding: 4px 12px;
-    border: 1px solid #ef4444;
+    border: 1px solid var(--color-danger);
     background: transparent;
-    color: #ef4444;
+    color: var(--color-danger);
     border-radius: 6px;
     cursor: pointer;
     font-size: 13px;
     transition: all 0.15s;
   }
   .revoke:hover {
-    background: #ef4444;
+    background: var(--color-danger);
     color: #fff;
   }
 

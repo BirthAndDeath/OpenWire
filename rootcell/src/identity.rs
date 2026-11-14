@@ -75,15 +75,6 @@ pub(crate) fn ensure_keyring_init() {
     LazyLock::force(&KEYRING_INIT);
 }
 
-/// 初始化当前平台的 keyring store（强制立即执行，非惰性）。
-///
-/// 桌面/iOS 平台无需手动调用，`check_keyring_available` 等函数会自动触发惰性初始化。
-/// Android 平台需在 JNI 主线程（JVM 上下文就绪后）显式调用此函数，确保 keyring
-/// 在正确的线程上完成初始化。
-pub fn setup_default_keyring() {
-    ensure_keyring_init();
-}
-
 pub struct PrivateKeyHandle {
     private_key: Pin<Box<[u8]>>,
     identifier: String,
@@ -287,9 +278,9 @@ impl PrivateKeyHandle {
         if !Self::check_keyring_available() {
             anyhow::bail!(
                 "Keyring is not available on this platform. \
-                 OpenWire requires a system keyring (Windows Credential Manager, \
+                 A system keyring (Windows Credential Manager, \
                  macOS Keychain, Linux Secret Service, or Android/iOS keystore) \
-                 to securely store encryption keys."
+                 is required to securely store encryption keys."
             );
         }
 
@@ -309,14 +300,14 @@ impl PrivateKeyHandle {
         if !Self::check_keyring_available() {
             anyhow::bail!(
                 "Keyring is not available on this platform. \
-                 OpenWire requires a system keyring to securely store encryption keys."
+                 A system keyring is required to securely store encryption keys."
             );
         }
 
         let master_key = Self::load_master_key()?.ok_or_else(|| {
             anyhow::anyhow!(
                 "Keyring unavailable: no master key found. \
-                 OpenWire requires a system keyring to access encryption keys."
+                 A system keyring is required to access encryption keys."
             )
         })?;
 

@@ -1,20 +1,25 @@
 <script lang="ts">
-  import "../lib/i18n";
+  import { tt } from "../lib/i18n";
   import { _ } from "svelte-i18n";
   import { listen } from "@tauri-apps/api/event";
+  import { stripAllQuoteRefs } from "../lib/quote";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import Input from "./Input.svelte";
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
+  import Spinner from "$lib/components/Spinner.svelte";
   import Toast from "./Toast.svelte";
   import NotificationBadge from "./NotificationBadge.svelte";
   import AddFriendModal from "./AddFriendModal.svelte";
   import SentFileManager from "./SentFileManager.svelte";
+  import TransferManagerModal from "./TransferManagerModal.svelte";
+  import { upsertTransfer } from "../lib/transfers";
   import ResizablePanel from "$lib/components/ResizablePanel.svelte";
   import { formatFileSize } from "$lib/format";
   import type { FileHashInfo } from "$lib/types";
+
   interface IdentityDto {
     id: number;
     identity_id: string;
@@ -58,7 +63,9 @@
 
   // 移动端：返回联系人列表
   function backToContacts() {
-    selectedId = null;
+    if (selectedId) {
+      selectedId = null;
+    }
     sidebarVisible = true;
   }
 
@@ -104,6 +111,10 @@
   interface ContactDto {
     mldsa_pubkey_hex: string;
     name: string;
+    nickname: string | null;
+    notes: string;
+    group_name: string;
+    blocked: boolean;
     added_at: number;
   }
 
@@ -117,14 +128,18 @@
         order: index,
         pubkey_hex: c.mldsa_pubkey_hex,
         name: c.name,
-        lastMsg: "最近聊天",
+        nickname: c.nickname,
+        notes: c.notes,
+        group: c.group_name,
+        blocked: c.blocked,
+        lastMsg: $_("recent_chat"),
         lastTime: c.added_at * 1000,
         unread: 0,
         online: false,
       }));
       if (!selectedId && contacts.length) selectedId = contacts[0].pubkey_hex;
     } catch (e) {
-      showWarning(`加载联系人失败：${e}`);
+      showWarning(tt("load_contacts_failed", { values: { error: e } }));
     } finally {
       loadingContacts = false;
     }
@@ -134,18 +149,26 @@
   let msgListRef: ReturnType<typeof Messagelist> | undefined = $state();
   let selectedId = $state<string | null>(null);
   let inputH = $state(150);
+  // 输入栏最大高度随窗口可用空间（至少 300px），拖动扩展不再被固定 300 限制
+  const inputMax = Math.max(300, Math.round((window.innerHeight ?? 720) * 0.6));
 
   // 添加好友相关状态
   let showAddFriendModal = $state(false);
 
   // 已发送文件管理
   let showSentFiles = $state(false);
+  // 全局传输任务面板
+  let showTransferManager = $state(false);
 
   let contacts = $state<
     {
       order: number;
       pubkey_hex: string;
       name: string;
+      nickname: string | null;
+      notes: string;
+      group: string;
+      blocked: boolean;
       lastMsg: string;
       lastTime: number;
       unread: number;
@@ -156,53 +179,125 @@
   // === 核心是否已就绪（后端核心初始化完成） ===
   let coreReady = $state(false);
   let coreInitError = $state<string | null>(null);
+  // === 加载失败态（连续瞬态失败后停止轮询，模板显示错误与重试） ===
+  let loadFailed = $state(false);
+  let lastLoadError = $state("");
+  let pollDelay = 200;
+  let pollStopped = false;
+  let destroyed = false;
+  let pollFailures = 0;
+  const POLL_FAILURE_LIMIT = 8;
+  let pollTimeout: ReturnType<typeof setTimeout> | undefined = undefined;
+
+  const pollCoreReady = async () => {
+    if (destroyed || coreReady || coreInitError || pollStopped) return;
+    try {
+      await invoke("check_core_ready");
+      coreReady = true;
+      loadContacts();
+      loadCurrentIdentity();
+    } catch (e) {
+      const msg = typeof e === "string" ? e : String(e ?? "");
+      if (msg.startsWith("CORE_INIT_FAILED:")) {
+        coreInitError = msg.slice("CORE_INIT_FAILED:".length);
+        pollStopped = true;
+        console.error("Core 初始化失败:", coreInitError);
+        return;
+      }
+      // PENDING 或其他瞬态错误：记录并继续退避轮询
+      lastLoadError = msg;
+      pollFailures += 1;
+      if (pollFailures >= POLL_FAILURE_LIMIT) {
+        loadFailed = true;
+        pollStopped = true;
+        console.error("Core 加载超时，停止轮询:", lastLoadError);
+        return;
+      }
+      pollDelay = Math.min(pollDelay * 2, 2000);
+      pollTimeout = setTimeout(pollCoreReady, pollDelay);
+    }
+  };
+
+  // 加载失败后重试：重置状态并重新轮询
+  const retryLoad = () => {
+    if (destroyed) return;
+    loadFailed = false;
+    lastLoadError = "";
+    pollFailures = 0;
+    pollDelay = 200;
+    pollStopped = false;
+    pollTimeout = setTimeout(pollCoreReady, pollDelay);
+  };
+
+  // === 定向更新单个联系人（避免每条消息/在线事件全量 map 重建数组） ===
+  const updateContact = (
+    pubkey: string,
+    patch: Partial<{
+      lastMsg: string;
+      lastTime: number;
+      unread: number;
+      online: boolean;
+    }>,
+  ) => {
+    const idx = contacts.findIndex((c) => c.pubkey_hex === pubkey);
+    if (idx === -1) return;
+    contacts[idx] = { ...contacts[idx], ...patch };
+  };
 
   // === 监听消息和事件 ===
   onMount(() => {
-    let unlistenWarning: (() => void) | undefined;
-  let unlistenCoreInitFailed: (() => void) | undefined;
-    let unlistenMessage: (() => void) | undefined;
-    let unlistenFileProgress: (() => void) | undefined;
-    let unlistenCoreReady: (() => void) | undefined;
-    let unlistenDeliveryReceipt: (() => void) | undefined;
-    let unlistenOnlineStatus: (() => void) | undefined;
-    let unlistenMessageSent: (() => void) | undefined;
-    let unlistenForeground: (() => void) | undefined;
-    let pollingTimer: ReturnType<typeof setInterval> | undefined;
+    const unlisteners: (() => void)[] = [];
+    // 统一注册：单个监听注册失败不应导致后续监听全部丢失（事件静默失效）；
+    // 注册是异步的，若注册完成后页面已卸载则立即注销，避免监听泄漏到已销毁页面。
+    const register = async <T,>(
+      event: string,
+      handler: (e: { payload: T }) => void,
+    ): Promise<void> => {
+      try {
+        const unlisten = await listen<T>(event, handler);
+        if (destroyed) unlisten();
+        else unlisteners.push(unlisten);
+      } catch (e) {
+        console.error(`注册事件监听失败 ${event}:`, e);
+      }
+    };
 
-    (async () => {
+    void (async () => {
       // 监听 core-ready 事件（核心初始化完成后由后端发送）
       // 注意：Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
       // 事件可能丢失。因此同时使用 check_core_ready 命令轮询作为可靠兜底。
-unlistenCoreReady = await listen<boolean>("core-ready", () => {
+      await register<boolean>("core-ready", () => {
         coreReady = true;
         loadContacts();
         loadCurrentIdentity();
       });
 
       // 应用从后台恢复前台时，触发发现和拨号，避免好友端因连接超时标记离线
-      unlistenForeground = await listen("tauri://foreground", () => {
+      await register("tauri://foreground", () => {
         invoke("on_foreground").catch(console.error);
       });
 
-      unlistenCoreInitFailed = await listen<string>("core-init-failed", (e) => {
+      await register<string>("core-init-failed", (e) => {
         coreInitError = e.payload;
+        pollStopped = true;
       });
 
-      unlistenWarning = await listen<string>("warning", (e) => {
+      await register<string>("warning", (e) => {
         showWarning(e.payload, 5000);
         console.warn("Received warning from backend:", e.payload);
       });
 
-      // 监听送达回执事件，将 pending 消息标记为已送达
-      unlistenDeliveryReceipt = await listen<string>(
-        "delivery-receipt",
-        (e) => {
-          msgListRef?.markSent(e.payload);
-        },
-      );
+      // 联系人列表变更（新增/更新/删除，含扫码暂存自动补添）→ 刷新列表
+      await register("contacts-changed", () => {
+        loadContacts();
+      });
 
-      unlistenMessage = await listen<string>("chat-message", (e) => {
+      // 监听送达回执事件，将 pending 消息标记为已送达
+      await register<string>("delivery-receipt", (e) => {
+        msgListRef?.markSent(e.payload);
+      });
+
+      await register<string>("chat-message", (e) => {
         // 尝试解析结构化 JSON 消息（FileHash 类型）
         let displayText = e.payload;
         let msgType: "text" | "file_hash" | "file_stream" = "text";
@@ -225,7 +320,12 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             const filename = parsed.filename;
             const total_size = typeof parsed.total_size === "number" ? parsed.total_size : 0;
             const file_hash = parsed.file_hash;
-            displayText = `文件分享: ${filename} (${formatFileSize(total_size)})`;
+            displayText = tt("file_share", {
+              values: {
+                filename,
+                size: formatFileSize(total_size),
+              },
+            });
             fileHashInfo = {
               filename,
               total_size,
@@ -251,26 +351,42 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           senderPubkey, // mldsa_pubkey_hex 参数，用于按联系人过滤
         );
 
-        // 更新联系人列表中的最后一条消息
-        contacts = contacts.map((c) =>
-          c.pubkey_hex === senderPubkey || c.pubkey_hex === selectedId
-            ? { ...c, lastMsg: displayText, lastTime: Date.now() }
-            : c,
-        );
+        // 更新联系人列表中的最后一条消息（定向更新，避免全量 map 重建）
+        if (senderPubkey)
+          updateContact(senderPubkey, {
+            lastMsg: stripAllQuoteRefs(displayText).trim() || displayText,
+            lastTime: Date.now(),
+          });
+        // 选中联系人的预览只应由「该联系人的消息」更新：
+        // 其它联系人的入站消息不得覆盖当前会话预览（上一条已按 senderPubkey 定向更新）
+        if (senderPubkey && selectedId && senderPubkey === selectedId) {
+          updateContact(selectedId, { lastMsg: displayText, lastTime: Date.now() });
+        }
       });
 
-      // 监听在线状态事件：更新每个联系人的 online 字段
-      unlistenOnlineStatus = await listen<string[]>("online-status", (e) => {
+      // 监听在线状态事件：定向更新每个联系人的 online 字段
+      await register<string[]>("online-status", (e) => {
         const onlinePubkeys = new Set(e.payload);
-        contacts = contacts.map((c) => ({
-          ...c,
-          online: onlinePubkeys.has(c.pubkey_hex),
-        }));
+        for (const contact of contacts) {
+          contact.online = onlinePubkeys.has(contact.pubkey_hex);
+        }
+      });
+
+      // 监听单联系人在线状态变更（连接/FriendOffline 驱动，含剩余设备集合）
+      await register<string>("contact-online-status", (e) => {
+        try {
+          const payload = JSON.parse(e.payload);
+          if (payload?.mldsa_pubkey_hex && typeof payload.online === "boolean") {
+            updateContact(payload.mldsa_pubkey_hex, { online: payload.online });
+          }
+        } catch (err) {
+          console.error("解析 contact-online-status 事件失败:", err);
+        }
       });
 
       // 监听消息已发送事件：更新对应消息的 message_hash 字段
       // 这样后续送达回执能通过 message_hash 精确匹配
-      unlistenMessageSent = await listen<string>("message-sent", (e) => {
+      await register<string>("message-sent", (e) => {
         try {
           const payload = JSON.parse(e.payload);
           const messageHash = payload.message_hash;
@@ -283,49 +399,32 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
         }
       });
 
-      // 监听文件传输进度事件
-      unlistenFileProgress = await listen<string>(
-        "file-transfer-progress",
-        (e) => {
-          try {
-            const progress = JSON.parse(e.payload);
-            msgListRef?.updateFileProgress(progress);
-          } catch (err) {
-            console.error("解析文件传输进度失败:", err);
-          }
-        },
-      );
+      // 监听文件传输进度事件 → 写入全局任务存储（聊天卡片与全局面板共享）
+      await register<string>("file-transfer-progress", (e) => {
+        try {
+          const progress = JSON.parse(e.payload);
+          upsertTransfer(progress);
+        } catch (err) {
+          console.error("解析文件传输进度失败:", err);
+        }
+      });
     })();
 
     // 轮询检查 Core 就绪状态（兜底机制）
     // 由于 Tauri 的 emit 是 fire-and-forget，如果前端尚未注册 listener，
     // core-ready 事件会丢失。通过轮询 check_core_ready 命令可靠检测。
-    pollingTimer = setInterval(async () => {
-      if (coreReady) {
-        clearInterval(pollingTimer);
-        return;
-      }
-      try {
-        await invoke("check_core_ready");
-        coreReady = true;
-        clearInterval(pollingTimer);
-        loadContacts();
-        loadCurrentIdentity();
-      } catch {
-      }
-    }, 200);
+    // 指数退避：200ms → 400ms → ... → 2s 封顶，减少启动期间 IPC 请求压力。
+    //
+    // 错误区分（后端协议）：
+    // - "CORE_READY_PENDING:" → 仍在初始化，继续轮询（UI 显示加载中）
+    // - "CORE_INIT_FAILED:..." → 初始化失败，停止轮询并显示错误原因
+    // - 其他异常 → 视为瞬态 IPC 故障，继续轮询；连续失败达阈值后显示加载错误与重试
+    pollTimeout = setTimeout(pollCoreReady, pollDelay);
 
     return () => {
-      if (pollingTimer) clearInterval(pollingTimer);
-      unlistenWarning?.();
-      unlistenCoreInitFailed?.();
-      unlistenMessage?.();
-      unlistenFileProgress?.();
-      unlistenCoreReady?.();
-      unlistenDeliveryReceipt?.();
-      unlistenOnlineStatus?.();
-      unlistenMessageSent?.();
-      unlistenForeground?.();
+      destroyed = true;
+      if (pollTimeout) clearTimeout(pollTimeout);
+      for (const unlisten of unlisteners) unlisten();
     };
   });
 
@@ -334,20 +433,33 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   // === 操作 ===
   const select = (id: string) => (selectedId = id);
 
+  // 消息搜索结果跳转：选中联系人并下发跳转目标给 Messagelist
+  let jumpTarget = $state<{ peer: string; id: number } | null>(null);
+  const msgJump = (peer: string, msgId: number) => {
+    selectedId = peer;
+    if (isMobile) sidebarVisible = false; // 移动端进入会话
+    jumpTarget = { peer, id: msgId };
+  };
+
+  // 长按消息菜单"引用"：将引用文本交给输入框（经 bind:quote 注入）
+  let quoteDraft = $state("");
+
   const send = async (text: string) => {
     if (!selectedId) return;
-    // 添加消息到列表，标记为 pending（待确认送达）
-    msgListRef?.add(text, true, "text", undefined, undefined, undefined, true);
-    contacts = contacts.map((c) =>
-      c.pubkey_hex === selectedId
-        ? { ...c, lastMsg: text, lastTime: Date.now() }
-        : c,
-    );
-    // 同时调用后端发送消息
+    // 添加消息到列表，标记为 pending（待确认送达）；add 会定稿引用游标并返回最终文本
+    const finalText =
+      msgListRef?.add(text, true, "text", undefined, undefined, undefined, true) ??
+      text;
+    // 定向更新联系人最后一条消息（引用标记不进入预览）
+    updateContact(selectedId, {
+      lastMsg: stripAllQuoteRefs(finalText).trim() || finalText,
+      lastTime: Date.now(),
+    });
+    // 同时调用后端发送消息（发送定稿后的引用文本，使对端游标一致）
     try {
-      await invoke("send", { mldsaPubkeyHex: selectedId, message: text });
+      await invoke("send", { mldsaPubkeyHex: selectedId, message: finalText });
     } catch (e) {
-      showWarning(`发送消息失败：${e}`);
+      showWarning(tt("send_message_failed", { values: { error: e } }));
     }
   };
 
@@ -364,12 +476,44 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   function openSentFiles() {
     showSentFiles = true;
   }
+
+  function openTransferManager() {
+    showTransferManager = true;
+  }
 </script>
 
 <main class="container" class:mobile={isMobile} class:sidebar-open={sidebarVisible && isMobile} style={!isMobile ? `grid-template-columns: ${sidebarW}px 1fr` : ''}>
   <!-- 移动端侧边栏遮罩层 -->
   {#if isMobile && sidebarVisible}
     <div class="mobile-overlay" onclick={() => (sidebarVisible = false)} role="presentation" aria-hidden="true"></div>
+  {/if}
+
+  <!-- Core 初始化失败：显示错误原因（覆盖主界面） -->
+  {#if coreInitError}
+    <div class="core-error-screen">
+      <div class="core-error-icon">⚠</div>
+      <h2>{$_("core_init_failed_title")}</h2>
+      <p class="core-error-reason">{coreInitError}</p>
+      <p class="core-error-hint">{$_("core_init_failed_hint")}</p>
+    </div>
+  {:else if !coreReady}
+    <!-- 加载界面（覆盖主界面）：正常显示加载圈，连续失败则显示错误与重试 -->
+    <div class="core-loading-screen">
+      {#if loadFailed}
+        <div class="load-error">
+          <p class="load-error-title">{$_("load_failed")}</p>
+          {#if lastLoadError}
+            <p class="load-error-reason">{lastLoadError}</p>
+          {/if}
+          <button class="load-retry-btn" onclick={retryLoad}>
+            {$_("action_retry")}
+          </button>
+        </div>
+      {:else}
+        <Spinner size={36} />
+        <p>{$_("app_loading")}</p>
+      {/if}
+    </div>
   {/if}
 
   <!-- 桌面端：侧边栏作为可拖拽面板 -->
@@ -387,7 +531,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             class="icon-btn"
             onclick={goToSettings}
             title={$_("settings")}
-            aria-label="打开设置"
+            aria-label={$_("aria_open_settings")}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -405,7 +549,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             class="icon-btn"
             onclick={goToIdentity}
             title={$_("identity_management")}
-            aria-label="身份管理"
+            aria-label={$_("identity_management")}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -423,7 +567,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             class="icon-btn"
             onclick={openSentFiles}
             title={$_("sent_files")}
-            aria-label="已发送文件"
+            aria-label={$_("sent_files")}
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -436,12 +580,50 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
               /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
             >
           </button>
+
+          <button
+            class="icon-btn"
+            onclick={() => goto("/about")}
+            title={$_("about")}
+            aria-label={$_("about")}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              ><path
+                fill="currentColor"
+                d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20m0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16"
+              /></svg
+            >
+          </button>
+
+          <button
+            class="icon-btn"
+            onclick={openTransferManager}
+            title={$_("transfer_manager")}
+            aria-label={$_("transfer_manager")}
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              ><path
+                fill="currentColor"
+                d="M4 6h16v2H4zm0 4h12v2H4zm0 4h12v2H4zm14-6h2v4h-2zm0 4v2h-3l4 4 4-4h-3V8z"
+              /></svg
+            >
+          </button>
         </div>
 
         <Contactlist
           {contacts}
           {selectedId}
           onselect={select}
+          onmeta={loadContacts}
+          onmsgjump={msgJump}
           ondelete={(id) => {
             contacts = contacts.filter((c) => c.pubkey_hex !== id);
             if (selectedId === id)
@@ -449,7 +631,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           }}
         />
 
-        <div class="add-friend-wrapper">
+<div class="add-friend-wrapper">
           <button
             class="add-friend-btn"
             onclick={() => (showAddFriendModal = true)}
@@ -463,10 +645,10 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
               stroke="currentColor"
               stroke-width="2"
             >
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <line x1="19" y1="8" x2="19" y2="14" />
-              <line x1="22" y1="11" x2="16" y2="11" />
+              <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="8.5" cy="7" r="4" />
+              <line x1="20" y1="8" x2="20" y2="14" />
+              <line x1="23" y1="11" x2="17" y2="11" />
             </svg>
             <span>{$_("add_friend")}</span>
           </button>
@@ -481,7 +663,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           class="icon-btn"
           onclick={goToSettings}
           title={$_("settings")}
-          aria-label="打开设置"
+          aria-label={$_("aria_open_settings")}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -499,7 +681,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           class="icon-btn"
           onclick={goToIdentity}
           title={$_("identity_management")}
-          aria-label="身份管理"
+          aria-label={$_("identity_management")}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -517,7 +699,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           class="icon-btn"
           onclick={openSentFiles}
           title={$_("sent_files")}
-          aria-label="已发送文件"
+          aria-label={$_("sent_files")}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -530,12 +712,50 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
             /><path fill="currentColor" d="M8 12h8v2H8zm0 4h5v2H8zm0-8h3v2H8z"/></svg
           >
         </button>
+
+        <button
+          class="icon-btn"
+          onclick={() => goto("/about")}
+          title={$_("about")}
+          aria-label={$_("about")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            ><path
+              fill="currentColor"
+              d="M11 7h2v2h-2zm0 4h2v6h-2zm1-9a10 10 0 1 0 0 20 10 10 0 0 0 0-20m0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16"
+            /></svg
+          >
+        </button>
+
+        <button
+          class="icon-btn"
+          onclick={openTransferManager}
+          title={$_("transfer_manager")}
+          aria-label={$_("transfer_manager")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            ><path
+              fill="currentColor"
+              d="M4 6h16v2H4zm0 4h12v2H4zm0 4h12v2H4zm14-6h2v4h-2zm0 4v2h-3l4 4 4-4h-3V8z"
+            /></svg
+          >
+        </button>
       </div>
 
       <Contactlist
         {contacts}
         {selectedId}
         onselect={selectMobile}
+        onmeta={loadContacts}
+        onmsgjump={msgJump}
         ondelete={(id) => {
           contacts = contacts.filter((c) => c.pubkey_hex !== id);
           if (selectedId === id)
@@ -569,20 +789,31 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   {/if}
 
   <div class="main">
-    <!-- 移动端标题栏：返回按钮 + 关于 -->
-    <div class="mobile-header" class:visible={isMobile && selectedId != null}>
-      <button class="back-btn" onclick={backToContacts} aria-label="返回联系人列表">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
+    <!-- 移动端标题栏：返回/菜单按钮 -->
+    <div class="mobile-header" class:visible={isMobile && !sidebarVisible}>
+      <button class="back-btn" onclick={backToContacts} aria-label={$_("aria_back_to_contacts")}>
+        {#if selectedId}
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+        {:else}
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        {/if}
       </button>
     </div>
 
-    <a class="about" href="./about">{$_("about")}</a>
-
     <div class="chat">
       {#if selectedId}
-        <Messagelist bind:this={msgListRef} contactId={selectedId} />
+        <Messagelist
+            bind:this={msgListRef}
+            contactId={selectedId}
+            {jumpTarget}
+            onquote={(t) => (quoteDraft = t)}
+          />
       {:else if !isMobile}
         <div class="empty">{$_("select_contact_to_chat")}</div>
       {/if}
@@ -593,7 +824,7 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
 
     <ResizablePanel
       min={80}
-      max={300}
+      max={inputMax}
       defaultSize={150}
       bind:size={inputH}
       position="bottom"
@@ -604,7 +835,9 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
           onsend={send}
           disabled={!selectedId}
           mldsaPubkeyHex={selectedId ?? ""}
-          fill
+          bind:quote={quoteDraft}
+          compact={inputH < 140}
+          fill={!isMobile}
         />
       </div>
     </ResizablePanel>
@@ -620,6 +853,9 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
 
 <!-- 已发送文件管理 -->
 <SentFileManager bind:show={showSentFiles} />
+
+<!-- 全局传输任务面板：一目了然所有下载/推送任务，可取消/重试/删除 -->
+<TransferManagerModal bind:show={showTransferManager} />
 
 <style>
   :global(:root) {
@@ -753,9 +989,9 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
   }
 
   .icon-btn:hover {
-    background: var(--border-color);
-    border-color: #3b82f6;
-    color: #3b82f6;
+    background: var(--color-hover);
+    border-color: var(--color-primary);
+    color: var(--color-primary);
   }
 
   .icon-btn:hover svg {
@@ -777,17 +1013,6 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     min-width: 0;
     overflow: hidden;
   }
-  .about {
-    position: absolute;
-    top: 16px;
-    right: 16px;
-    color: var(--text-secondary);
-    text-decoration: none;
-    font-size: 14px;
-  }
-  .about:hover {
-    color: #3b82f6;
-  }
 
   .chat {
     flex: 1;
@@ -801,8 +1026,15 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     color: var(--text-secondary);
   }
   .input-box {
+    /* 移动端（mobileHidden 直接渲染子节点、无 panel-v 定高基准）时为内容自适应，
+       避免 height:100% 撑满整个 .main；桌面端由 .panel-v 提供定高基准再填满。 */
+    min-height: 0;
+    flex-shrink: 0; /* 矮窗口下不被聊天区压缩到 0 */
     border-top: 1px solid var(--border-color);
     background: var(--bg-tertiary);
+  }
+  :global(.panel-v .input-box) {
+    height: 100%; /* 关键：使内部 .wrap.fill{height:100%} 有确定基准，textarea 才能随面板伸缩 */
   }
 
   /* 添加好友按钮样式 */
@@ -832,5 +1064,97 @@ unlistenCoreReady = await listen<boolean>("core-ready", () => {
     background: var(--border-color);
     color: #3b82f6;
     border-color: #3b82f6;
+  }
+/* Core 初始化：加载中界面（覆盖主界面，before core ready） */
+  .core-loading-screen {
+    position: absolute;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 14px;
+  }
+
+  .load-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    max-width: 60vw;
+    text-align: center;
+  }
+  .load-error-title {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--color-danger);
+  }
+  .load-error-reason {
+    font-size: 13px;
+    margin: 0;
+    color: var(--text-secondary);
+    word-break: break-all;
+  }
+  .load-retry-btn {
+    padding: 8px 20px;
+    border-radius: 8px;
+    border: none;
+    background: var(--color-primary);
+    color: white;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .load-retry-btn:hover {
+    background: var(--color-primary-strong);
+  }
+
+  /* Core 初始化失败：错误原因界面 */
+  .core-error-screen {
+    position: absolute;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 24px;
+    text-align: center;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+  }
+
+  .core-error-icon {
+    font-size: 40px;
+  }
+
+  .core-error-screen h2 {
+    margin: 0;
+    font-size: 20px;
+  }
+
+  .core-error-reason {
+    margin: 0;
+    max-width: 480px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 14px;
+    color: #f48771;
+    background: rgba(244, 135, 113, 0.08);
+    border: 1px solid rgba(244, 135, 113, 0.3);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+
+  .core-error-hint {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary, rgba(246, 246, 246, 0.7));
+    opacity: 0.85;
   }
 </style>

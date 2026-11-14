@@ -1,8 +1,5 @@
 //! OpenWire 核心库，处理后端可复用代码工作
-//! ✅
 #![warn(missing_docs)]
-
-
 
 /// Actor 模块（P2P 事件循环 Actor 模式）
 pub mod actor;
@@ -44,14 +41,14 @@ pub mod storage;
 pub mod transfer;
 pub use actor::p2p::{P2pActor, P2pActorBuilder, P2pActorHandle, P2pCommand, P2pEvent};
 pub use actor::RUNTIME;
-pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, NetworkStatusData, PaidNetworkMode, PeerInfoDto, RelayRole, TransferProgressStatus};
+pub use command::{ChatCommand, ChatcoreEvent, IncomingMessage, MessageEvent, NetworkStatusData, PaidNetworkMode, PeerInfoDto, RelayRole, ScanContactInfo, TransferProgressStatus};
 pub use core::ChatCore;
 pub use coreconfig::CoreConfig;
 pub use identity::{
     extract_public_key_from_private, generate_complete_identity,
     load_or_create_peerid, load_or_generate_complete_identity,
 };
-pub use message::{ChatMessage, ChatMessageType, ChatResponse, OnlineStatusPayload};
+pub use message::{ChatMessage, ChatMessageType, ChatResponse, DeviceRouting, OnlineStatusPayload};
 pub use signature::{
     generate_mldsa_keypair, sign_data, validate_mldsa_pubkey_bytes, validate_mldsa_pubkey_hex,
     verify_signature,

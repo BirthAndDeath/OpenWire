@@ -96,6 +96,7 @@ println!("[{}] {}", short_sender, crate::strip_escape(&text));
                 MessageEvent::ContactOnlineStatus {
                     mldsa_pubkey_hex,
                     online,
+                    remaining_devices: _,
                 } => {
                     let short = if mldsa_pubkey_hex.len() > 16 {
                         format!("{}...", &mldsa_pubkey_hex[..16])
@@ -106,6 +107,9 @@ println!("[{}] {}", short_sender, crate::strip_escape(&text));
                     println!("[在线状态] {} {}", short, status);
                 }
                 MessageEvent::IdentityChanged { .. } => {}
+                MessageEvent::ContactsChanged => {
+                    // 联系人列表变更：CLI 每轮循环自动刷新联系人列表，无需额外处理
+                }
             }
         }
     });

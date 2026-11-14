@@ -11,11 +11,33 @@
   --spacing-lg: clamp(16px, 2vw, 32px);
 
   /* ========== 字体 ========== */
+  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-size-xs: clamp(10px, 0.8vw, 12px);
   --font-size-sm: clamp(11px, 1vw, 13px);
   --font-size-base: clamp(13px, 1.2vw, 15px);
   --font-size-lg: clamp(15px, 1.5vw, 18px);
   --font-size-xl: clamp(18px, 2vw, 24px);
+  --line-height: 1.5;
+
+  /* ========== 圆角（4px 基准网格） ========== */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+
+  /* ========== 语义色（浅色主题） ========== */
+  --color-primary: #3b82f6;
+  --color-primary-strong: #2563eb;
+  --color-primary-soft: rgba(59, 130, 246, 0.12);
+  --color-success: #10b981;
+  --color-success-soft: rgba(16, 185, 129, 0.12);
+  --color-danger: #ef4444;
+  --color-danger-soft: rgba(239, 68, 68, 0.12);
+  --color-warning: #f59e0b;
+  --color-hover: rgba(0, 0, 0, 0.06);
+  --color-selected: #1e3a5f;
+  --text-muted: #6b7280;
+  --text-muted-strong: #4b5563;
 
   /* ========== 消息气泡 ========== */
   --bubble-max: clamp(55%, 70%, 80%);
@@ -66,4 +88,43 @@
     --sidebar-default: 380px;
     --bubble-max: 60%;
   }
+}
+
+/* 暗色主题（默认）：语义色与现有 --bg-* 观感对齐 */
+[data-theme="dark"] {
+  --color-primary: #3b82f6;
+  --color-primary-strong: #2563eb;
+  --color-primary-soft: rgba(59, 130, 246, 0.18);
+  --color-success: #10b981;
+  --color-success-soft: rgba(16, 185, 129, 0.18);
+  --color-danger: #ef4444;
+  --color-danger-soft: rgba(239, 68, 68, 0.18);
+  --color-warning: #f59e0b;
+  --color-hover: rgba(255, 255, 255, 0.08);
+  --color-selected: #1e3a5f;
+}
+
+/* 全局排版 */
+html {
+  font-family: var(--font-family);
+  line-height: var(--line-height);
+}
+
+/* 紧凑密度：收紧间距与气泡内边距 */
+[data-density="compact"] {
+  --spacing-xs: 2px;
+  --spacing-sm: 4px;
+  --spacing-md: 8px;
+  --spacing-lg: 12px;
+  --bubble-padding: 6px 8px;
+  --avatar-size: 32px;
+  --avatar-font: 13px;
+}
+
+/* 数字/时间等宽数字：时间戳、文件大小、百分比对齐不跳动 */
+.tabular-nums,
+.msg-meta time,
+.file-size,
+.progress-text {
+  font-variant-numeric: tabular-nums;
 }

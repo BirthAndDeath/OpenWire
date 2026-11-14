@@ -131,12 +131,14 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                 MessageEvent::ContactOnlineStatus {
                     mldsa_pubkey_hex,
                     online,
+                    remaining_devices,
                 } => {
                     json!({
                         "type": "contact_online_status",
                         "data": {
                             "mldsa_pubkey_hex": mldsa_pubkey_hex,
                             "online": online,
+                            "remaining_devices": remaining_devices,
                         },
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     })
@@ -144,6 +146,12 @@ pub async fn json_run(app: &mut App) -> Result<(), CliError> {
                 MessageEvent::IdentityChanged { .. } => {
                     json!({
                         "type": "identity_changed",
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    })
+                }
+                MessageEvent::ContactsChanged => {
+                    json!({
+                        "type": "contacts_changed",
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     })
                 }

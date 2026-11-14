@@ -9,8 +9,16 @@
     "core:default",
     "core:window:allow-set-content-protected",
     "opener:default",
-    "store:default",
+    "rootcell:default",
     "core:path:default",
+    {
+      "identifier": "store:allow-get-store",
+      "allow": [
+        {
+          "path": ".settings.dat"
+        }
+      ]
+    },
     {
       "identifier": "store:allow-load",
       "allow": [

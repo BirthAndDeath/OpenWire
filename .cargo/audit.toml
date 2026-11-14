@@ -1,0 +1,14 @@
+# cargo audit 已跟踪忽略项（非静默压住，均有追踪理由）
+# 上游/依赖升级后应再复核：
+# - RUSTSEC-2026-0118 / 0119: hickory-proto 0.25.2（libp2p-dns 间接引入），
+#   修复需 >=0.26.1，而 libp2p 0.56 依赖链锁定 0.25.x，待 libp2p 升级吸收
+# - RUSTSEC-2024-0344 / 2022-0093: did-key dev-dependencies 引入
+#   ed25519-dalek@1 / curve25519-dalek@3，release 产物无此链（删除前用
+#   `cargo audit --no-fetch --file Cargo.lock` 复核：这会报 4 vulnerabilities）
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2024-0344",
+    "RUSTSEC-2022-0093",
+]

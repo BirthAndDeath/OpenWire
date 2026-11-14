@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { _ } from "svelte-i18n";
+
   interface Notification {
     id: number;
     message: string;
@@ -65,7 +67,7 @@ function toggle(e: MouseEvent) {
 
 {#if notifications.length > 0 || expanded}
 <div class="notif-badge-container">
-  <button class="notif-badge" onclick={toggle} aria-label="notifications">
+  <button class="notif-badge" onclick={toggle} aria-label={$_("notifications")}>
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
       <path d="M13.73 21a2 2 0 0 1-3.46 0" />
@@ -78,14 +80,14 @@ function toggle(e: MouseEvent) {
   {#if expanded}
     <div class="notif-popover" bind:this={popover}>
       <div class="notif-header">
-        <span class="notif-title">通知</span>
+        <span class="notif-title">{$_("notifications")}</span>
         {#if notifications.length > 0}
-          <button class="clear-btn" onclick={clearAll}>清空</button>
+          <button class="clear-btn" onclick={clearAll}>{$_("clear_all")}</button>
         {/if}
       </div>
       <div class="notif-list">
         {#if notifications.length === 0}
-          <div class="notif-empty">暂无通知</div>
+          <div class="notif-empty">{$_("no_notifications")}</div>
         {:else}
           {#each notifications as n (n.id)}
             <div class="notif-item">
@@ -137,7 +139,7 @@ function toggle(e: MouseEvent) {
     min-width: 18px;
     height: 18px;
     border-radius: 9px;
-    background: #ef4444;
+    background: var(--color-danger);
     color: white;
     font-size: 11px;
     font-weight: 700;
@@ -145,7 +147,7 @@ function toggle(e: MouseEvent) {
     align-items: center;
     justify-content: center;
     padding: 0 4px;
-    box-shadow: 0 0 4px rgba(239, 68, 68, 0.6);
+    box-shadow: 0 0 4px var(--color-danger-soft);
   }
 
   .notif-popover {

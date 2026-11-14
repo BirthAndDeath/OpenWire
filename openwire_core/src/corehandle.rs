@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChatCommand, ChatMessageType};
+use crate::{ChatCommand, ChatMessageType, ScanContactInfo};
 
 /// 核心句柄，封装向核心发送命令的通道与优雅关闭信号
 #[derive(Debug, Clone)]
@@ -78,6 +78,15 @@ impl CoreHandle {
         .await
     }
 
+    /// 限时等待核心对某条命令的响应：核心卡死/关停时返回 None，
+    /// 避免上层（Tauri 命令 → UI）无限挂起。
+    async fn await_resp<T>(rx: tokio::sync::oneshot::Receiver<T>) -> Option<T> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
     /// 删除联系人
     pub async fn delete_contact(&self, mldsa_pubkey_hex: &str) -> bool {
         let pool = match crate::storage::pool() {
@@ -93,11 +102,11 @@ impl CoreHandle {
         };
         match crate::storage::delete_contact(pool, &owner_identity_id, mldsa_pubkey_hex).await {
             Ok(rows) if rows > 0 => {
-                tracing::info!("Deleted contact: {}", &mldsa_pubkey_hex[..16]);
+                tracing::info!("Deleted contact: {}", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]);
                 true
             }
             Ok(_) => {
-                tracing::info!("Contact not found: {}", &mldsa_pubkey_hex[..16]);
+                tracing::info!("Contact not found: {}", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]);
                 false
             }
             Err(e) => {
@@ -129,13 +138,10 @@ impl CoreHandle {
             })
             .await;
         match result {
-            Ok(_) => match resp_rx.await {
-                Ok(success) => success,
-                Err(_) => {
-                    tracing::info!("Failed to receive add_contact response");
-                    false
-                }
-            },
+            Ok(_) => Self::await_resp(resp_rx).await.unwrap_or_else(|| {
+                tracing::info!("Failed to receive add_contact response (timeout)");
+                false
+            }),
             Err(e) => {
                 tracing::info!("Failed to add contact: {e}");
                 false
@@ -143,62 +149,159 @@ impl CoreHandle {
         }
     }
 
+    /// 扫码添加联系人（仅凭 SHA256 摘要；完整公钥经 FriendOnline 匹配后自动完成添加）
+    pub async fn add_contact_by_scan(&self, info: ScanContactInfo) -> bool {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let result = self
+            .cmd_tx
+            .send(ChatCommand::AddContactByScan {
+                info,
+                resp: resp_tx,
+            })
+            .await;
+        match result {
+            Ok(_) => Self::await_resp(resp_rx).await.unwrap_or_else(|| {
+                tracing::info!("Failed to receive add_contact_by_scan response (timeout)");
+                false
+            }),
+            Err(e) => {
+                tracing::info!("Failed to add contact by scan: {e}");
+                false
+            }
+        }
+    }
+
+    /// 查询身份分享信息（v2 二进制载荷，供前端生成二维码）
+    pub async fn get_identity_share_info(&self) -> Option<Vec<u8>> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ChatCommand::GetIdentityShareInfo { resp: resp_tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Self::await_resp(resp_rx).await
+    }
+
+    /// 取消文件传输（hex 的 file_hash）
+    pub async fn cancel_file_transfer(&self, file_id_hex: &str) -> bool {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let result = self
+            .cmd_tx
+            .send(ChatCommand::CancelFileTransfer {
+                file_id_hex: file_id_hex.to_string(),
+                resp: resp_tx,
+            })
+            .await;
+        match result {
+            Ok(_) => Self::await_resp(resp_rx).await.unwrap_or_else(|| {
+                tracing::info!("Failed to receive cancel_file_transfer response (timeout)");
+                false
+            }),
+            Err(e) => {
+                tracing::warn!("Failed to cancel file transfer: {e}");
+                false
+            }
+        }
+    }
+
+    /// 按关键词搜索所有联系人的消息内容（返回 JSON 数组字符串）
+    pub async fn search_messages(&self, query: &str) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ChatCommand::SearchMessages { query: query.to_string(), resp: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Self::await_resp(rx).await
+    }
+
+    /// 存储管理：每位联系人的消息/文件占用统计（返回 JSON 数组字符串）
+    pub async fn get_storage_stats(&self) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ChatCommand::GetStorageStats { resp: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Self::await_resp(rx).await
+    }
+
+    /// 删除指定联系人的聊天记录
+    pub async fn delete_contact_history(&self, mldsa_pubkey_hex: &str) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(ChatCommand::DeleteContactHistory {
+                mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+                resp: tx,
+            })
+            .await;
+        Self::await_resp(rx).await.unwrap_or(false)
+    }
+
+    /// 删除指定联系人的已发送文件（记录 + 本地文件），返回释放字节数
+    pub async fn delete_contact_files(&self, mldsa_pubkey_hex: &str) -> Option<i64> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(ChatCommand::DeleteContactFiles {
+                mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+                resp: tx,
+            })
+            .await;
+        Self::await_resp(rx).await.flatten()
+    }
+
     /// 发送关闭命令（非阻塞）
     pub fn shutdown(&self) {
         let _ = self.try_send_cmd(ChatCommand::Shutdown);
     }
 
-    /// 发送文件（计算文件 hash、注册文件路径、发送 FileHash 消息）
+    /// 更新联系人元数据（自定义昵称/备注/分组/屏蔽；None=不修改，Some("")=清空）
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_contact_meta(
+        &self,
+        mldsa_pubkey_hex: &str,
+        name: Option<String>,
+        notes: Option<String>,
+        group_name: Option<String>,
+        blocked: Option<bool>,
+    ) -> bool {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let result = self
+            .cmd_tx
+            .send(ChatCommand::UpdateContactMeta {
+                mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+                name,
+                notes,
+                group_name,
+                blocked,
+                resp: resp_tx,
+            })
+            .await;
+        match result {
+            Ok(_) => Self::await_resp(resp_rx).await.unwrap_or(false),
+            Err(e) => {
+                tracing::info!("Failed to send update_contact_meta: {e}");
+                false
+            }
+        }
+    }
+
+    /// 发送文件（校验 → 计算 hash → 记录 sent_files → 发送 FileHash 消息）。
+    /// 与 Tauri 命令层共用 `transfer::prepare_and_send_file`，避免两套实现漂移。
     pub async fn send_file(&self, mldsa_pubkey_hex: &str, file_path: &std::path::Path) -> bool {
-        let file_hash = match crate::transfer::compute_file_hash(file_path).await {
-            Ok(hash) => hash,
-            Err(e) => {
-                tracing::info!("Failed to compute file hash: {e}");
-                return false;
-            }
-        };
-        let metadata = match tokio::fs::metadata(file_path).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::info!("Failed to get file metadata: {e}");
-                return false;
-            }
-        };
-        let total_size = metadata.len();
-        let filename = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        // 记录到已发送文件历史（sent_files 表）
-        if let Some(pool) = crate::storage::pool()
-            && let Err(e) = crate::storage::add_sent_file(
-                pool,
-                &file_hash,
-                file_path.to_str().unwrap_or(""),
-                &filename,
-                total_size,
-            )
+        crate::transfer::prepare_and_send_file(&self.cmd_tx, mldsa_pubkey_hex, file_path)
             .await
-            {
-                tracing::warn!("记录已发送文件失败: {e}");
-            }
-
-        let file_info = crate::message::FileHashInfo::new(filename, total_size, file_hash);
-        let file_info_bytes = match postcard::to_allocvec(&file_info) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::info!("Failed to serialize FileHashInfo: {e}");
-                return false;
-            }
-        };
-
-        self.send_cmd(ChatCommand::SendMessage {
-            mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
-            msgtype: ChatMessageType::FileHash,
-            data: file_info_bytes,
-        })
-        .await
+            .is_ok()
     }
 }

@@ -1,0 +1,5 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "rootcell 身份/密钥环插件默认权限：允许查询密钥环可用性"
+permissions = ["allow-is-keyring-available"]

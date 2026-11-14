@@ -1,11 +1,14 @@
 <script lang="ts">
     import { _ } from "svelte-i18n";
+    import { renderMarkdown } from "../../lib/markdown";
+    // 构建期打包仓库根 README（单一事实源），内嵌展示，不跳远程
+    import readme from "../../../../README.md?raw";
 </script>
 
 <main>
     <div class="hero">
         <a
-            href="https://github.com/BirthAndDeath/chat"
+            href="https://github.com/BirthAndDeath/OpenWire"
             target="_blank"
             class="logo-link"
         >
@@ -19,7 +22,7 @@
     <div class="links">
         <a href="/" class="btn secondary">{$_("home")}</a>
         <a
-            href="https://github.com/BirthAndDeath/chat"
+            href="https://github.com/BirthAndDeath/OpenWire"
             target="_blank"
             class="btn primary"
         >
@@ -28,7 +31,7 @@
                     d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"
                 />
             </svg>
-            GitHub
+            {$_("github")}
         </a>
     </div>
 
@@ -49,21 +52,30 @@
                     d="M488.6 104.1c16.7 18.1 24.4 39.7 23.3 65.7v202.4c-.4 26.4-9.2 48.1-26.5 65.1-17.2 17-39.1 25.9-65.5 26.7H92.02c-26.45-.8-48.21-9.8-65.28-27.2C9.682 419.4.767 397.5.968 371.6V169.2c-1.153-26.4 7.645-48.4 26.392-66.1 18.75-17.7 40.61-26.5 65.58-26.4h35.7l21.2-40.95c6.5-11.93 16.6-17.88 30.3-17.88 13.8 0 23.9 5.95 30.3 17.88l21.2 40.95h146.4l21.2-40.95c6.5-11.93 16.6-17.88 30.3-17.88 13.8 0 23.9 5.95 30.3 17.88l21.2 40.95h35.7c25-.1 46.8 8.7 65.5 26.4zM96 224c-17.7 0-32 14.3-32 32s14.3 32 32 32 32-14.3 32-32-14.3-32-32-32zm320 0c-17.7 0-32 14.3-32 32s14.3 32 32 32 32-14.3 32-32-14.3-32-32-32z"
                 />
             </svg>
-            Bilibili
+            {$_("bilibili")}
         </a>
-        <span>Consider supporting me 🥰</span>
+        <span>{$_("support_me")}</span>
     </div>
 
     <p class="desc">{$_("details")}</p>
+
+    <!-- 构建期内嵌 README（单一事实源），可滚动查看 -->
+    <section class="readme">
+        <h2>{$_("about_readme")}</h2>
+        <div class="readme-body">{@html renderMarkdown(readme)}</div>
+    </section>
 </main>
 
 <style>
     main {
-        min-height: 100vh;
+        /* 全局 app-layout 为 overflow:hidden：本页自身作为滚动容器，允许纵向滑动阅读 README。
+           safe center：内容矮时居中、超出一屏时顶部对齐可滚动，避免裁掉顶部。 */
+        height: 100dvh;
+        overflow-y: auto;
         display: flex;
         flex-direction: column;
         align-items: center;
-        justify-content: center;
+        justify-content: safe center;
         padding: 2rem;
         box-sizing: border-box;
         position: relative;
@@ -185,6 +197,62 @@
         font-size: 0.875rem;
         line-height: 1.6;
         margin-top: 2rem;
+    }
+
+    /* 内嵌 README 卡片 */
+    .readme {
+        width: 100%;
+        max-width: 720px;
+        margin: 2.5rem auto 0;
+        text-align: left;
+    }
+    .readme h2 {
+        font-size: 1.1rem;
+        margin-bottom: 0.75rem;
+        color: var(--text-primary, #fafafa);
+    }
+    .readme-body {
+        /* 不设内滚：README 随页面整体向下滑动阅读 */
+        padding: 1rem 1.25rem;
+        border: 1px solid var(--border-color, #2a2a2a);
+        border-radius: 12px;
+        background: var(--bg-primary, #141414);
+        font-size: 0.875rem;
+        line-height: 1.6;
+        color: var(--text-secondary, #a3a3a3);
+    }
+    .readme-body :global(h1) {
+        font-size: 1.2rem;
+        margin: 0 0 0.5rem;
+    }
+    .readme-body :global(h2) {
+        font-size: 1.05rem;
+        margin: 1rem 0 0.4rem;
+        color: var(--text-primary, #fafafa);
+    }
+    .readme-body :global(p) {
+        margin: 0.4rem 0;
+    }
+    .readme-body :global(ul) {
+        margin: 0.4rem 0;
+        padding-left: 1.25rem;
+    }
+    .readme-body :global(blockquote) {
+        border-left: 3px solid var(--color-primary, #3b82f6);
+        margin: 0.5rem 0;
+        padding-left: 0.75rem;
+    }
+    .readme-body :global(code) {
+        background: rgba(128, 128, 128, 0.2);
+        border-radius: 4px;
+        padding: 0 4px;
+        font-size: 0.85em;
+    }
+    .readme-body :global(pre) {
+        background: rgba(0, 0, 0, 0.35);
+        border-radius: 6px;
+        padding: 0.75rem;
+        overflow-x: auto;
     }
 
     @media (width <= 480px) {

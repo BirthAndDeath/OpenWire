@@ -17,6 +17,11 @@ use sha2::{Digest, Sha256};
 /// 接收端据此判断能否正确解析并处理消息。
 pub(crate) const NETEVENT_VERSION: u8 = 1;
 
+/// ML-DSA 公钥 hex 的合法长度上限（对齐 DHT key 校验），
+/// 签名验证/hex 解码前置检查，防恶意对端超大字段触发巨额分配。
+/// 客户端与中继服务器共用。
+pub const MAX_MLDSA_PUBKEY_HEX_LEN: usize = 4096;
+
 /// 网络事件请求
 ///
 /// 通过 request-response 协议发送给对等节点。
@@ -45,6 +50,28 @@ pub enum NetEventRequest {
         /// `None` 表示缺失签名，接收端会直接拒绝此请求并记录警告。
         /// 用于在接收端验证通告者确实持有 mldsa_pubkey_hex 对应的私钥，
         /// 防止攻击者冒充他人公钥污染 pubkey→PeerID / ML-KEM 缓存。
+        #[serde(default)]
+        signature: Option<Vec<u8>>,
+    },
+    /// 设备下线通知（对称于 FriendOnline）
+    ///
+    /// 本设备优雅退出前通知对端"该设备已下线"。对端据此把自己维护的
+    /// 该账户在线设备集合中移除本设备；若集合因此为空，则标记该账户离线。
+    ///
+    /// `remaining_peers` 是发送方尽力提供（DHT 自查询）的其余在线设备 PeerID。
+    /// 对端应以「自己本地已连接的该账户设备集合」为准计算剩余设备，本字段仅作参考。
+    FriendOffline {
+        /// 协议版本号（与 FriendOnline 同语义）
+        #[serde(default)]
+        version: Option<u8>,
+        /// 该账户的 ML-DSA 公钥 hex
+        mldsa_pubkey_hex: String,
+        /// 正在下线的设备 PeerID（Base58 编码）
+        peer_id: String,
+        /// 该账户其余仍在线/可达的设备 PeerID（空 = 尽力认为全部下线）
+        #[serde(default)]
+        remaining_peers: Vec<String>,
+        /// 身份声明签名（与 FriendOnline 相同的公钥→PeerID 归属证明）
         #[serde(default)]
         signature: Option<Vec<u8>>,
     },
@@ -154,5 +181,43 @@ pub fn verify_friend_online_signature(
         return false;
     }
     let payload = friend_online_payload(mldsa_pubkey_hex, peer_id, listen_addrs, mlkem_pubkey_hex);
+    crate::signature::verify_signature(&pubkey_bytes, &payload, signature).unwrap_or(false)
+}
+
+/// 生成 FriendOffline 身份声明的规范化负载哈希。
+///
+/// 与 FriendOnline 相同的签名约定：remaining_peers 排序后编码，保证顺序差异不影响签名。
+pub(crate) fn friend_offline_payload(
+    mldsa_pubkey_hex: &str,
+    peer_id: &str,
+    remaining_peers: &[String],
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"OpenWire-FriendOffline-v1");
+    hasher.update(mldsa_pubkey_hex.as_bytes());
+    hasher.update(peer_id.as_bytes());
+    let mut sorted: Vec<&str> = remaining_peers.iter().map(String::as_str).collect();
+    sorted.sort();
+    for p in &sorted {
+        hasher.update(p.as_bytes());
+        hasher.update([0u8]);
+    }
+    hasher.finalize().to_vec()
+}
+
+/// 验证 FriendOffline 请求的 ML-DSA 签名。
+pub fn verify_friend_offline_signature(
+    mldsa_pubkey_hex: &str,
+    peer_id: &str,
+    remaining_peers: &[String],
+    signature: &[u8],
+) -> bool {
+    let Ok(pubkey_bytes) = hex::decode(mldsa_pubkey_hex) else {
+        return false;
+    };
+    if signature.is_empty() {
+        return false;
+    }
+    let payload = friend_offline_payload(mldsa_pubkey_hex, peer_id, remaining_peers);
     crate::signature::verify_signature(&pubkey_bytes, &payload, signature).unwrap_or(false)
 }

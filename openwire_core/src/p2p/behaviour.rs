@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 use crate::p2p::netevent::{NetEventRequest, NetEventResponse};
+use crate::message::EncryptedFileChunk;
 use crate::{ChatMessage, ChatResponse};
 use libp2p::kad::{self};
 use libp2p::request_response::cbor;
@@ -31,6 +32,9 @@ pub struct MyBehaviour {
 
     /// 网络事件通知 request-response（好友上线等）
     pub rr_netevent: cbor::Behaviour<NetEventRequest, NetEventResponse>,
+
+    /// 文件传输 request-response（4MB 上限：256KB 分片 + 加密签名开销 ≈ 264KB，留足余量）
+    pub rr_file: cbor::Behaviour<EncryptedFileChunk, bool>,
 
     /// mDNS 协议：局域网内自动发现对等节点
     pub mdns: mdns::tokio::Behaviour,

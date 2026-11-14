@@ -115,6 +115,81 @@ pub fn stop_providing_to_dht(swarm: &mut Swarm<MyBehaviour>, mldsa_pubkey_hex: &
     );
 }
 
+/// 判断 Multiaddr 是否为公网可达地址（非环回/私有/链路本地/ULA/组播/未指定）。
+///
+/// 等价于 Go libp2p 的 `Addresses.NoAnnounce`：任何向外部宣告/写入推荐信息的
+/// 地址（身份记录、二维码 addr、节点导出）都应先过此过滤，避免内网网段泄漏。
+pub fn is_public_internet_addr(maddr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    let ip = maddr.iter().find_map(|p| match p {
+        Protocol::Ip4(a) => Some(std::net::IpAddr::V4(a)),
+        Protocol::Ip6(a) => Some(std::net::IpAddr::V6(a)),
+        _ => None,
+    });
+    match ip {
+        Some(std::net::IpAddr::V4(v4)) => {
+            !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+        }
+        Some(std::net::IpAddr::V6(v6)) => {
+            let first: u16 = v6.segments()[0];
+            let is_ula_or_lla =
+                // fc00::/7  ULA
+                (first & 0xfe00) == 0xfc00
+                // fe80::/10 链路本地
+                || (first & 0xffc0) == 0xfe80;
+            !is_ula_or_lla
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && !v6.is_unspecified()
+        }
+        // 无 IP 组件（/dns 或纯 relay 地址）不在此处过滤
+        _ => true,
+    }
+}
+
+/// 判断 Multiaddr 是否可作为二维码推荐直连地址。
+///
+/// 与 `is_public_internet_addr` 的区别：**保留局域网/私有地址**（192.168/16、
+/// 10/8、172.16/12、IPv6 ULA），使扫码方在同一局域网无服务器环境也能直连；
+/// 仅排除环回、链路本地、组播、未指定、广播以及 circuit 地址（非端点直连地址）。
+pub fn is_qr_recommend_addr(maddr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    // /p2p-circuit 是经中继的电路地址，非端点直接可拨地址，不推荐进二维码
+    if maddr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        return false;
+    }
+    let ip = maddr.iter().find_map(|p| match p {
+        Protocol::Ip4(a) => Some(std::net::IpAddr::V4(a)),
+        Protocol::Ip6(a) => Some(std::net::IpAddr::V6(a)),
+        _ => None,
+    });
+    match ip {
+        Some(std::net::IpAddr::V4(v4)) => {
+            !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_multicast()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+        }
+        Some(std::net::IpAddr::V6(v6)) => {
+            let first: u16 = v6.segments()[0];
+            // fe80::/10 链路本地排除；fc00::/7 ULA（局域网地址）保留
+            let is_lla = (first & 0xffc0) == 0xfe80;
+            !is_lla
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                && !v6.is_unspecified()
+        }
+        // 无 IP 组件（/dns 或纯 relay 地址）不推荐（无法作为端点直连地址）
+        _ => false,
+    }
+}
+
 /// 随机刷新路由表：选取一个随机桶范围，发起 get_closest_peers 查询
 ///
 /// 通过随机生成 PeerID 发起 Kademlia 查询，扩展路由表覆盖范围。

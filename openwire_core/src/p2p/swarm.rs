@@ -29,6 +29,9 @@ static PROTOCOL_MSGRR: LazyLock<StreamProtocol> =
 /// 网络事件通知协议标识
 static PROTOCOL_NETEVENT: LazyLock<StreamProtocol> =
     LazyLock::new(|| StreamProtocol::new("/chat/rr_netevent/0.0.1"));
+/// 文件传输协议标识（4MB 上限，避免加密+签名开销超过消息上限）
+static PROTOCOL_RR_FILE: LazyLock<StreamProtocol> =
+    LazyLock::new(|| StreamProtocol::new("/chat/rr_file/0.0.1"));
 
 // ============================================================================
 // DDoS 防护配置
@@ -38,6 +41,9 @@ static PROTOCOL_NETEVENT: LazyLock<StreamProtocol> =
 const REQUEST_SIZE_MAX: usize = 256 * 1024;
 /// 响应消息最大大小（256KB）
 const RESPONSE_SIZE_MAX: usize = 256 * 1024;
+/// 文件传输请求/响应上限（4MB：单分片 256KB + 加密+签名 ≈ 264KB，留足余量）
+const FILE_REQUEST_SIZE_MAX: usize = 4 * 1024 * 1024;
+const FILE_RESPONSE_SIZE_MAX: usize = 1024;
 
 /// Identify 协议缓存大小
 const IDENTIFY_CACHE_SIZE: usize = 100;
@@ -138,6 +144,19 @@ pub fn swarm_init(
                     netevent_rr_config,
                 );
 
+                // --- rr_file: 文件传输（4MB 上限：256KB 分片 + 加密签名 ≈ 264KB，留足余量）---
+                let file_codec = Codec::<crate::message::EncryptedFileChunk, bool>::default()
+                    .set_request_size_maximum(FILE_REQUEST_SIZE_MAX as u64)
+                    .set_response_size_maximum(FILE_RESPONSE_SIZE_MAX as u64);
+                let file_rr_config = rrconfig::default()
+                    .with_request_timeout(Duration::from_secs(120))
+                    .with_max_concurrent_streams(RR_MAX_CONCURRENT_STREAMS);
+                let rr_file = cbor::Behaviour::with_codec(
+                    file_codec,
+                    [(PROTOCOL_RR_FILE.deref().to_owned(), ProtocolSupport::Full)],
+                    file_rr_config,
+                );
+
                 // --- mDNS 配置 ---
                 let mdns =
                     mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())
@@ -182,6 +201,7 @@ pub fn swarm_init(
                     upnp,
                     rr_msg,
                     rr_netevent,
+                    rr_file,
                     mdns,
                     kademlia,
                     ping,

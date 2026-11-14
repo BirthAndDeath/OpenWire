@@ -115,8 +115,8 @@ impl App {
             pool,
             &owner,
             pubkey,
-            None,
-            50,
+            Some(Self::MAX_MESSAGES_PER_CONTACT as i64),
+            0,
         )
         .await else { return };
         let entry = self.messages_by_contact.entry(pubkey.to_string()).or_default();
@@ -259,12 +259,15 @@ impl App {
         let mut file_shares_by_contact: HashMap<String, Vec<Option<FileShareInfo>>> =
             HashMap::new();
         for contact in &contacts {
+            // 在 SQL 侧限制条数（与 MAX_MESSAGES_PER_CONTACT 一致），
+            // 避免 limit=None 全表拉取后再内存截断（联系人越多启动越慢）。
+            // offset 必须为 0：第 5 参数是 offset，传 50 会跳过最近 50 条导致历史空白。
             if let Ok(msgs) = openwire_core::storage::get_messages(
                 pool,
                 &owner,
                 &contact.mldsa_pubkey_hex,
-                None,
-                50,
+                Some(Self::MAX_MESSAGES_PER_CONTACT as i64),
+                0,
             )
             .await
             {
@@ -416,6 +419,7 @@ let text = format!("{} {}", prefix, crate::strip_escape(&msg.content));
             MessageEvent::ContactOnlineStatus {
                 mldsa_pubkey_hex,
                 online,
+                remaining_devices: _,
             } => {
                 let short = if mldsa_pubkey_hex.len() > 16 {
                     format!("{}...", &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())])
@@ -427,6 +431,9 @@ let text = format!("{} {}", prefix, crate::strip_escape(&msg.content));
             }
             MessageEvent::IdentityChanged { .. } => {
                 // CLI 不需要缓存 ML-KEM 公钥，忽略
+            }
+            MessageEvent::ContactsChanged => {
+                // CLI 联系人列表每次循环实时查询，无需缓存，忽略
             }
         }
     }

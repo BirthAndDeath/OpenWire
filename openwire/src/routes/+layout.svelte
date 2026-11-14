@@ -2,6 +2,7 @@
   import "../lib/i18n";
   import "../lib/styles/variables.css";
   import { onMount, type Snippet } from "svelte";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { initTheme } from "../lib/theme";
   import { initLanguage } from "../lib/language";
   import { initSettingsStore, getSetting, chatBackgroundStore, fontSizeScale } from "../lib/settings";
@@ -38,7 +39,13 @@
     if (!settingsReady) return;
     let cancelled = false;
     (async () => {
-      const url = await resolveBackgroundUrl();
+      let url: string;
+      try {
+        url = await resolveBackgroundUrl();
+      } catch (e) {
+        console.error("加载背景图失败:", e);
+        return;
+      }
       if (cancelled) {
         if (url.startsWith("blob:")) URL.revokeObjectURL(url);
         return;
@@ -58,14 +65,36 @@
   });
 
   onMount(async () => {
-    await initSettingsStore();
-    // 设置就绪后，背景加载交由上面的 $effect 统一执行（单次），不再重复显式加载
-    settingsReady = true;
-    // 字号
-    const savedFontSize = await getSetting<number>("font_size");
-    if (savedFontSize !== undefined && savedFontSize >= 0.5 && savedFontSize <= 2.0) {
-      fontSizeScale.set(savedFontSize);
+    try {
+      await initSettingsStore();
+      // 字号
+      const savedFontSize = await getSetting<number>("font_size");
+      if (savedFontSize !== undefined && savedFontSize >= 0.5 && savedFontSize <= 2.0) {
+        fontSizeScale.set(savedFontSize);
+      }
+    } catch (e) {
+      console.error("初始化布局设置失败:", e);
+    } finally {
+      // 设置就绪后，背景加载交由上面的 $effect 统一执行（单次）；
+      // 即使读取失败也置就绪，避免背景因等待一个永不成功的初始化而永久不加载
+      settingsReady = true;
     }
+  });
+
+  // 全局拦截外部链接：http(s) 锚点统一交由系统浏览器打开，
+  // 避免 WebView 在应用内导航到空白外部页（CSP 不管 OS 级操作，走 IPC 不受 connect-src 限制）。
+  onMount(() => {
+    const onClick = (e: MouseEvent) => {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey) return;
+      const anchor = (e.target as HTMLElement)?.closest?.("a");
+      if (!anchor) return;
+      const href = anchor.getAttribute("href");
+      if (!href || !/^https?:\/\//i.test(href)) return;
+      e.preventDefault();
+      openUrl(href).catch((err) => console.error("打开外部链接失败:", err));
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
   });
 </script>
 

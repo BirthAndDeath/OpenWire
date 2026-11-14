@@ -1,49 +1,85 @@
 version: 2
 updates:
+  # ── Rust（cargo workspace） ──
+  # 分组策略：一周内的更新最多产出 2 个 PR——
+  #   · minor+patch 合成一个 PR（绝大多数更新走这里）
+  #   · major 单独一个 PR（与 minor/patch 隔离，便于单独评估破坏性变更）
+  # 同时纳入安全更新（applies-to），避免安全 PR 额外增加数量。
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "08:00"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "rust"
-    # 分组更新，将多个依赖合并到一个 PR
-    groups:
-      tokio:
-        patterns:
-          - "tokio*"
-        update-types:
-          - "minor"
-          - "patch"
-      tauri:
-        patterns: ["tauri*", "serde*", "specta*"]
-      backend:
-        patterns: ["openwire*", "rootcell*"]
     versioning-strategy: "auto"
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+        applies-to: ["version-updates", "security-updates"]
+      cargo-major:
+        patterns: ["*"]
+        update-types: ["major"]
+        applies-to: ["version-updates", "security-updates"]
 
+  # ── 前端（openwire workspace） ──
   - package-ecosystem: "npm"
     directory: "/openwire"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "08:00"
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "javascript"
-    open-pull-requests-limit: 10
     groups:
-      tauri-frontend:
-        patterns: ["@tauri-apps/*", "svelte*", "vite*"]
-        update-types: [minor, patch]
-      types:
-        patterns: ["@types/*", "typescript*"]
-      lint:
-        patterns: ["eslint*", "prettier*"]
-  # 检查 GitHub Actions 工作流
+      openwire-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+        applies-to: ["version-updates", "security-updates"]
+      openwire-major:
+        patterns: ["*"]
+        update-types: ["major"]
+        applies-to: ["version-updates", "security-updates"]
+
+  # ── 仓库根目录工具链 ──
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+    groups:
+      root-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+        applies-to: ["version-updates", "security-updates"]
+      root-major:
+        patterns: ["*"]
+        update-types: ["major"]
+        applies-to: ["version-updates", "security-updates"]
+
+  # ── GitHub Actions ──
+  # Action 更新彼此独立、风险低，全部合并为一个 PR（含 major 与安全更新）。
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "08:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "ci"
+    groups:
+      actions-all:
+        patterns: ["*"]
+        applies-to: ["version-updates", "security-updates"]

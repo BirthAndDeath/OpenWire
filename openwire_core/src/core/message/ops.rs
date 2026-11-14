@@ -5,6 +5,22 @@ use crate::actor::p2p::{swarm_ops as p2p_swarm_ops, P2pCommand};
 
 use crate::{core::ChatCore, crypto, error::CoreError, message::ChatMessageType, storage};
 
+/// 仅用户可见消息持久化到离线队列；纯协议消息不落库。
+///
+/// - `Text`（聊天）、`FileHash`（发出的文件提示）必须离线排队。
+/// - `FileDownloadRequest` 代表收件人的下载意图：发送方离线时排队，
+///   上线重试后请求是幂等的（对方重发即重新发起传输），分片到达时
+///   file_transfer_manager 自动重建接收状态，维持"离线求档"能力。
+/// - `FileStream` 分片与 `FileDownloadResponse` 等协议消息不落库：
+///   分片由断点状态管理，重放分片/握手会破坏状态或造成重复传输；
+///   DownloadResponse 是即时应答，无离线排队语义。
+fn should_persist_to_pending(msgtype: ChatMessageType) -> bool {
+    matches!(
+        msgtype,
+        ChatMessageType::Text | ChatMessageType::FileHash | ChatMessageType::FileDownloadRequest
+    )
+}
+
 impl ChatCore {
     /// send_text 的公开入口
     ///
@@ -46,8 +62,7 @@ impl ChatCore {
         // 通过 DHT 查找接收方当前的 PeerID（临时传输层标识）
         let recipient_peer_id = {
             let store = self.get_dht_store();
-            match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {
-                Some(peer_id) => {
+            match store.get_peerid_by_pubkey(mldsa_pubkey_hex) {                Some(peer_id) => {
                     tracing::debug!(
                         "Found PeerID {} for {} in local DHT database",
                         peer_id,
@@ -81,7 +96,7 @@ impl ChatCore {
                                 )));
                             }
                             tracing::info!("未找到 {} 的 PeerID，保存到离线队列", pubkey_short);
-                            if !is_retry {
+                            if !is_retry && should_persist_to_pending(msgtype) {
                                 self.save_pending_message(mldsa_pubkey_hex, msgtype, &data)
                                     .await;
                             }
@@ -101,6 +116,65 @@ impl ChatCore {
                 }
             }
         };
+
+        // === 多设备扇出：目标账号有多台在线设备时，对每台独立加密投递 ===
+        // 同一明文用各设备 ML-KEM 加密、同一发送方签名（身份不变）、
+        // 携带同一 origin_hash（跨副本稳定去重）。单设备/旧客户端走下方原路径。
+        let account_devices = self
+            .get_dht_store()
+            .list_pubkey_devices(mldsa_pubkey_hex);
+        if account_devices.len() >= 2 {
+            let routing = self.new_device_routing(mldsa_pubkey_hex, msgtype, &data);
+            let mut sent_any = false;
+            for pid in &account_devices {
+                let Some(mlkem_hex) = self.peer_cache.peerid_to_mlkem.get(pid) else {
+                    continue;
+                };
+                if mlkem_hex.is_empty() {
+                    continue;
+                }
+                let Ok(device_mlkem) = hex::decode(mlkem_hex.as_str()) else {
+                    continue;
+                };
+                let Ok(encrypted) = crypto::encrypt_message(&data, &device_mlkem) else {
+                    continue;
+                };
+                let Ok(message) = self
+                    .build_signed_message_with_routing(msgtype, encrypted, Some(routing.clone()))
+                    .await
+                else {
+                    continue;
+                };
+                let message_hash = hex::encode(&message.hash);
+                self.send_message(*pid, message, Some(&message_hash)).await;
+                sent_any = true;
+                tracing::debug!(
+                    "多设备扇出: 向 {} 的设备 {} 发送消息 (origin_hash={}..)",
+                    pubkey_short,
+                    pid,
+                    &routing.origin_hash[..16.min(routing.origin_hash.len())]
+                );
+            }
+            if !sent_any {
+                // 全部设备均无可用 ML-KEM → 按原离线路径处理
+                return Err(CoreError::MlKemKeyNotCached(format!(
+                    "联系人 {} 的所有在线设备均无可加密 ML-KEM，消息未发送",
+                    pubkey_short
+                )));
+            }
+            // pending 以 origin_hash 为逻辑消息入账键：跨副本稳定，
+            // 接收端回执附带 origin_hash 可精确匹配（不依赖某台设备的密文 hash）。
+            if !is_retry && should_persist_to_pending(msgtype) {
+                self.save_pending_message_with_hash(
+                    mldsa_pubkey_hex,
+                    msgtype,
+                    &data,
+                    &routing.origin_hash,
+                )
+                .await;
+            }
+            return Ok(routing.origin_hash);
+        }
 
         // 获取接收方的 ML-KEM 公钥
         let recipient_mlkem_public_key = self
@@ -131,7 +205,7 @@ impl ChatCore {
         );
 
         // 保存到数据库作为 pending（重试时消息已在 pending 队列中，跳过保存）
-        if !is_retry {
+        if !is_retry && should_persist_to_pending(msgtype) {
             tracing::debug!(
                 "send_text_impl: 调用 save_pending_message_with_hash, msgtype={:?}, hash={}..",
                 msgtype,
@@ -140,7 +214,7 @@ impl ChatCore {
             self.save_pending_message_with_hash(mldsa_pubkey_hex, msgtype, &data, &message_hash)
                 .await;
         } else {
-            tracing::debug!("send_text_impl: is_retry=true, 跳过 save_pending_message_with_hash");
+            tracing::debug!("send_text_impl: is_retry=true 或协议消息，跳过 save_pending_message_with_hash");
         }
 
         // 发送消息到网络（不立即标记已发送，由 P2P 事件确认或送达回执标记）
@@ -184,15 +258,54 @@ impl ChatCore {
         );
 
         // 步骤 1：从 peerid_to_mlkem 缓存查询（FriendOnline 直接传递，无需 DHT）
-        // 通过 DHT 缓存找到目标公钥对应的 PeerID，再查 ML-KEM 公钥
+        // 账号级：遍历该账号全部在线设备（list_pubkey_devices）逐个查 ML-KEM，
+        // 任一设备在线且已交换密钥即可投递（多设备下主 PeerID 可能不是唯一在线设备）。
+        // 与发送的 recipient_peer_id（主设备）解耦：ML-KEM 属于账号，取任一可用即可。
         let store = self.get_dht_store();
-        let peer_id = store.get_peerid_by_pubkey(mldsa_pubkey_hex);
-        if let Some(pid) = peer_id
-            && let Some(mlkem_hex) = self.peer_cache.peerid_to_mlkem.get(&pid)
+        let account_devices = store.list_pubkey_devices(mldsa_pubkey_hex);
+        for pid in &account_devices {
+            if let Some(mlkem_hex) = self.peer_cache.peerid_to_mlkem.get(pid)
                 && !mlkem_hex.is_empty() {
-                    tracing::info!("Found ML-KEM pubkey for {} via peerid_to_mlkem", pubkey_short);
+                    tracing::info!(
+                        "Found ML-KEM pubkey for {} via account device {}",
+                        pubkey_short,
+                        pid
+                    );
                     return hex::decode(mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
                 }
+        }
+        // 兜底：账号设备列表为空时回退到主 PeerID 缓存（单设备场景兼容）
+        if let Some(pid) = store.get_peerid_by_pubkey(mldsa_pubkey_hex)
+            && let Some(mlkem_hex) = self.peer_cache.peerid_to_mlkem.get(&pid)
+                && !mlkem_hex.is_empty() {
+                    tracing::info!("Found ML-KEM pubkey for {} via primary PeerID", pubkey_short);
+                    return hex::decode(mlkem_hex).map_err(CoreError::InvalidMlKemFormat);
+                }
+
+        // 步骤 2 前置守卫：对端在线但 FriendOnline 尚未刷新 ML-KEM 缓存时，
+        // contacts 表里的旧 key（ML-KEM 每次启动轮换）加密会静默丢失
+        // （对端新解封装密钥无法解密）。此时入离线队列，等待密钥交换后再重试。
+        if let Some(pid) = store.get_peerid_by_pubkey(mldsa_pubkey_hex)
+            && self.connected_peers.contains_key(&pid)
+            && self
+                .peer_cache
+                .peerid_to_mlkem
+                .get(&pid)
+                .is_none_or(|h| h.is_empty())
+        {
+            tracing::info!(
+                "联系人在线但 ML-KEM 尚未交换（FriendOnline 未达），入队等待密钥刷新: {}",
+                pubkey_short
+            );
+            if !is_retry && should_persist_to_pending(msgtype) {
+                self.save_pending_message(mldsa_pubkey_hex, msgtype, data)
+                    .await;
+            }
+            return Err(CoreError::MlKemKeyNotCached(format!(
+                "联系人 {} 在线但 ML-KEM 尚未交换，消息已入离线队列",
+                pubkey_short
+            )));
+        }
 
         // 步骤 2：从 contacts 表查询（兜底，可能是旧数据）
         if let Some(pool) = storage::pool() {
@@ -226,22 +339,33 @@ impl ChatCore {
             return Err(CoreError::DatabaseNotAvailable);
         }
 
-        // 步骤 3：本地没有，保存到离线队列等待重试
+        // 步骤 3：本地没有，无法立即发送
         // 对方不在线时 FriendOnline 未送达，无 ML-KEM 缓存，待重试
         tracing::debug!(
-            "lookup_mlkem_pubkey: ML-KEM 公钥未缓存, is_retry={}, 将保存到离线队列",
-            is_retry
+            "lookup_mlkem_pubkey: ML-KEM 公钥未缓存, is_retry={}, msgtype={:?}",
+            is_retry,
+            msgtype
         );
-        if !is_retry {
+        if !is_retry && should_persist_to_pending(msgtype) {
             self.save_pending_message(mldsa_pubkey_hex, msgtype, data)
                 .await;
+            Err(CoreError::MlKemKeyNotCached(format!(
+                "联系人 {} 的 ML-KEM 公钥未缓存（对方离线），消息已保存到离线队列",
+                pubkey_short
+            )))
         } else {
-            tracing::debug!("lookup_mlkem_pubkey: is_retry=true, 跳过 save_pending_message");
+            // 协议消息（FileStream/DownloadResponse 等）不落库：
+            // 明确返回"未入队、发送中止"，避免调用方误以为会离线补发
+            let err = if should_persist_to_pending(msgtype) {
+                format!("联系人 {} 的 ML-KEM 公钥未缓存（对方离线），消息已保存到离线队列", pubkey_short)
+            } else {
+                format!(
+                    "联系人 {} 的 ML-KEM 公钥未缓存（对方离线），且该协议消息不落库，传输中止，请稍后重试",
+                    pubkey_short
+                )
+            };
+            Err(CoreError::MlKemKeyNotCached(err))
         }
-        Err(CoreError::MlKemKeyNotCached(format!(
-            "联系人 {} 的 ML-KEM 公钥未缓存（对方离线），消息已保存到离线队列",
-            pubkey_short
-        )))
     }
 
     /// 保存待发送消息到离线队列
@@ -288,7 +412,7 @@ impl ChatCore {
                     tracing::info!("消息已保存到离线队列，id={}", id);
                     let msg = format!(
                         "消息已保存到离线队列（联系人 {} 当前不在线）",
-                        &mldsa_pubkey_hex[..16]
+                        &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())]
                     );
                     self.send_log_mpsc(msg).await;
                 }
@@ -407,7 +531,7 @@ impl ChatCore {
         if !has_local_peerid {
             return Err(CoreError::ContactOffline(format!(
                 "联系人 {} 当前不在线（本地未缓存 PeerID），不重试",
-                &msg.peer_pubkey_hex[..16]
+                &msg.peer_pubkey_hex[..16.min(msg.peer_pubkey_hex.len())]
             )));
         }
 
@@ -492,14 +616,14 @@ impl ChatCore {
         // 无法加密且不应响应，且会泄露通信元数据，违反 E2EE，故禁止网络查询。
         if allow_network_query {
             let query_key = p2p_swarm_ops::dht_key(mldsa_pubkey_hex);
-            let _ = self
+            // try_send：避免 ChatCore 事件循环在发送消息路径上因 P2pActor 通道背压而无限阻塞
+            if let Err(e) = self
                 .p2p_handle
-                .send(
-                    P2pCommand::GetProviders {
-                        key: query_key,
-                    },
-                )
-                .await;
+                .tx
+                .try_send(P2pCommand::GetProviders { key: query_key })
+            {
+                tracing::warn!("dht_lookup_peerid: 发送 GetProviders 失败（通道满/关闭）: {e:?}");
+            }
 
             tracing::debug!(
                 "dht_lookup_peerid: 本地未找到 {}..，已发起非阻塞 GetProviders 查询",
@@ -513,6 +637,79 @@ impl ChatCore {
         }
 
         None
+    }
+
+    /// 启动时自动续传未完成的文件下载
+    ///
+    /// 扫描 downloads 目录中的 `.hash.tmp` + `.hash.state` 配对，读取 sender
+    /// 元数据后重新发起 DownloadRequest。允许 DHT 查询（sender 来自本端已保存
+    /// 的下载状态，属已知联系人），对方离线时请求进入离线队列，上线后自动重试。
+    pub(crate) async fn resume_pending_downloads(&mut self) {
+        let pending = self.file_transfer.scan_resumable();
+        if pending.is_empty() {
+            return;
+        }
+        tracing::info!("发现 {} 个可续传文件", pending.len());
+        let mut deferred = 0usize;
+        for (file_hash, meta) in pending {
+            let hash_hex = hex::encode(file_hash);
+            // 已处于活动传输（上一轮已发起）的条目跳过，避免重复请求
+            if self.file_transfer.file_transfers.contains_key(&hash_hex) {
+                continue;
+            }
+            let save_path = std::path::PathBuf::from(&meta.save_dir);
+            match self
+                .file_transfer
+                .try_start_download(file_hash, &save_path, &meta.sender_pubkey_hex)
+            {
+                Ok((hash_hex, data)) => {
+                    match self
+                        .send_text(
+                            &meta.sender_pubkey_hex,
+                            ChatMessageType::FileDownloadRequest,
+                            data,
+                            true,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            self.send_log_mpsc(format!(
+                                "已自动续传文件（{}..）",
+                                &hash_hex[..16]
+                            ))
+                            .await;
+                        }
+                        Err(e) => {
+                            // 对方离线：请求已由 send_text 写入离线队列，
+                            // 状态保留等待分片到达后重建，仅告警不取消。
+                            self.send_warning_mpsc(format!("文件续传请求暂未发出: {e}"))
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.contains("并发下载数已达上限") {
+                        // 并发槽位被占满：条目保留在 .state，稍后延迟重扫续传
+                        deferred += 1;
+                    } else {
+                        self.send_warning_mpsc(format!("文件续传失败: {e}"))
+                            .await;
+                    }
+                }
+            }
+        }
+        if deferred > 0 {
+            tracing::info!(
+                "{deferred} 个续传条目因并发上限延迟，15 秒后自动重试"
+            );
+            let handle = tokio::runtime::Handle::current();
+            let tx = self.core_handle.cmd_tx.clone();
+            handle.spawn(async move {
+                // 延迟后重发续传命令：活动传输完成释放槽位后接手剩余条目
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let _ = tx.try_send(crate::command::ChatCommand::ResumeFileTransfers);
+            });
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 <script lang="ts">
-  import "../../lib/i18n";
   import { _ } from "svelte-i18n";
+  import { tt } from "../../lib/i18n";
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
@@ -20,7 +20,28 @@
   let loadingIdentities = $state(false);
   let warning = $state<string>("");
   let qrCanvas = $state<HTMLCanvasElement | undefined>(undefined);
-  let qrData = $state<string>("");
+  // 删除身份确认：置入待删身份 id 时弹确认框（删除将级联清除联系人/消息/密钥）
+  let confirmDeleteId = $state<string | null>(null);
+
+  // 完整公钥（3904 字符）默认隐藏：展示 SHA256 摘要（与扫码 digest 同源），可点击展开完整
+  let currentShort = $state("");
+  let currentReveal = $state(false);
+  let rowReveal = $state<Record<number, boolean>>({});
+  let rowShort = $state<Record<number, string>>({});
+
+  const sha256Hex = async (text: string): Promise<string> => {
+    try {
+      const buf = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(text),
+      );
+      return [...new Uint8Array(buf)]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    } catch {
+      return `${text.slice(0, 16)}…`; // 降级：裁剪显示
+    }
+  };
 
   // 显示 warning 的统一函数
   const showWarning = (message: string, duration: number = 5000) => {
@@ -33,10 +54,17 @@
       identities = await invoke<IdentityDto[]>("list_identities");
       currentIdentity = identities.find((id) => id.is_current) ?? null;
       if (currentIdentity) {
+        currentShort = await sha256Hex(currentIdentity.identity_id);
         await loadQrData();
       }
+      // 行级摘要缓存（默认展示，展开时才显示完整公钥）
+      const shorts: Record<number, string> = {};
+      for (const ident of identities) {
+        shorts[ident.id] = await sha256Hex(ident.identity_id);
+      }
+      rowShort = shorts;
     } catch (e) {
-      showWarning(`加载身份失败：${e}`);
+      showWarning(tt("load_identity_failed", { values: { error: e } }));
     } finally {
       loadingIdentities = false;
     }
@@ -49,24 +77,18 @@
       const data: number[] = await invoke("get_identity_qr_data");
       const binary = new Uint8Array(data);
       console.log("二维码二进制数据加载成功，长度:", binary.length, "字节");
-      qrData = ""; // 不再需要 qrData 字符串
       // 数据加载完成后，等待 DOM 更新再绘制二维码
       setTimeout(() => drawQrCodeOnCanvas(binary), 100);
     } catch (e) {
       console.error("加载二维码数据失败:", e);
       // 没有当前身份时不显示二维码
-      qrData = "";
     }
   };
 
   // 在 canvas 上绘制二维码
   const drawQrCodeOnCanvas = (binaryData?: Uint8Array) => {
-    if (!qrCanvas) return;
-    if (binaryData) {
-      drawQrCode(qrCanvas, binaryData, 540);
-    } else if (qrData) {
-      drawQrCode(qrCanvas, qrData, 540);
-    }
+    if (!qrCanvas || !binaryData) return;
+    drawQrCode(qrCanvas, binaryData, 540);
   };
 
   const selectIdentity = async (identityId: string) => {
@@ -76,7 +98,7 @@
       // 切换身份后刷新页面，重新初始化所有状态
       window.location.reload();
     } catch (e) {
-      showWarning(`切换身份失败：${e}`);
+      showWarning(tt("switch_identity_failed", { values: { error: e } }));
     }
   };
 
@@ -87,7 +109,7 @@
       // 删除身份后刷新页面，重新初始化所有状态
       window.location.reload();
     } catch (e) {
-      showWarning(`删除身份失败：${e}`);
+      showWarning(tt("delete_identity_failed", { values: { error: e } }));
     }
   };
 
@@ -95,19 +117,19 @@
     try {
       await invoke("generate_identity");
       await loadIdentities();
-      showWarning("已生成新身份", 3000);
+      showWarning(tt("identity_generated"), 3000);
     } catch (e) {
-      showWarning(`生成身份失败：${e}`);
+      showWarning(tt("generate_identity_failed", { values: { error: e } }));
     }
   };
 
-  const copyToClipboard = async (text: string, label: string = "内容") => {
+  const copyToClipboard = async (text: string, label: string = tt("copy_content")) => {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      showWarning(`${label} 已复制到剪贴板`, 3000);
+      showWarning(tt("copied_to_clipboard", { values: { label } }), 3000);
     } catch (e) {
-      showWarning(`复制失败：${e}`);
+      showWarning(tt("copy_failed", { values: { error: e } }));
     }
   };
 
@@ -118,17 +140,26 @@
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    let destroyed = false;
 
     (async () => {
-      unlisten = await listen<string>("warning", (e) => {
-        showWarning(e.payload, 5000);
-        console.warn("Received warning from backend:", e.payload);
-      });
+      try {
+        const un = await listen<string>("warning", (e) => {
+          showWarning(e.payload, 5000);
+          console.warn("Received warning from backend:", e.payload);
+        });
+        // 注册期间页面可能已卸载：此时立即注销，避免监听泄漏到已销毁页面
+        if (destroyed) un();
+        else unlisten = un;
+      } catch (e) {
+        console.error("注册 warning 监听失败:", e);
+      }
     })();
 
     loadIdentities();
 
     return () => {
+      destroyed = true;
       unlisten?.();
     };
   });
@@ -136,7 +167,7 @@
 
 <div class="identity-container">
   <header class="identity-header">
-    <button class="back-button" onclick={goBack} aria-label="返回主页">
+    <button class="back-button" onclick={goBack} aria-label={$_("back_to_home")}>
       ← {$_("back")}
     </button>
     <h1>{$_("identity_management")}</h1>
@@ -150,27 +181,34 @@
         <h2>{$_("current_identity")}</h2>
         <div class="current-identity-card">
           <div class="identity-field">
-            <label for="identity-id-display">身份 ID (ML-DSA 公钥):</label>
+            <label for="identity-id-display">{$_("identity_id_label")}</label>
             <button
               id="identity-id-display"
               class="copyable-value"
-              onclick={() => copyToClipboard(identity.identity_id, "身份 ID")}
-              title="点击复制"
+              onclick={() => copyToClipboard(identity.identity_id, $_("identity_id"))}
+              title={$_("click_to_copy")}
               type="button"
             >
-              <code>{identity.identity_id}</code>
+              <code>{currentReveal ? identity.identity_id : currentShort}</code>
               <span class="copy-icon">📋</span>
+            </button>
+            <button
+              type="button"
+              class="reveal-toggle"
+              onclick={() => (currentReveal = !currentReveal)}
+            >
+              {currentReveal ? $_("hide_full_id") : $_("show_full_id")}
             </button>
           </div>
           {#if identity.mlkem_pubkey_hex}
             <div class="identity-field">
-              <label for="mlkem-pubkey-display">ML-KEM 公钥 (当前会话):</label>
+              <label for="mlkem-pubkey-display">{$_("mlkem_pubkey_current_label")}</label>
               <button
                 id="mlkem-pubkey-display"
                 class="copyable-value"
                 onclick={() =>
-                  copyToClipboard(identity.mlkem_pubkey_hex!, "ML-KEM 公钥")}
-                title="点击复制"
+                  copyToClipboard(identity.mlkem_pubkey_hex!, $_("mlkem_pubkey"))}
+                title={$_("click_to_copy")}
                 type="button"
               >
                 <code>{identity.mlkem_pubkey_hex}</code>
@@ -238,7 +276,20 @@
                 <div class="identity-details">
                   <div class="detail-row">
                     <span class="detail-label">ID:</span>
-                    <code class="identity-id">{identity.identity_id}</code>
+                    <button
+                      type="button"
+                      class="identity-id"
+                      onclick={() =>
+                        (rowReveal[identity.id] = !rowReveal[identity.id])}
+                      title={
+                        rowReveal[identity.id]
+                          ? $_("hide_full_id")
+                          : $_("show_full_id")
+                      }
+                      >{rowReveal[identity.id]
+                        ? identity.identity_id
+                        : rowShort[identity.id] ?? ""}</button
+                    >
                   </div>
                 </div>
                 {#if identity.is_current}
@@ -270,8 +321,8 @@
                 <button
                   class="icon-btn copy-btn"
                   onclick={() =>
-                    copyToClipboard(identity.identity_id, "身份 ID")}
-                  title="复制身份 ID"
+                    copyToClipboard(identity.identity_id, $_("identity_id"))}
+                  title={$_("copy_identity_id")}
                 >
                   <svg
                     xmlns="http://www.w3.org/2000/svg"
@@ -294,7 +345,7 @@
                 {#if !identity.is_current}
                   <button
                     class="icon-btn delete-btn"
-                    onclick={() => deleteIdentity(identity.identity_id)}
+                    onclick={() => (confirmDeleteId = identity.identity_id)}
                     title={$_("delete_identity")}
                   >
                     <svg
@@ -322,6 +373,42 @@
       {/if}
     </section>
   </main>
+
+  {#if confirmDeleteId}
+    <div
+      class="confirm-overlay"
+      onclick={(e) => e.target === e.currentTarget && (confirmDeleteId = null)}
+      onkeydown={(e) => e.key === "Escape" && (confirmDeleteId = null)}
+      role="dialog"
+      aria-label={$_("delete_identity")}
+      tabindex="0"
+    >
+      <div class="confirm-box">
+        <h3>{$_("delete_identity")}</h3>
+        <p>{$_("delete_identity_confirm")}</p>
+        <div class="confirm-actions">
+          <button
+            type="button"
+            class="btn-ghost"
+            onclick={() => (confirmDeleteId = null)}
+          >
+            {$_("action_cancel")}
+          </button>
+          <button
+            type="button"
+            class="btn-danger"
+            onclick={() => {
+              const id = confirmDeleteId;
+              confirmDeleteId = null;
+              if (id) void deleteIdentity(id);
+            }}
+          >
+            {$_("confirm_delete")}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <Toast message={warning} />
 </div>
@@ -483,6 +570,87 @@
     opacity: 1;
   }
 
+  .reveal-toggle {
+    margin-top: 6px;
+    background: none;
+    border: none;
+    color: #60a5fa;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    align-self: flex-start;
+  }
+  .reveal-toggle:hover {
+    text-decoration: underline;
+  }
+
+  .identity-id {
+    cursor: pointer;
+    user-select: none;
+  }
+  .identity-id:hover {
+    color: #60a5fa;
+  }
+
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .confirm-box {
+    width: 90%;
+    max-width: 380px;
+    padding: 20px 22px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  }
+  .confirm-box h3 {
+    margin: 0 0 12px;
+    color: var(--text-primary, #fafafa);
+  }
+  .confirm-box p {
+    margin: 0 0 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-secondary, #a3a3a3);
+  }
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .btn-ghost,
+  .btn-danger {
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+  }
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border-color, #2a2a2a);
+    color: var(--text-secondary, #a3a3a3);
+  }
+  .btn-ghost:hover {
+    background: var(--bg-tertiary, #1a1a1a);
+    color: var(--text-primary, #fafafa);
+  }
+  .btn-danger {
+    background: var(--color-danger, #ef4444);
+    border: none;
+    color: #fff;
+  }
+  .btn-danger:hover {
+    opacity: 0.85;
+  }
+
   /* 二维码区域 */
   .qr-section {
     text-align: center;
@@ -622,12 +790,23 @@
     flex-shrink: 0;
   }
 
-  .identity-id {
+.identity-id {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 100%;
-    display: block;
+    /* 以按钮承载但保持代码外观 */
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    user-select: none;
+    min-width: 0;
+  }
+  .identity-id:hover {
+    color: #60a5fa;
   }
 
   .current-badge {

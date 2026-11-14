@@ -99,6 +99,19 @@ impl ChatCore {
         };
         let mldsa_pubkey_hex = hex::encode(&mldsa_public_key);
 
+        // 一致性校验：加载的私钥重算出的公钥必须与身份记录一致。
+        // 密钥文件损坏或被备份覆盖成其他密钥时，若静默继续，会以"DB 身份 ≠ 实际签名钥"
+        // 运行导致加密/验证失败且难排查，故拒绝切换并告警。
+        if !mldsa_pubkey_hex.eq_ignore_ascii_case(&identity_id) {
+            let msg = format!(
+                "切换身份失败：私钥与身份记录不一致（{}.. vs {}..），拒绝切换",
+                &identity_id[..16.min(identity_id.len())],
+                &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())],
+            );
+            self.send_warning_mpsc(msg).await;
+            return;
+        }
+
         let mlkem_decap_key = match DecapsulationKey::generate(&ML_KEM_768) {
             Ok(key) => key,
             Err(e) => {

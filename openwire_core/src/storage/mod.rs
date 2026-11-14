@@ -6,6 +6,8 @@ mod identity;
 mod message;
 /// 数据库迁移模块
 mod migrations;
+/// 扫码暂存模块（好友摘要化流程）
+mod pending_contact;
 /// 已发送文件历史模块
 mod sent_file;
 /// 统计查询模块
@@ -13,8 +15,9 @@ mod stats;
 //✅
 use crate::CoreConfig;
 pub use contact::{
-    Contact, clear_all_mlkem_pubkeys, delete_contact, get_contact_by_mldsa_pubkey,
-    get_contact_mlkem_pubkey, is_contact_exists, list_contacts, update_contact_mlkem_pubkey,
+    Contact, clear_all_mlkem_pubkeys, contact_display_name, delete_contact,
+    get_contact_by_mldsa_pubkey, get_contact_mlkem_pubkey, is_contact_blocked,
+    is_contact_exists, list_contacts, update_contact_meta, update_contact_mlkem_pubkey,
     upsert_contact,
 };
 pub use identity::{
@@ -22,19 +25,29 @@ pub use identity::{
     list_identities, set_current_identity,
 };
 pub use message::{
-    Message, MAX_MESSAGE_PAGE_SIZE, add_message_with_hash, delete_message, delete_messages_batch,
+    ContactMessagesStat, Message, MessageSearchHit, MAX_MESSAGE_PAGE_SIZE,
+    add_message_with_hash, contact_messages_stat, delete_message, delete_messages_batch,
     delete_messages_by_peer, get_last_message, get_message, get_message_by_hash, get_messages,
-    get_messages_range, list_failed, list_pending, list_pending_by_peer, mark_failed, mark_pending,
-    mark_sent, mark_sent_batch, mark_sent_by_hash, update_message_hash,
+    get_messages_around, get_messages_range, list_failed, list_pending, list_pending_by_peer,
+    mark_failed, mark_pending,
+    mark_sent, mark_sent_batch, mark_sent_by_hash, search_messages_by_content,
+    update_message_hash,
+};
+pub use pending_contact::{
+    PendingContact, add_pending_contact, delete_pending_contact, get_pending_contact_by_digest,
+    list_pending_contacts,
 };
 pub use sent_file::{
-    SentFile, add_sent_file, delete_sent_file, get_sent_file, list_all_sent_files, verify_sent_file,
+    SentFile, SENT_FILE_RETENTION_DAYS, add_sent_file, delete_sent_file,
+    delete_sent_files_by_recipient, delete_sent_files_older_than, get_sent_file,
+    list_all_sent_files, list_sent_files_by_recipient, sum_sent_bytes_by_recipient,
+    verify_sent_file,
 };
 use sqlx::{
     Pool, Sqlite,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{path::Path, time::Duration};
+use std::{path::Path, path::PathBuf, time::Duration};
 use tracing;
 //✅
 use crate::error::{StorageError, StorageResult};
@@ -57,11 +70,41 @@ pub async fn init_path(path: &Path) -> StorageResult<()> {
         return Ok(());
     }
 
-    let is_new = !path.exists();
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
     }
 
+    let mut is_new = !path.exists();
+    let mut pool = connect_db(path).await?;
+
+    if !is_new {
+        // 旧数据库与当前迁移基线不兼容（迁移文件已合并/修改，校验和不匹配）→ 视为不存在，直接删除重建
+        if let Err(e) = crate::storage::migrations::run(&pool).await {
+            tracing::warn!("旧数据库与当前迁移基线不兼容，删除并重建: {e}");
+            pool.close().await;
+            drop(pool);
+            remove_db_files(path)?;
+            pool = connect_db(path).await?;
+            is_new = true;
+        }
+    }
+
+    crate::storage::migrations::run(&pool).await?;
+
+    if is_new {
+        tracing::info!("New database initialized");
+    } else {
+        tracing::info!("Existing database migrated");
+    }
+
+    SQLITE_DB_POOL
+        .set(pool)
+        .map_err(|_| StorageError::PoolAlreadyInitialized)?;
+    Ok(())
+}
+
+/// 建立数据库连接池并验证连接可用
+async fn connect_db(path: &Path) -> StorageResult<Pool<Sqlite>> {
     let pool = SqlitePoolOptions::new()
         .max_connections(7)
         .min_connections(1)
@@ -83,18 +126,19 @@ pub async fn init_path(path: &Path) -> StorageResult<()> {
         .await?;
 
     sqlx::query("SELECT 1").execute(&pool).await?; //测试数据库连接
+    Ok(pool)
+}
 
-    if is_new {
-        crate::storage::migrations::run(&pool).await?;
-        tracing::info!("New database initialized");
-    } else {
-        // 对已有数据库也执行迁移，确保新迁移（如 sent_files 表）被应用
-        crate::storage::migrations::run(&pool).await?;
+/// 删除旧数据库文件（连同 WAL/SHM）
+fn remove_db_files(path: &Path) -> StorageResult<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut os = path.as_os_str().to_owned();
+        os.push(suffix);
+        let f = PathBuf::from(os);
+        if f.exists() {
+            std::fs::remove_file(&f)?;
+        }
     }
-
-    SQLITE_DB_POOL
-        .set(pool)
-        .map_err(|_| StorageError::PoolAlreadyInitialized)?;
     Ok(())
 }
 

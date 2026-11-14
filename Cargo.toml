@@ -7,12 +7,14 @@ members = [
     "libp2p-pathranker",
     "openwire_server/common",
     "openwire_server/server_cli",
+    "tauri-plugin-rootcell",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 rootcell = { path = "rootcell" }
 openwire_core = { path = "openwire_core" }
+tauri-plugin-rootcell = { path = "tauri-plugin-rootcell" }
 tokio = { version = "1.53.1", features = [
     "rt-multi-thread",
     "macros",
@@ -61,9 +63,17 @@ lto = false
 [profile.release]
 opt-level = "s"
 codegen-units = 1
-lto = "thin"
+lto = true
 panic = "abort"
 strip = true
 debug = false
 debug-assertions = false
 overflow-checks = true
+
+# 核心库：性能优先
+[profile.release.package.openwire_core]
+opt-level = 3
+
+# 桌面 Tauri 应用：体积优先
+[profile.release.package.openwire]
+opt-level = "z"

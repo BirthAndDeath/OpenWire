@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { _ } from "svelte-i18n";
   let {
     min = 200,
     max = 500,
@@ -64,7 +65,7 @@
         style="right: calc(var(--resizer-size) / -2)"
         onmousedown={onDown}
         ontouchstart={onDown}
-        aria-label="调整面板宽度"
+        aria-label={$_("resize_panel_width")}
         type="button"
       ></button>
     </div>
@@ -76,7 +77,7 @@
         style="top: {position === 'bottom' ? '0' : 'calc(var(--size) - var(--resizer-size) / 2)'}"
         onmousedown={onDown}
         ontouchstart={onDown}
-        aria-label="调整面板高度"
+        aria-label={$_("resize_panel_height")}
         type="button"
       ></button>
     </div>

@@ -4,7 +4,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use tauri_plugin_fs::FsExt;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
@@ -127,78 +129,14 @@ async fn send(
 #[tauri::command]
 async fn send_file(
     state: tauri::State<'_, AppData>,
+    app: tauri::AppHandle,
     mldsa_pubkey_hex: &str,
-    file_path: &str,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     validate_contact(mldsa_pubkey_hex).await?;
 
-    let path = std::path::PathBuf::from(file_path);
-    let canon = path.canonicalize().map_err(|e| format!("无效的文件路径: {}", e))?;
-    if !canon.exists() {
-        return Err(format!("文件不存在: {}", file_path));
-    }
-    // 限制只允许发送下载目录内的文件，防止路径遍历
-    let data_dir = app_data_dir(&state).await;
-    let downloads_dir = data_dir.join("downloads");
-    let downloads_canon = downloads_dir.canonicalize().unwrap_or(downloads_dir);
-    if !canon.starts_with(&downloads_canon) {
-        return Err("只能发送下载目录内的文件".to_string());
-    }
-    // 拒绝下载目录内任何 symlink 路径组件：防御纵深，防止指向任意文件的
-    // 符号链接被当作站内文件读取并发送。
-    // 先补全为绝对路径，确保相对路径/含 .. 的路径也能匹配到下载目录前缀。
-    let abs_path = if path.is_absolute() {
-        path.clone()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&path))
-            .unwrap_or_else(|_| path.clone())
-    };
-    if let Ok(rel) = abs_path.strip_prefix(&downloads_canon) {
-        let mut current = downloads_canon.clone();
-        for seg in rel.iter() {
-            current.push(seg);
-            if let Ok(md) = std::fs::symlink_metadata(&current) {
-                if md.file_type().is_symlink() {
-                    return Err("不允许发送符号链接指向的文件".to_string());
-                }
-            }
-        }
-    }
-    drop(data_dir);
-
-    let file_hash = openwire_core::transfer::compute_file_hash(&path)
-        .await
-        .map_err(|e| format!("计算文件 hash 失败: {}", e))?;
-
-    let metadata = std::fs::metadata(&path).map_err(|e| format!("获取文件信息失败: {}", e))?;
-    let total_size = metadata.len();
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let file_info =
-        openwire_core::message::FileHashInfo::new(filename.clone(), total_size, file_hash);
-    let file_info_bytes = postcard::to_allocvec(&file_info)
-        .map_err(|e| format!("序列化 FileHashInfo 失败: {}", e))?;
-
-    // 记录到已发送文件历史（sent_files 表），使对方下载请求时能验证文件合法性
-    if let Some(pool) = openwire_core::storage::pool() {
-        if let Err(e) = openwire_core::storage::add_sent_file(
-            pool,
-            &file_hash,
-            path.to_str().unwrap_or(""),
-            &filename,
-            total_size,
-        )
-        .await
-        {
-            tracing::warn!("记录已发送文件失败: {e}");
-        }
-    }
-
+    // 文件选择由后端弹原生对话框：回调式 API（主线程弹窗，不经渲染层传路径）。
+    // 对话框结果经 `file-send-result` 事件回传前端。
+    let owner_hex = mldsa_pubkey_hex.to_string();
     let inner = state.inner.read().await;
     let cmd_tx = inner
         .cmd_tx
@@ -206,23 +144,102 @@ async fn send_file(
         .ok_or_else(|| "核心尚未初始化".to_string())?;
     drop(inner);
 
-    let result = cmd_tx
-        .send(ChatCommand::SendMessage {
-            mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
-            msgtype: ChatMessageType::FileHash,
-            data: file_info_bytes,
-        })
-        .await;
+    let app2 = app.clone();
+    app.dialog()
+        .file()
+        .add_filter("所有文件", &["*"])
+        .pick_file(move |picked| {
+            let Some(path) = picked else {
+                return; // 用户取消：不发事件，前端静默
+            };
+            let app2 = app2.clone();
+            let cmd_tx = cmd_tx.clone();
+            let owner = owner_hex.clone();
+            tauri::async_runtime::spawn(async move {
+                match resolve_picked_file(&app2, path).await {
+                    Ok(path) => match send_file_picked(cmd_tx, &path, &owner).await {
+                        Ok(filename) => {
+                            let _ = app2.emit(
+                                "file-send-result",
+                                serde_json::json!({ "ok": true, "filename": filename }),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = app2.emit(
+                                "file-send-result",
+                                serde_json::json!({ "ok": false, "error": e }),
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        let _ = app2.emit(
+                            "file-send-result",
+                            serde_json::json!({ "ok": false, "error": e }),
+                        );
+                    }
+                }
+            });
+        });
 
-    match result {
-        Ok(_) => Ok(true),
-        Err(e) => Err(format!("发送文件消息失败: {}", e)),
+    Ok(())
+}
+
+/// 解析文件选择结果到本地可读路径：
+/// - 桌面/iOS：`FilePath::Path` 直接返回；`file://` URL 转 PathBuf；
+/// - Android content://（scoped storage 不暴露 `_data`，`into_path` 必失败）：
+///   经 tauri-plugin-fs 的 ContentResolver 读取后拷入应用缓存目录，供后续哈希/发送。
+async fn resolve_picked_file(
+    app: &tauri::AppHandle,
+    picked: tauri_plugin_fs::FilePath,
+) -> Result<std::path::PathBuf, String> {
+    match picked {
+        tauri_plugin_fs::FilePath::Path(p) => Ok(p),
+        tauri_plugin_fs::FilePath::Url(url) => {
+            // 桌面/iOS 的文件 URL 直接转路径
+            if let Ok(p) = url.to_file_path() {
+                return Ok(p);
+            }
+            // Android content://：fs 插件经 ContentResolver 读取
+            let bytes = app
+                .fs()
+                .read(tauri_plugin_fs::FilePath::Url(url.clone()))
+                .map_err(|e| format!("读取所选文件失败: {e}"))?;
+            let cache_dir = app
+                .path()
+                .app_cache_dir()
+                .map_err(|e| format!("应用缓存目录不可用: {e}"))?;
+            std::fs::create_dir_all(&cache_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+            let name = url
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("picked_file");
+            let dest = cache_dir.join(name);
+            std::fs::write(&dest, &bytes).map_err(|e| format!("写入缓存文件失败: {e}"))?;
+            Ok(dest)
+        }
     }
+}
+
+/// 在回调线程中执行"校验 + 哈希 + 记录 + 发送 FileHash 消息"，返回文件名。
+async fn send_file_picked(
+    cmd_tx: tokio::sync::mpsc::Sender<ChatCommand>,
+    path: &std::path::Path,
+    mldsa_pubkey_hex: &str,
+) -> Result<String, String> {
+    // 校验/哈希/记录/发送统一由核心实现，避免与 CoreHandle::send_file 两套逻辑漂移
+    openwire_core::transfer::prepare_and_send_file(&cmd_tx, mldsa_pubkey_hex, path).await
 }
 #[derive(Serialize)]
 struct ContactDto {
     mldsa_pubkey_hex: String,
+    /// 显示名：昵称，或空昵称时公钥哈希短号（默认回退）
     name: String,
+    /// 真实昵称（None/空 = 未设置，前端编辑用）
+    nickname: Option<String>,
+    notes: String,
+    group_name: String,
+    blocked: bool,
     added_at: i64,
 }
 
@@ -236,12 +253,19 @@ async fn list_contacts() -> Result<Vec<ContactDto>, String> {
         .await
         .map_err(|e| format!("加载联系人失败: {}", e))?
         .into_iter()
-        .map(|contact| ContactDto {
-            mldsa_pubkey_hex: contact.mldsa_pubkey_hex.clone(),
-            name: contact
-                .name
-                .unwrap_or_else(|| contact.mldsa_pubkey_hex.clone()),
-            added_at: contact.added_at,
+        .map(|contact| {
+            let nickname = contact.name.filter(|s| !s.trim().is_empty());
+            ContactDto {
+                mldsa_pubkey_hex: contact.mldsa_pubkey_hex.clone(),
+                nickname: nickname.clone(),
+                name: nickname.unwrap_or_else(|| {
+                    openwire_core::storage::contact_display_name(&contact.mldsa_pubkey_hex)
+                }),
+                notes: contact.notes,
+                group_name: contact.group_name,
+                blocked: contact.blocked,
+                added_at: contact.added_at,
+            }
         })
         .collect();
     Ok(contacts)
@@ -266,11 +290,9 @@ async fn load_messages(
     after_id: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<MessageDto>, String> {
-    let short = if mldsa_pubkey_hex.len() > 16 {
-        &mldsa_pubkey_hex[..16]
-    } else {
-        mldsa_pubkey_hex
-    };
+    // 校验公钥 hex 格式（同时防非 ASCII 字符边界切片 panic）
+    validate_pubkey_hex(mldsa_pubkey_hex)?;
+    let short = &mldsa_pubkey_hex[..16.min(mldsa_pubkey_hex.len())];
     tracing::info!(
         "load_messages called: peer={}.. before={before:?} before_id={before_id:?} after={after:?} after_id={after_id:?} limit={limit:?}",
         short
@@ -316,6 +338,40 @@ async fn load_messages(
     result
 }
 
+/// 以指定消息为中心加载一个窗口（用于搜索命中跳转），返回与 load_messages 相同的 DTO 列表
+#[tauri::command]
+async fn load_messages_around(
+    mldsa_pubkey_hex: &str,
+    msg_id: i64,
+    radius: i64,
+) -> Result<Vec<MessageDto>, String> {
+    let radius = radius.clamp(1, openwire_core::storage::MAX_MESSAGE_PAGE_SIZE);
+    let Some(owner_identity_id) = current_identity().await? else {
+        return Ok(Vec::new());
+    };
+    let pool = storage::pool().ok_or_else(|| "数据库尚未初始化".to_string())?;
+    let msgs = openwire_core::storage::get_messages_around(
+        pool,
+        &owner_identity_id,
+        mldsa_pubkey_hex,
+        msg_id,
+        radius,
+    )
+    .await
+    .map_err(|e| format!("加载消息窗口失败: {e}"))?
+    .into_iter()
+    .map(|msg| MessageDto {
+        id: msg.id,
+        mldsa_pubkey_hex: msg.peer_pubkey_hex,
+        content: decode_message_content(&msg.content, msg.msgtype),
+        is_outgoing: msg.is_outgoing != 0,
+        ts: msg.ts,
+        pending: msg.pending,
+    })
+    .collect();
+    Ok(msgs)
+}
+
 #[derive(Serialize)]
 struct IdentityDto {
     id: i64,
@@ -325,12 +381,272 @@ struct IdentityDto {
 }
 
 #[tauri::command]
-async fn get_identity_qr_data(_state: tauri::State<'_, AppData>) -> Result<Vec<u8>, String> {
-    let identity_id = current_identity()
+async fn get_identity_qr_data(state: tauri::State<'_, AppData>) -> Result<Vec<u8>, String> {
+    current_identity()
         .await?
         .ok_or_else(|| "未选择身份".to_string())?;
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::GetIdentityShareInfo { resp: resp_tx })
+        .await
+        .map_err(|e| format!("发送身份分享查询失败: {e}"))?;
+    let bytes = resp_rx.await.map_err(|_| "未收到核心响应".to_string())?;
+    Ok(bytes)
+}
 
-    hex::decode(&identity_id).map_err(|e| format!("解码公钥失败: {}", e))
+#[tauri::command]
+async fn cancel_file_transfer(
+    state: tauri::State<'_, AppData>,
+    file_id_hex: &str,
+) -> Result<bool, String> {
+    if file_id_hex.len() != 64 || !file_id_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("文件标识格式无效（需 64 位 hex）".to_string());
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::CancelFileTransfer {
+            file_id_hex: file_id_hex.to_string(),
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送取消命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "取消传输失败：未收到核心响应".to_string())
+}
+
+#[tauri::command]
+async fn add_contact_by_scan(
+    state: tauri::State<'_, AppData>,
+    mut info: openwire_core::ScanContactInfo,
+) -> Result<bool, String> {
+    // 归一化为小写：dht_key 输出恒为小写 hex，pending 落库/匹配/自见守卫均按小写比较
+    info.digest_hex = info.digest_hex.to_ascii_lowercase();
+    // 校验摘要格式（64 位 hex，与 dht_key 输出一致）
+    if info.digest_hex.len() != 64
+        || !info.digest_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("二维码摘要格式无效（需 64 位 hex）".to_string());
+    }
+    if let Some(pid) = &info.peer_id {
+        pid.parse::<libp2p::PeerId>()
+            .map_err(|_| "二维码 PeerID 格式无效".to_string())?;
+    }
+    if info.addrs.len() > 16 {
+        return Err("推荐地址过多（最多 16 个）".to_string());
+    }
+    for a in &info.addrs {
+        a.parse::<libp2p::Multiaddr>()
+            .map_err(|_| format!("推荐地址格式无效: {a}"))?;
+    }
+    if info.relay_addrs.len() > 8 {
+        return Err("推荐 relay 过多（最多 8 个）".to_string());
+    }
+    for r in &info.relay_addrs {
+        if r.len() != 2 {
+            return Err("推荐 relay 格式无效（需 [PeerID, Multiaddr]）".to_string());
+        }
+        r[0].parse::<libp2p::PeerId>()
+            .map_err(|_| format!("推荐 relay PeerID 无效: {}", r[0]))?;
+        r[1].parse::<libp2p::Multiaddr>()
+            .map_err(|_| format!("推荐 relay 地址无效: {}", r[1]))?;
+    }
+
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::AddContactByScan {
+            info,
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送扫码添加命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "添加好友失败：未收到核心响应".to_string())
+}
+
+/// 扫码添加好友（v2 二进制二维码载荷）：解码后走 AddContactByScan 同路径。
+/// 返回 Some(摘要 hex) = 已暂存/已添加（前端用于历史记录）；None/Err = 失败。
+#[tauri::command]
+async fn add_contact_by_scan_binary(
+    state: tauri::State<'_, AppData>,
+    bytes: Vec<u8>,
+) -> Result<Option<String>, String> {
+    // 防御上限：二维码载荷应远小于 4KB（v2 二进制 ≈ 250B）
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err("二维码载荷长度非法".to_string());
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::AddContactByScanBinary {
+            bytes,
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送扫码添加命令失败: {e}"))?;
+    match resp_rx.await.map_err(|_| "添加好友失败：未收到核心响应".to_string())? {
+        Ok(digest) => Ok(Some(digest)),
+        Err(()) => Err("二维码无效或添加好友失败".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn update_contact_meta(
+    state: tauri::State<'_, AppData>,
+    mldsa_pubkey_hex: &str,
+    name: Option<String>,
+    notes: Option<String>,
+    group_name: Option<String>,
+    blocked: Option<bool>,
+) -> Result<bool, String> {
+    if mldsa_pubkey_hex.is_empty()
+        || mldsa_pubkey_hex.len() > 3904
+        || !mldsa_pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("公钥格式无效（需 1~3904 位 hex）".to_string());
+    }
+    for (label, v) in [("name", &name), ("notes", &notes), ("group_name", &group_name)] {
+        if let Some(s) = v {
+            if s.len() > 256 {
+                return Err(format!("{label} 过长（最多 256 字符）"));
+            }
+        }
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::UpdateContactMeta {
+            mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+            name,
+            notes,
+            group_name,
+            blocked,
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "更新联系人失败：未收到核心响应".to_string())
+}
+
+/// 定位本机已保存的、自己发送的文件（sent_files 本地路径，在文件管理器显示）。
+/// 供"点自己发的文件消息 → 打开/定位本地文件"；跨设备取回走多设备身份同步方案。
+#[tauri::command]
+async fn reveal_own_sent_file(
+    app: tauri::AppHandle,
+    file_hash_hex: &str,
+) -> Result<(), String> {
+    let bytes = hex::decode(file_hash_hex)
+        .map_err(|e| format!("无效的 file_hash hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err("file_hash 长度必须为 32 字节".to_string());
+    }
+    let mut file_hash = [0u8; 32];
+    file_hash.copy_from_slice(&bytes);
+
+    let Some(pool) = openwire_core::storage::pool() else {
+        return Err("数据库不可用".to_string());
+    };
+    let Some(record) = openwire_core::storage::get_sent_file(pool, &file_hash)
+        .await
+        .map_err(|e| format!("查询发送记录失败: {e}"))?
+    else {
+        return Err("本机未保存该文件".to_string());
+    };
+    app.opener()
+        .reveal_item_in_dir(std::path::Path::new(&record.file_path))
+        .map_err(|e| format!("定位文件失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn search_messages(
+    state: tauri::State<'_, AppData>,
+    query: &str,
+) -> Result<String, String> {
+    if query.len() > 256 {
+        return Err("关键词过长（最多 256 字符）".to_string());
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::SearchMessages {
+            query: query.to_string(),
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送搜索命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "搜索失败：未收到核心响应".to_string())
+}
+
+#[tauri::command]
+async fn get_storage_stats(state: tauri::State<'_, AppData>) -> Result<String, String> {
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::GetStorageStats { resp: resp_tx })
+        .await
+        .map_err(|e| format!("发送统计命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "统计失败：未收到核心响应".to_string())
+}
+
+#[tauri::command]
+async fn delete_contact_history(
+    state: tauri::State<'_, AppData>,
+    mldsa_pubkey_hex: &str,
+) -> Result<bool, String> {
+    if mldsa_pubkey_hex.is_empty()
+        || mldsa_pubkey_hex.len() > 3904
+        || !mldsa_pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("公钥格式无效".to_string());
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::DeleteContactHistory {
+            mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "删除失败：未收到核心响应".to_string())
+}
+
+#[tauri::command]
+async fn delete_contact_files(
+    state: tauri::State<'_, AppData>,
+    mldsa_pubkey_hex: &str,
+) -> Result<Option<i64>, String> {
+    if mldsa_pubkey_hex.is_empty()
+        || mldsa_pubkey_hex.len() > 3904
+        || !mldsa_pubkey_hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("公钥格式无效".to_string());
+    }
+    let cmd_tx = require_cmd_tx(&state).await?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(ChatCommand::DeleteContactFiles {
+            mldsa_pubkey_hex: mldsa_pubkey_hex.to_string(),
+            resp: resp_tx,
+        })
+        .await
+        .map_err(|e| format!("发送命令失败: {e}"))?;
+    resp_rx
+        .await
+        .map_err(|_| "删除失败：未收到核心响应".to_string())
 }
 
 #[tauri::command]
@@ -596,9 +912,10 @@ async fn generate_identity(state: tauri::State<'_, AppData>) -> Result<bool, Str
 #[tauri::command]
 async fn request_file_download(
     state: tauri::State<'_, AppData>,
+    app: tauri::AppHandle,
     sender_mldsa_pubkey_hex: &str,
     file_hash_hex: &str,
-    save_path: String,
+    filename: &str,
 ) -> Result<(), String> {
     let file_hash_bytes =
         hex::decode(file_hash_hex).map_err(|e| format!("无效的 file_hash hex: {}", e))?;
@@ -607,48 +924,55 @@ async fn request_file_download(
     }
     let mut file_hash = [0u8; 32];
     file_hash.copy_from_slice(&file_hash_bytes);
-
-    if save_path.trim().is_empty() {
-        return Err("保存路径不能为空".to_string());
+    if filename.len() > 256 {
+        return Err("文件名过长".to_string());
     }
 
-    // 限制保存路径必须在下载目录内，防止路径遍历
-    let data_dir = app_data_dir(&state).await;
-    let downloads_dir = data_dir.join("downloads");
-    let save_canon = {
-        let parent = std::path::Path::new(&save_path).parent().unwrap_or(std::path::Path::new(""));
-        std::fs::create_dir_all(downloads_dir.clone())
-            .map_err(|e| format!("创建下载目录失败: {}", e))?;
-        parent.canonicalize().map_err(|e| format!("无效的保存路径: {}", e))?
-    };
-    let downloads_canon = downloads_dir
-        .canonicalize()
-        .map_err(|e| format!("下载目录不可用: {}", e))?;
-    if !save_canon.starts_with(&downloads_canon) {
-        return Err("保存路径必须在下载目录内".to_string());
-    }
-
+    // 保存位置由后端弹"另存为"对话框：用户可选任意位置，路径不经渲染层，
+    // 渲染层无法伪造写路径（任意文件写防护）。
     let cmd_tx = require_cmd_tx(&state).await?;
-    let result = cmd_tx
-        .send(ChatCommand::RequestFileDownload {
-            sender_mldsa_pubkey_hex: sender_mldsa_pubkey_hex.to_string(),
-            file_hash,
-            save_path: PathBuf::from(save_path),
-        })
-        .await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("请求文件下载失败: {}", e)),
-    }
+    let owner = sender_mldsa_pubkey_hex.to_string();
+    app.dialog()
+        .file()
+        .set_file_name(filename)
+        .save_file(move |picked| {
+            let Some(path) = picked else {
+                return; // 用户取消
+            };
+            let Ok(path) = path.into_path() else {
+                tracing::warn!("保存对话框返回无效路径");
+                return;
+            };
+            if let Err(e) = cmd_tx.try_send(ChatCommand::RequestFileDownload {
+                sender_mldsa_pubkey_hex: owner.clone(),
+                file_hash,
+                save_path: path,
+            }) {
+                tracing::warn!("发送下载请求命令失败: {e}");
+            }
+        });
+
+    Ok(())
 }
+
+/// check_core_ready 的错误前缀协议：
+/// - `CORE_READY_PENDING:` → 仍在初始化中（前端应继续轮询/显示加载中）
+/// - `CORE_INIT_FAILED:`  → 初始化已失败，冒号后为原因（前端应停止轮询并显示错误）
+///
+/// 失败原因持久化在 AppDataInner.core_init_error（core-init-failed 事件可能
+/// 因 listener 未注册而丢失，须能在此查询兜底）。
+const CORE_READY_PENDING: &str = "CORE_READY_PENDING:";
+const CORE_INIT_FAILED: &str = "CORE_INIT_FAILED:";
 
 #[tauri::command]
 async fn check_core_ready(state: tauri::State<'_, AppData>) -> Result<(), String> {
     let inner = state.inner.read().await;
     if inner.core_ready {
         Ok(())
+    } else if let Some(err) = inner.core_init_error.as_deref() {
+        Err(format!("{CORE_INIT_FAILED}{err}"))
     } else {
-        Err("核心尚未就绪".to_string())
+        Err(CORE_READY_PENDING.to_string())
     }
 }
 
@@ -727,17 +1051,6 @@ async fn reset_nodes_config(state: tauri::State<'_, AppData>) -> Result<String, 
     let json = config.to_json_string();
     tracing::info!("节点配置已重置为默认值，重启后生效");
     Ok(json)
-}
-
-#[tauri::command]
-async fn is_keyring_available() -> Result<bool, String> {
-    let available = rootcell::identity::PrivateKeyHandle::check_keyring_available();
-    if available {
-        tracing::debug!("Keyring is available");
-    } else {
-        tracing::debug!("Keyring is not available");
-    }
-    Ok(available)
 }
 
 /// 查询网络状态（用于前端网络监控组件）
@@ -831,6 +1144,37 @@ async fn import_routing_table(
         .map_err(|_| "核心未响应导入请求".to_string())
 }
 
+/// 更新系统托盘菜单文本。
+/// 更新托盘菜单文案（仅桌面端；由前端从 locales JSON 读取翻译文本后传入）
+#[cfg(desktop)]
+#[tauri::command]
+fn set_tray_menu_texts(
+    state: tauri::State<'_, AppData>,
+    show_window_text: String,
+    quit_text: String,
+) -> Result<(), String> {
+    let items = state
+        .inner
+        .blocking_read()
+        .tray_menu
+        .clone();
+    if let Some(items) = items {
+        items
+            .show
+            .set_text(&show_window_text)
+            .map_err(|e| format!("更新托盘\"显示窗口\"失败: {e}"))?;
+        items
+            .quit
+            .set_text(&quit_text)
+            .map_err(|e| format!("更新托盘\"彻底退出\"失败: {e}"))?;
+    } else {
+        tracing::debug!(
+            "set_tray_menu_texts 被调用但托盘菜单尚未初始化（tray_menu=None），忽略本次更新"
+        );
+    }
+    Ok(())
+}
+
 pub struct AppData {
     pub inner: Arc<RwLock<AppDataInner>>,
 }
@@ -840,7 +1184,22 @@ pub struct AppDataInner {
     pub data_dir: PathBuf,
     pub mlkem_pubkey_hex: Option<String>,
     pub core_ready: bool,
+    /// Core 初始化失败原因（None = 未失败）。持久化于后端：
+    /// `core-init-failed` 事件是 fire-and-forget，若前端 listener 未注册
+    /// 即丢失；前端可通过 check_core_ready 查询此字段兜底显示错误原因。
+    pub core_init_error: Option<String>,
     pub is_quitting: bool,
+    /// 托盘菜单项（供语言切换时更新文本；仅桌面端存在）
+    #[cfg(desktop)]
+    pub tray_menu: Option<TrayMenuItems>,
+}
+
+/// 托盘菜单项句柄（可 Clone，set_text 内部自动切主线程；仅桌面端）
+#[cfg(desktop)]
+#[derive(Clone)]
+pub struct TrayMenuItems {
+    pub show: tauri::menu::MenuItem<tauri::Wry>,
+    pub quit: tauri::menu::MenuItem<tauri::Wry>,
 }
 
 fn create_placeholder_appdata(data_dir: PathBuf) -> AppData {
@@ -850,7 +1209,10 @@ fn create_placeholder_appdata(data_dir: PathBuf) -> AppData {
             data_dir,
             mlkem_pubkey_hex: None,
             core_ready: false,
+            core_init_error: None,
             is_quitting: false,
+            #[cfg(desktop)]
+            tray_menu: None,
         })),
     }
 }
@@ -919,21 +1281,28 @@ async fn setup_core_and_event_loop(
             MessageEvent::Warning(data) => {
                 app_handle_for_events.emit("warning", data).ok();
             }
+            MessageEvent::ContactsChanged => {
+                // 联系人列表变更（新增/更新/删除）：前端重新拉取联系人列表
+                app_handle_for_events.emit("contacts-changed", ()).ok();
+            }
             MessageEvent::Error(data) => {
                 app_handle_for_events.emit("error", data).ok();
             }
             MessageEvent::FileTransferProgress(progress) => {
-                app_handle_for_events
-                    .emit("file-transfer-progress", progress)
-                    .ok();
+                // 前端以 JSON.parse(e.payload) 消费，须序列化为 JSON 字符串；
+                // 直接 emit 结构体会被 Tauri 内联为 JS 对象字面量，导致解析失败
+                let json = serde_json::to_string(&progress).unwrap_or_default();
+                app_handle_for_events.emit("file-transfer-progress", json).ok();
             }
             MessageEvent::ContactOnlineStatus {
                 mldsa_pubkey_hex,
                 online,
+                remaining_devices,
             } => {
                 let payload = serde_json::json!({
                     "mldsa_pubkey_hex": mldsa_pubkey_hex,
                     "online": online,
+                    "remaining_devices": remaining_devices,
                 });
                 app_handle_for_events
                     .emit("contact-online-status", payload.to_string())
@@ -952,6 +1321,10 @@ async fn setup_core_and_event_loop(
 /// 可在此处扩展后续需要的后台恢复逻辑（刷新路由表、重置定时器等）。
 #[tauri::command]
 async fn on_foreground(state: tauri::State<'_, AppData>) -> Result<(), String> {
+    let cmd_tx = require_cmd_tx(&state).await?;
+    // 重建网络连接层：重拨中继 + 重跑 DHT bootstrap + 补发暂存 DiscoverPeer
+    let _ = cmd_tx.send(ChatCommand::OnForeground).await;
+
     let Some(owner_identity_id) = current_identity().await? else {
         return Ok(());
     };
@@ -959,7 +1332,6 @@ async fn on_foreground(state: tauri::State<'_, AppData>) -> Result<(), String> {
     let contacts = storage::list_contacts(pool, &owner_identity_id)
         .await
         .map_err(|e| format!("加载联系人失败: {e}"))?;
-    let cmd_tx = require_cmd_tx(&state).await?;
     for contact in &contacts {
         let tx = cmd_tx.clone();
         let mldsa_pubkey_hex = contact.mldsa_pubkey_hex.clone();
@@ -1060,11 +1432,31 @@ fn reject_sensitive_path(p: &std::path::Path) -> Result<std::path::PathBuf, Stri
     Ok(canon)
 }
 
-/// 读取文本文件（仅限用户通过对话框选择的导入文件，禁止系统敏感目录）
+/// 读取文本文件（限用户通过对话框选择的导入文件）
+///
+/// 渲染器层不可信，命令面不能接受任意路径：黑名单之外仍需限制为
+/// 普通文件 + 大小上限 + 扩展名白名单，压缩任意文件外带面。
 #[tauri::command]
 async fn read_text_file(path: String) -> Result<String, String> {
+    const MAX_IMPORT_SIZE: u64 = 5 * 1024 * 1024;
+
     let resolved = reject_sensitive_path(std::path::Path::new(&path))?;
-    std::fs::read_to_string(&resolved).map_err(|e| format!("read file failed: {}", e))
+    let meta = std::fs::metadata(&resolved).map_err(|e| format!("read file failed: {e}"))?;
+    if !meta.is_file() {
+        return Err("仅支持读取普通文件".to_string());
+    }
+    if meta.len() > MAX_IMPORT_SIZE {
+        return Err("文件过大（超过 5MB）".to_string());
+    }
+    let ext = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "json" | "txt" | "csv" | "log" | "md") {
+        return Err("不支持的文件类型（导入需 .json/.txt/.csv/.log/.md）".to_string());
+    }
+    std::fs::read_to_string(&resolved).map_err(|e| format!("read file failed: {e}"))
 }
 
 /// 设置计费网络检测模式（free / paid / disabled）
@@ -1127,8 +1519,10 @@ async fn get_version() -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_rootcell::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if cfg!(desktop) {
@@ -1180,6 +1574,13 @@ pub fn run() {
                         \n  - Linux: 安装 gnome-keyring 或 kwallet\
                         \n  - Android/iOS: 平台内置密钥环".to_string();
                     tracing::error!("{}", err_msg);
+                    // 持久化失败原因：check_core_ready 可查询，事件丢失也能兜底
+                    apphandle
+                        .state::<AppData>()
+                        .inner
+                        .write()
+                        .await
+                        .core_init_error = Some(err_msg.clone());
                     apphandle.emit("keyring-unavailable", &err_msg).ok();
                     apphandle.emit("core-init-failed", err_msg.clone()).ok();
                     apphandle.emit("warning", err_msg).ok();
@@ -1195,6 +1596,13 @@ pub fn run() {
                     Err(e) => {
                         let err_msg = format!("Core 初始化失败: {}", e);
                         tracing::error!("{}", err_msg);
+                        // 持久化失败原因：check_core_ready 可查询，事件丢失也能兜底
+                        apphandle
+                            .state::<AppData>()
+                            .inner
+                            .write()
+                            .await
+                            .core_init_error = Some(err_msg.clone());
                         apphandle.emit("core-init-failed", err_msg.clone()).ok();
                         apphandle.emit("warning", err_msg).ok();
                     }
@@ -1214,6 +1622,17 @@ pub fn run() {
                     .separator()
                     .item(&quit_item)
                     .build()?;
+
+                // 保存菜单项句柄，供语言切换时更新托盘文本
+                if let Some(state) = app.try_state::<AppData>() {
+                    state
+                        .inner
+                        .blocking_write()
+                        .tray_menu = Some(TrayMenuItems {
+                        show: show_item.clone(),
+                        quit: quit_item.clone(),
+                    });
+                }
 
                 TrayIconBuilder::new()
                     .icon(app.default_window_icon().expect("default_window_icon must be set in tauri.conf.json").clone())
@@ -1273,12 +1692,21 @@ pub fn run() {
             delete_identity,
             generate_identity,
             add_contact,
+            add_contact_by_scan,
+            add_contact_by_scan_binary,
+            cancel_file_transfer,
+            update_contact_meta,
+            reveal_own_sent_file,
+            search_messages,
+            get_storage_stats,
+            delete_contact_history,
+            delete_contact_files,
             discover_contact,
             on_foreground,
             request_file_download,
             load_messages,
+            load_messages_around,
             get_identity_qr_data,
-            is_keyring_available,
             check_core_ready,
             delete_contact,
             delete_message,
@@ -1293,8 +1721,10 @@ pub fn run() {
             import_routing_table,
 read_text_file,
             set_paid_network,
-set_relay_role,
-            dial_peer
+            set_relay_role,
+            dial_peer,
+            #[cfg(desktop)]
+            set_tray_menu_texts
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -1328,44 +1758,5 @@ fn cleanup(app: &AppHandle) {
         tracing::error!("Error sending shutdown command: {}", e);
         app.emit("warning", format!("Error sending shutdown command: {e}"))
             .ok();
-    }
-}
-
-#[cfg(target_os = "android")]
-#[no_mangle]
-pub extern "system" fn Java_com_openwire_app_MainActivity_initNdkContext<'local>(
-    mut env: jni::EnvUnowned<'local>,
-    _class: jni::objects::JClass<'local>,
-    context: jni::objects::JObject<'local>,
-) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use std::ffi::c_void;
-        let _ = env.with_env(|env| {
-            match env.new_global_ref(context) {
-                Ok(global_ref) => match env.get_java_vm() {
-                    Ok(vm) => {
-                        let vm_ptr = vm.get_raw() as *mut c_void;
-                        let context_ptr = global_ref.into_raw() as *mut c_void;
-                        unsafe {
-                            ndk_context::initialize_android_context(vm_ptr, context_ptr);
-                        }
-                        tracing::info!("Android NDK context initialized for keyring");
-                        rootcell::identity::setup_default_keyring();
-                        Ok(())
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to get Java VM: {e}");
-                        Err(e)
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("Failed to create global ref for Android context: {e}");
-                    Err(e)
-                }
-            }
-        });
-    }));
-    if let Err(e) = result {
-        tracing::error!("JNI initNdkContext panicked: {e:?}");
     }
 }

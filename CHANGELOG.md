@@ -20,6 +20,8 @@
 
 v0.1.x 的 ML-DSA 加密密钥文件不能直接在新版本使用。如有重要 ML-DSA 身份需要保留，请在升级前记录并重新生成。PeerID 配置（`peerid.json`）在首次启动时自动迁移到加密存储，旧明文文件会被删除。
 
+**数据库 BREAKING CHANGE（开发阶段）**：迁移序列已合并为单一基线（`openwire_core/migrations/001_init.sql`），旧迁移文件（002/003 及 0.x 早期序列）已被删除。早于当前基线的数据库版本视为**不存在**——如果旧数据库的 `_sqlx_migrations` 表记录了已删除的迁移版本，启动会报 `migration N was previously applied but is missing in the resolved migrations`。**升级方式：删除旧的 `database.sqlite`（连同 `-wal`/`-shm`）后全新启动**，应用只会从合并基线重建空库。这只是当前开发阶段的策略，正式发布前必须恢复逐版本兼容迁移链。
+
 ### security
 
 - `copy_file` Tauri 命令：源路径和目标路径均通过 `canonicalize` + `starts_with(&data_canon)` 校验，并加入 TOCTOU 符号链接防护。
