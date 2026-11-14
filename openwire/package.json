@@ -34,11 +34,11 @@
     "@sveltejs/kit": "^3.0.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tauri-apps/cli": "^2.12.4",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.6",
     "globals": "^17.13.0",
     "svelte": "^5.57.2",
     "svelte-check": "^4.7.7",
-    "typescript": "~6.0.0",
+    "typescript": "~7.0.2",
     "vite": "^8.3.5"
   },
   "allowScripts": {
