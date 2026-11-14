@@ -2,8 +2,8 @@
     import { VList, type VListHandle } from "virtua/svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { _ } from "svelte-i18n";
-    import Portal from "$lib/components/Portal.svelte";
-    import { tt } from "$lib/i18n";
+    import Portal from "#lib/components/Portal.svelte";
+    import { tt } from "#lib/i18n";
 
     interface Contact {
         order: number;

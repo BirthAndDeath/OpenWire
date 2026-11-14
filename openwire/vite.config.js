@@ -1,11 +1,20 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import adapter from "@sveltejs/adapter-static";
+import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
+// SvelteKit 3: 配置统一放在 sveltekit(...) 插件里（不再使用 svelte.config.js）。
+// Tauri 无 Node SSR，用 adapter-static + index.html fallback 走 SPA 模式。
 export default defineConfig(async () => ({
-  plugins: [sveltekit()],
+  plugins: [
+    sveltekit({
+      preprocess: vitePreprocess(),
+      adapter: adapter({ fallback: "index.html" }),
+    }),
+  ],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

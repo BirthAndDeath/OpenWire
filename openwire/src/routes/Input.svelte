@@ -16,7 +16,7 @@
         compact = false,
         mldsaPubkeyHex = "",
         quote = $bindable(""),
-    } = $props<{
+    }: {
         onsend?: (t: string) => void;
         disabled?: boolean;
         fill?: boolean;
@@ -25,7 +25,7 @@
         mldsaPubkeyHex?: string;
         /** 外部注入的文本（如长按消息"引用"），非空时追加到输入框并清空 */
         quote?: string;
-    }>();
+    } = $props();
 
     let text = $state("");
     let sending = $state(false);

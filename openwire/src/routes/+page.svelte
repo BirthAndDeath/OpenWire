@@ -9,16 +9,16 @@
   import Input from "./Input.svelte";
   import Messagelist from "./Messagelist.svelte";
   import Contactlist from "./Contactlist.svelte";
-  import Spinner from "$lib/components/Spinner.svelte";
+  import Spinner from "#lib/components/Spinner.svelte";
   import Toast from "./Toast.svelte";
   import NotificationBadge from "./NotificationBadge.svelte";
   import AddFriendModal from "./AddFriendModal.svelte";
   import SentFileManager from "./SentFileManager.svelte";
   import TransferManagerModal from "./TransferManagerModal.svelte";
   import { upsertTransfer } from "../lib/transfers";
-  import ResizablePanel from "$lib/components/ResizablePanel.svelte";
-  import { formatFileSize } from "$lib/format";
-  import type { FileHashInfo } from "$lib/types";
+  import ResizablePanel from "#lib/components/ResizablePanel.svelte";
+  import { formatFileSize } from "#lib/format";
+  import type { FileHashInfo } from "#lib/types";
 
   interface IdentityDto {
     id: number;
