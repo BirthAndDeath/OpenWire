@@ -4130,7 +4130,7 @@ name = "libp2p-pathranker"
 version = "0.1.0"
 dependencies = [
  "libp2p",
- "lru",
+ "lru 0.19.0",
  "rand 0.10.3",
  "serde",
  "tracing",
@@ -4454,6 +4454,15 @@ name = "lru"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "lru"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -5299,7 +5308,7 @@ dependencies = [
  "if-addrs",
  "libp2p",
  "libp2p-pathranker",
- "lru",
+ "lru 0.19.0",
  "postcard",
  "rand 0.10.3",
  "redb",
@@ -6291,7 +6300,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.14.0",
  "kasuari",
- "lru",
+ "lru 0.18.5",
  "palette",
  "serde",
  "strum",
