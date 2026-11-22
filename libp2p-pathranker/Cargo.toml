@@ -10,5 +10,5 @@ default = []
 libp2p = { version = "0.56.0", features = ["request-response", "tokio", "cbor"] }
 serde = { version = "1.0.229", features = ["derive"] }
 rand = { workspace = true }
-lru = "0.18"
+lru = "0.19"
 tracing.workspace = true
