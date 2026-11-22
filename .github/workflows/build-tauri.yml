@@ -107,7 +107,7 @@ jobs:
 
       # Rust cache 必须在 workspace 根目录执行，才能正确缓存所有 workspace 成员
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2.9.2
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: |
             . -> openwire/src-tauri/target
