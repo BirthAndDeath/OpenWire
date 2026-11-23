@@ -32,7 +32,7 @@ if-addrs = "0.15"
 lru = "0.18.5"
 
 dashmap = "6"
-redb = { version = "4.3.0", optional = true }
+redb = { version = "5.0.0", optional = true }
 zeroize = { version = "1.9.0", features = ["zeroize_derive", "serde"] }
 async-compression = { version = "0.4.50", features = ["futures-io", "zstd"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
